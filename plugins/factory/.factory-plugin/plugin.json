@@ -1,0 +1,17 @@
+{
+  "name": "tabward",
+  "version": "0.1.0",
+  "description": "Teach Factory to use the local TabWard MCP safely",
+  "author": {
+    "name": "NePavel221"
+  },
+  "homepage": "https://github.com/NePavel221/TabWard",
+  "repository": "https://github.com/NePavel221/TabWard",
+  "license": "Apache-2.0",
+  "keywords": [
+    "browser",
+    "chrome",
+    "mcp",
+    "automation"
+  ]
+}

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.factory/temp/
+.factory/settings.local.json
+*.log
+*.pem
+*.key
+*.zip
+*.tgz
+.env
+pairing.json
+artifacts/
+downloads/
+.DS_Store
+Thumbs.db

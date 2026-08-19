@@ -1,0 +1,39 @@
+# Factory Droid
+
+TabWard uses a direct user MCP entry plus a Factory plugin that installs the
+operating skill.
+
+## Install the local MCP command
+
+```powershell
+npm run install:mcp
+Get-Command tabward-mcp
+```
+
+## Register the MCP
+
+```powershell
+$TabWardServer = (Join-Path (npm root --global) '@tabward\mcp\dist\index.js').Replace('\', '/')
+droid mcp add tabward node $TabWardServer
+```
+
+The direct Node entry avoids Windows `.cmd` subprocess lifecycle issues.
+
+## Install the Factory skill
+
+```powershell
+droid plugin marketplace add https://github.com/NePavel221/TabWard
+droid plugin install tabward@TabWard --scope user
+```
+
+Verify the complete integration:
+
+```powershell
+droid plugin list --scope user
+droid mcp list
+```
+
+The plugin contributes `plugins/factory/skills/tabward/SKILL.md`. It does not
+register a second MCP process. It teaches Factory to check health and pairing,
+prefer managed sessions, observe before acting, respect popup access settings,
+and close sessions safely.

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TabWard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 13px/1.4 system-ui, sans-serif;
+      background: #202124;
+      color: #f1f3f4;
+    }
+    body {
+      width: 320px;
+      margin: 0;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 16px;
+      margin: 0 0 12px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 0;
+      border-top: 1px solid #3c4043;
+    }
+    .label {
+      color: #bdc1c6;
+    }
+    .status {
+      font-weight: 600;
+      text-align: right;
+    }
+    .ok {
+      color: #81c995;
+    }
+    .bad {
+      color: #f28b82;
+    }
+    .warn {
+      color: #fdd663;
+    }
+    #details {
+      color: #bdc1c6;
+      font-size: 11px;
+      margin-top: 10px;
+      overflow-wrap: anywhere;
+    }
+    .settings {
+      margin-top: 16px;
+      border-top: 1px solid #3c4043;
+    }
+    .setting {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px 12px;
+      padding: 12px 0;
+      border-bottom: 1px solid #3c4043;
+    }
+    .setting-title {
+      font-weight: 600;
+    }
+    .setting-help {
+      grid-column: 1 / -1;
+      color: #9aa0a6;
+      font-size: 11px;
+    }
+    .switch {
+      width: 40px;
+      height: 24px;
+      margin: 0;
+      accent-color: #8ab4f8;
+      cursor: pointer;
+    }
+    .switch:focus-visible,
+    button:focus-visible,
+    input:focus-visible {
+      outline: 2px solid #8ab4f8;
+      outline-offset: 2px;
+    }
+    #settings-notice {
+      min-height: 16px;
+      margin-top: 8px;
+      color: #bdc1c6;
+      font-size: 11px;
+    }
+    button {
+      width: 100%;
+      margin-top: 12px;
+      padding: 7px 10px;
+      border: 1px solid #5f6368;
+      border-radius: 4px;
+      background: #303134;
+      color: #f1f3f4;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #3c4043;
+    }
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      margin-top: 12px;
+      padding: 8px 10px;
+      border: 1px solid #5f6368;
+      border-radius: 4px;
+      background: #171717;
+      color: #f1f3f4;
+      letter-spacing: 0.2em;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>TabWard</h1>
+  <div class="row"><span class="label">Local MCP</span><span id="bridge" class="status">Checking...</span></div>
+  <div class="row"><span class="label">Extension</span><span id="extension" class="status">Checking...</span></div>
+  <div id="details"></div>
+  <section class="settings" aria-label="Browser access settings">
+    <label class="setting">
+      <span class="setting-title">Allow access to existing tabs</span>
+      <input id="allow-existing-tabs" class="switch" type="checkbox">
+      <span class="setting-help">Off by default. Applies only to full-profile sessions.</span>
+    </label>
+    <label class="setting">
+      <span class="setting-title">Use a separate Chrome window</span>
+      <input id="separate-window" class="switch" type="checkbox">
+      <span class="setting-help">When off, new tabs join a TabWard group in the current window.</span>
+    </label>
+  </section>
+  <div id="settings-notice" role="status" aria-live="polite"></div>
+  <input id="code" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code" hidden>
+  <button id="pair" type="button" hidden>Approve pairing</button>
+  <button id="revoke" type="button" hidden>Revoke pairing</button>
+  <button id="refresh" type="button">Refresh</button>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "name": "TabWard",
+  "description": "Factory plugin marketplace for TabWard",
+  "owner": {
+    "name": "NePavel221"
+  },
+  "plugins": [
+    {
+      "name": "tabward",
+      "description": "Install the safe Factory operating skill for TabWard",
+      "source": "./plugins/factory",
+      "category": "automation",
+      "homepage": "https://github.com/NePavel221/TabWard",
+      "tags": [
+        "browser",
+        "chrome",
+        "mcp"
+      ]
+    }
+  ]
+}

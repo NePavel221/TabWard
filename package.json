@@ -1,0 +1,24 @@
+{
+  "name": "tabward-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local browser control for AI agents",
+  "license": "Apache-2.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @tabward/protocol && npm run build -w @tabward/mcp",
+    "check": "npm run check -w @tabward/protocol && npm run check -w @tabward/mcp",
+    "test": "npm run test -w @tabward/protocol && npm run test -w @tabward/mcp && npm run test -w @tabward/test-harness",
+    "icons": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-icons.ps1",
+    "install:mcp": "node scripts/install-mcp.mjs",
+    "pack:extension": "node scripts/pack-extension.mjs",
+    "audit:release": "node scripts/audit-release.mjs",
+    "verify": "npm run check && npm test && npm run build && npm run pack:extension && npm run audit:release"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
