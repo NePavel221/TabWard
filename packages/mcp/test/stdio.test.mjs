@@ -31,6 +31,10 @@ test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, a
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
+    env: {
+      ...process.env,
+      TABWARD_PORT: "0"
+    },
     stderr: "pipe"
   });
   const client = new Client({ name: "tabward-test", version: "0.1.0" });
@@ -47,7 +51,9 @@ test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, a
     assert.equal(health.isError, undefined);
     assert.equal(health.structuredContent.serverVersion, "0.1.0");
     assert.equal(health.structuredContent.bridge.host, "127.0.0.1");
-    assert.equal(health.structuredContent.bridge.port, 18766);
+    assert.equal(Number.isInteger(health.structuredContent.bridge.port), true);
+    assert.equal(health.structuredContent.bridge.port > 0, true);
+    assert.notEqual(health.structuredContent.bridge.port, 18766);
   } finally {
     await client.close();
   }
