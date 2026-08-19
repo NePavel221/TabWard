@@ -121,4 +121,7 @@ npm run verify
 builds the MCP, packages the unpacked extension and Store ZIP, and audits the
 release tree for forbidden files and likely secrets.
 
+The private beta intentionally uses this local command as its required
+pre-push gate instead of GitHub Actions.
+
 TabWard is licensed under [Apache-2.0](LICENSE).

@@ -19,22 +19,21 @@ managed ownership, current-window grouping, semantic observation, and cleanup.
 
 ## Last 3 Tasks
 
-1. 2026-08-19: Published the initial private `main` and installed its Factory skill from GitHub.
-2. 2026-08-19: Prepared portable private-beta installation and Factory skill packaging.
-3. 2026-08-19: Removed legacy extension namespaces and passed global-package live smoke.
+1. 2026-08-19: Completed the private GitHub beta and chose local pre-push verification.
+2. 2026-08-19: Published the initial private `main` and installed its Factory skill from GitHub.
+3. 2026-08-19: Prepared portable private-beta installation and Factory skill packaging.
 
 ## Next Step
 
-Confirm the first successful GitHub Actions run. Keep the repository private
-until a separate public-release review.
+No pending implementation task. Keep the repository private until a separate
+public-release review.
 
 ## Risks / Do Not Forget
 
 - Keep the GitHub repository private until a separate public-release review.
 - The npm package and Chrome Web Store extension are not publicly published.
-- The first push produced a GitHub Actions `startup_failure` before any job
-  started; a manual trigger was added to separate workflow issues from a
-  transient GitHub Actions incident.
+- GitHub Actions is intentionally absent during the private beta. Local
+  `npm run verify` is mandatory before every push.
 - Pairing tokens under `%LOCALAPPDATA%\TabWard` are sensitive.
 - Existing user tabs must remain inaccessible in managed mode.
 - Keep existing-tab access disabled by default; disabling it releases adopted

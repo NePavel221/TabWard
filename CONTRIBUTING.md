@@ -23,7 +23,8 @@ user tabs.
 3. Do not commit pairing state, browser profiles, cookies, authenticated page
    content, downloads, artifacts, traces, logs, `.env` files, or credentials.
 4. Keep extension, MCP, and plugin versions synchronized.
-5. Run `npm run verify`.
+5. Run `npm run verify` locally before every push. The private beta does not
+   use GitHub Actions.
 6. Describe security or permission changes explicitly in the pull request.
 
 Regenerate extension icons with `npm run icons` after changing the icon source

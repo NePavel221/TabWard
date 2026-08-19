@@ -27,13 +27,15 @@ in authenticated, agent-owned Chrome tabs.
   artifacts, logs, traces, or generated packages.
 - Managed sessions may access only tabs created by that session.
 - Existing user tabs require an explicit full-profile adoption flow.
-- Do not add a Git remote or publish packages without explicit user approval.
+- Do not change repository visibility or publish npm/Chrome packages without
+  explicit user approval.
 
 ## Validation
 
-Run `npm run verify` after code changes. Run `npm run audit:release` before a
-release candidate. Run the live Chrome smoke only in a TabWard-owned test
-session and close only test-created tabs.
+GitHub Actions is intentionally not used during the private beta. Run
+`npm run verify` locally after code changes and before every push. Run
+`npm run audit:release` before a release candidate. Run the live Chrome smoke
+only in a TabWard-owned test session and close only test-created tabs.
 
 ## Project memory
 
