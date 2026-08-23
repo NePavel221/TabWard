@@ -30,8 +30,8 @@ by an installed-package smoke passed 3/3. Sanitized reports stay under
 
 ## Next Step
 
-Commit and push the verified private `0.2.0` build, then use TabWard for 20
-distinct real tasks without fallback: at least five
+Use the pushed private `0.2.0` build for 20 distinct real tasks without
+fallback: at least five
 authenticated read scenarios and five multi-step scenarios, plus navigation,
 forms, child tabs, downloads, and cleanup. Record only sanitized outcomes.
 After all 20 pass with no critical/high defects, rerun the full gate and then
@@ -40,6 +40,8 @@ disable the legacy MCP and skill.
 ## Risks / Do Not Forget
 
 - Keep the GitHub repository private until a separate public-release review.
+- Private `main` commit `0357e75` contains the `0.2.0` dogfooding build, and
+  the installed Factory plugin resolves to that commit.
 - Do not claim full replacement readiness until the real-use gate reaches 20/20.
 - Do not disable the legacy integration before the real-use gate passes.
 - The npm package and Chrome Web Store extension are not publicly published.
