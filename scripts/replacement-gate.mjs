@@ -54,7 +54,7 @@ const transport = new StdioClientTransport({
   args: [serverPath],
   stderr: "pipe"
 });
-const client = new Client({ name: "tabward-replacement-gate", version: "0.2.0" });
+const client = new Client({ name: "tabward-replacement-gate", version: "0.3.0" });
 const durations = [];
 const failures = [];
 let sessionId = null;

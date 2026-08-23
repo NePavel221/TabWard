@@ -39,3 +39,8 @@ The plugin contributes `plugins/factory/skills/tabward/SKILL.md`. It does not
 register a second MCP process. It teaches Factory to check health and pairing,
 prefer managed sessions, observe before acting, respect popup access settings,
 and close sessions safely.
+
+Managed sessions provide the everyday frontend QA surface. Use
+`clean_qa: true` only when a fresh incognito context is required and TabWard's
+Chrome **Allow in incognito** setting is enabled. Keep full-profile adoption
+for explicit existing-tab work.

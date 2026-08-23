@@ -64,6 +64,83 @@ test("extension settings enforce existing-tab access and workspace placement", a
   assert.match(popup, /id="separate-window"/);
 });
 
+test("managed QA is ownership-scoped and Clean QA is fail-closed", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+
+  assert.match(background, /MANAGED_QA|evaluateLocal|evaluate_local|localOnly|LocalEvaluateOnly/i);
+  assert.match(background, /assertTabOwnership\(payload\.tabId, \{ createdOnly: true \}\)/);
+  assert.match(background, /\["localhost", "127\.0\.0\.1", "\[::1\]"\]/);
+  assert.match(background, /isAllowedIncognitoAccess/);
+  assert.match(background, /incognito: true/);
+  assert.match(background, /CleanQaTainted/);
+  assert.match(background, /foreignTabsPreserved/);
+  assert.match(background, /leaseExpiresAt/);
+  assert.match(background, /Clean QA state was lost/);
+  assert.match(background, /canCloseCreatedTabs/);
+  assert.match(background, /inventoryVerified/);
+  assert.match(background, /previousStateRestored/);
+  assert.match(background, /preservedExistingAttachment/);
+  assert.match(background, /cdpEventBrokers\.delete/);
+  assert.match(background, /EMULATION_STATES_KEY/);
+  assert.match(background, /setEmulationState/);
+  assert.match(background, /EmulationVerificationError/);
+  assert.match(background, /VIEWPORT_TOLERANCE_PX = 2/);
+});
+
+test("frontend QA handlers expose forms, probes, history, and scoped screenshots", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+  assert.match(background, /form: commandForm/);
+  assert.match(background, /probe: commandProbe/);
+  assert.match(background, /qa: commandQa/);
+  assert.match(background, /goBack:/);
+  assert.match(background, /goForward:/);
+  assert.match(background, /payload\.scope === "element"/);
+  assert.match(background, /function resolveLocator\(locator\)/);
+  assert.match(background, /const snapshot = await locatorSnapshot\(payload\.tabId, payload\.locator/);
+  assert.match(background, /element\.checked = payload\.action === "check"/);
+  assert.match(background, /did not reach the requested checkbox state/);
+});
+
+test("popup persists a Chrome-derived English or Russian language", async () => {
+  const popupHtml = await readFile(
+    resolve(root, "apps", "extension", "popup.html"),
+    "utf8"
+  );
+  const popupJs = await readFile(
+    resolve(root, "apps", "extension", "popup.js"),
+    "utf8"
+  );
+  assert.match(popupHtml, /id="language"/);
+  assert.match(popupHtml, /value="en"/);
+  assert.match(popupHtml, /value="ru"/);
+  assert.match(popupJs, /const LANGUAGE_KEY = "uiLanguage"/);
+  assert.match(popupJs, /chrome\.i18n\.getUILanguage/);
+  assert.match(popupJs, /chrome\.storage\.local\.set/);
+  assert.match(popupJs, /document\.documentElement\.lang = language/);
+  assert.match(popupJs, /ru: \{/);
+});
+
+test("locator waits reserve transport time after their browser deadline", async () => {
+  const mcp = await readFile(
+    resolve(root, "packages", "mcp", "src", "index.ts"),
+    "utf8"
+  );
+  assert.match(
+    mcp,
+    /"locatorWait"[\s\S]*?timeoutMs: timeout_ms \+ 5_000/
+  );
+  assert.match(
+    mcp,
+    /"locatorAssert"[\s\S]*?timeoutMs: timeout_ms \+ 5_000/
+  );
+});
+
 test("extension internals use the TabWard namespace", async () => {
   const background = await readFile(
     resolve(root, "apps", "extension", "background.js"),

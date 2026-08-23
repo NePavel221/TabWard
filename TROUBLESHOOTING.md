@@ -79,3 +79,52 @@
 - Validation: the installed-package restart smoke starts a new broker and
   completes three browser cycles.
 - Applies to: replacement gate and first MCP call after reload.
+
+## Ephemeral MCP clients leave broker processes behind
+
+- Symptom: repeated test runs leave many Node processes whose command line
+  points to TabWard's broker.
+- Cause: the SDK stdio transport may end through stdin EOF without emitting the
+  close callback expected by the MCP entry point.
+- Working method: treat stdin EOF as an explicit shutdown signal for ephemeral
+  brokers and assert that test broker PIDs exit.
+- Validation: stdio lifecycle tests pass and repeated gates leave only the one
+  expected persistent broker.
+- Applies to: MCP lifecycle tests and one-off clients.
+
+## Deterministic extension error appears as OutcomeUnknown
+
+- Symptom: an ordinary validation or ownership error is returned as HTTP 502
+  and the client reports `OutcomeUnknown`.
+- Cause: the broker did not distinguish typed extension business errors from
+  ambiguous transport failures.
+- Working method: preserve typed extension errors as HTTP 422; reserve 5xx and
+  `OutcomeUnknown` for genuinely ambiguous transport/server failures.
+- Validation: the real protocol-handshake regression returns the original
+  error name and message.
+- Applies to: broker/extension command boundary.
+
+## QA viewport differs when Chrome zoom is not 100%
+
+- Symptom: a requested viewport such as `393x852` is observed several CSS
+  pixels larger when the origin has a saved Chrome zoom.
+- Cause: CDP device metrics and Chrome's per-origin zoom are quantized
+  independently.
+- Working method: apply device metrics through a measured feedback loop,
+  verify the resulting CSS viewport and DPR, and allow at most two CSS pixels
+  of Chrome quantization. Roll back an unverified override.
+- Validation: `npm run gate:qa` restores a pre-existing viewport and passes its
+  mobile composite QA at 75% Chrome zoom.
+- Applies to: emulation and composite QA.
+
+## Composite QA clears caller-owned browser state
+
+- Symptom: running `tabward_qa` removes emulation, event capture, or an existing
+  CDP attachment configured before the QA call.
+- Cause: cleanup unconditionally reset all QA resources.
+- Working method: persist emulation metadata in `chrome.storage.session`,
+  snapshot event/CDP ownership, and restore only the state acquired or replaced
+  by the composite command.
+- Validation: `npm run gate:qa` confirms that pre-existing viewport and console
+  capture still work after composite QA.
+- Applies to: `tabward_qa` cleanup and MV3 service-worker restarts.

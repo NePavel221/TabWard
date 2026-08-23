@@ -2,7 +2,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { ExtensionBridge } from "./bridge.js";
+import { ExtensionBridge, ExtensionCommandError } from "./bridge.js";
 import { writeRuntime } from "./runtime.js";
 
 const HOST = "127.0.0.1";
@@ -55,7 +55,7 @@ const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     json(response, 200, {
       ok: true,
-      brokerVersion: "0.2.0",
+      brokerVersion: "0.3.0",
       pid: process.pid,
       instanceId,
       uptimeSeconds: Math.floor(process.uptime()),
@@ -151,6 +151,15 @@ const server = createServer((request, response) => {
       const result = await record.promise;
       json(response, 200, { ok: true, result });
     } catch (error) {
+      if (error instanceof ExtensionCommandError) {
+        json(response, 422, {
+          ok: false,
+          error: error.message,
+          name: error.name,
+          details: error.details
+        });
+        return;
+      }
       json(response, 502, {
         ok: false,
         error: error instanceof Error ? error.message : "broker command failed"

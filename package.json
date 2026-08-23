@@ -1,6 +1,6 @@
 {
   "name": "tabward-workspace",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Local browser control for AI agents",
   "license": "Apache-2.0",
@@ -17,6 +17,8 @@
     "pack:extension": "node scripts/pack-extension.mjs",
     "audit:release": "node scripts/audit-release.mjs",
     "gate:replacement": "node scripts/replacement-gate.mjs",
+    "gate:qa": "node scripts/frontend-qa-gate.mjs",
+    "gate:clean-qa": "node scripts/clean-qa-gate.mjs",
     "benchmark:browsers": "node scripts/compare-browser-mcp.mjs",
     "verify": "npm run check && npm test && npm run build && npm run pack:extension && npm run audit:release"
   },

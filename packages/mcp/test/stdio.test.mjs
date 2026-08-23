@@ -15,6 +15,7 @@ const expectedTools = [
   "tabward_navigate",
   "tabward_observe",
   "tabward_action",
+  "tabward_form",
   "tabward_wait",
   "tabward_assert",
   "tabward_events",
@@ -23,10 +24,26 @@ const expectedTools = [
   "tabward_storage",
   "tabward_artifact",
   "tabward_evaluate",
+  "tabward_probe",
+  "tabward_qa",
   "tabward_cdp",
   "tabward_downloads",
   "tabward_download_click"
 ];
+
+async function waitForProcessExit(pid, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === "ESRCH") return;
+      throw error;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  assert.fail(`broker process ${pid} did not exit after stdio closed`);
+}
 
 test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, async () => {
   const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-stdio-"));
@@ -43,7 +60,8 @@ test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, a
     },
     stderr: "pipe"
   });
-  const client = new Client({ name: "tabward-test", version: "0.2.0" });
+  const client = new Client({ name: "tabward-test", version: "0.3.0" });
+  let brokerPid = null;
   try {
     await client.connect(transport);
     const listed = await client.listTools();
@@ -55,14 +73,15 @@ test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, a
       arguments: {}
     });
     assert.equal(health.isError, undefined);
-    assert.equal(health.structuredContent.serverVersion, "0.2.0");
+    assert.equal(health.structuredContent.serverVersion, "0.3.0");
     assert.equal(health.structuredContent.bridge.host, "127.0.0.1");
     assert.equal(Number.isInteger(health.structuredContent.bridge.port), true);
     assert.equal(health.structuredContent.bridge.port > 0, true);
     assert.notEqual(health.structuredContent.bridge.port, 18766);
+    brokerPid = health.structuredContent.bridge.broker.pid;
   } finally {
     await client.close();
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+    if (Number.isInteger(brokerPid)) await waitForProcessExit(brokerPid);
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -84,8 +103,9 @@ test("two stdio clients share one persistent broker", { timeout: 20_000 }, async
     stderr: "pipe"
   }));
   const clients = transports.map((_, index) =>
-    new Client({ name: `tabward-multi-${index}`, version: "0.2.0" })
+    new Client({ name: `tabward-multi-${index}`, version: "0.3.0" })
   );
+  let brokerPid = null;
   try {
     await Promise.all(clients.map((client, index) => client.connect(transports[index])));
     const health = await Promise.all(clients.map((client) => client.callTool({
@@ -97,9 +117,10 @@ test("two stdio clients share one persistent broker", { timeout: 20_000 }, async
     );
     assert.equal(typeof instances[0], "string");
     assert.deepEqual(instances[0], instances[1]);
+    brokerPid = health[0].structuredContent.bridge.broker.pid;
   } finally {
     await Promise.allSettled(clients.map((client) => client.close()));
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+    if (Number.isInteger(brokerPid)) await waitForProcessExit(brokerPid);
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -119,7 +140,8 @@ test("health restarts a terminated broker", { timeout: 25_000 }, async () => {
     },
     stderr: "pipe"
   });
-  const client = new Client({ name: "tabward-recovery", version: "0.2.0" });
+  const client = new Client({ name: "tabward-recovery", version: "0.3.0" });
+  let brokerPid = null;
   try {
     await client.connect(transport);
     const first = await client.callTool({
@@ -137,9 +159,10 @@ test("health restarts a terminated broker", { timeout: 25_000 }, async () => {
     const secondBroker = second.structuredContent.bridge.broker;
     assert.equal(typeof secondBroker.instanceId, "string");
     assert.notEqual(secondBroker.instanceId, firstBroker.instanceId);
+    brokerPid = secondBroker.pid;
   } finally {
     await client.close();
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+    if (Number.isInteger(brokerPid)) await waitForProcessExit(brokerPid);
     await rm(stateDir, { recursive: true, force: true });
   }
 });

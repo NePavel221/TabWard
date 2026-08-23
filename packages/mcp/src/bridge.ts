@@ -55,6 +55,17 @@ interface BridgeStatus {
   connectedAt: string | null;
 }
 
+export class ExtensionCommandError extends Error {
+  constructor(
+    message: string,
+    readonly extensionName = "ExtensionCommandError",
+    readonly details: unknown = null
+  ) {
+    super(message);
+    this.name = extensionName;
+  }
+}
+
 function tokensEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
@@ -337,11 +348,24 @@ export class ExtensionBridge extends EventEmitter {
       pending.resolve(result.payload);
       return;
     }
-    const message = typeof result.payload === "object"
+    if (
+      typeof result.payload === "object"
       && result.payload !== null
-      && "message" in result.payload
-      ? String((result.payload as { message: unknown }).message)
+      && "ok" in result.payload
+    ) {
+      pending.resolve(result.payload);
+      return;
+    }
+    const payload = typeof result.payload === "object" && result.payload !== null
+      ? result.payload as { name?: unknown; message?: unknown }
+      : null;
+    const message = payload && "message" in payload
+      ? String(payload.message)
       : "TabWard extension command failed";
-    pending.reject(new Error(message));
+    pending.reject(new ExtensionCommandError(
+      message,
+      typeof payload?.name === "string" ? payload.name : "ExtensionCommandError",
+      result.payload
+    ));
   }
 }

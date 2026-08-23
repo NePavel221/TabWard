@@ -9,11 +9,12 @@ interface PairingFile {
 }
 
 function stateRoot(): string {
-  const localAppData = process.env.LOCALAPPDATA;
-  if (!localAppData) {
-    throw new Error("LOCALAPPDATA is required on Windows");
+  const root = process.env.TABWARD_STATE_DIR
+    || (process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "TabWard") : null);
+  if (!root) {
+    throw new Error("LOCALAPPDATA or TABWARD_STATE_DIR is required");
   }
-  return join(localAppData, "TabWard");
+  return root;
 }
 
 export function pairingPath(): string {

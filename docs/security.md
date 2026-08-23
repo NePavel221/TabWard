@@ -7,6 +7,13 @@
 - Pairing credentials stay in the local OS profile and are never MCP output.
 - Broker runtime discovery and extension pairing use different credentials.
 - Managed mode exposes only tabs created by the current MCP session.
+- Managed JavaScript evaluation is restricted to `localhost`, `127.0.0.1`,
+  and `[::1]`; arbitrary-page evaluate requires explicitly privileged
+  full-profile mode.
+- Clean QA requires Chrome's **Allow in incognito** setting for TabWard,
+  refuses to start while another incognito window exists, and uses persisted
+  leases and repeated ownership validation. Cleanup fails closed if the
+  incognito tab inventory cannot be verified.
 - Existing user tabs are hidden and blocked by the extension by default. The
   user can enable global existing-tab access in the popup for full-profile
   sessions and revoke it at any time without closing those tabs.
@@ -18,3 +25,5 @@
   changes, and destructive actions require explicit user intent.
 - Completed extension results remain in a bounded Chrome IndexedDB outbox only
   until acknowledged. Runtime diagnostics never log command or result payloads.
+- Composite QA restores caller-owned emulation, event capture, and CDP
+  attachment state instead of unconditionally clearing it.

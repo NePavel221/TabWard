@@ -26,6 +26,14 @@ Get-Command tabward-mcp
 3. Select **Load unpacked**.
 4. Select the repository's `dist\extension` directory.
 
+For fail-closed Clean QA:
+
+1. Open the TabWard details page in `chrome://extensions`.
+2. Enable **Allow in incognito** only for TabWard.
+3. Run `npm run gate:clean-qa`.
+
+Regular managed sessions do not require incognito access.
+
 ## Factory MCP and skill
 
 Register the globally installed MCP by its real JavaScript entry point, then
@@ -42,6 +50,9 @@ droid mcp list
 
 Call `tabward_health`. If it reports `pairing_required`, enter the six-digit
 code in the TabWard popup. Never share the resulting pairing token.
+
+The popup initially follows Chrome's language when it is Russian or English.
+Changing the popup language applies immediately and persists in the extension.
 
 ## Direct stdio MCP
 

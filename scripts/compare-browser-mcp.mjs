@@ -71,7 +71,7 @@ async function connect(name, adapter) {
     args: adapter.args,
     stderr: "pipe"
   });
-  const client = new Client({ name: `${name}-comparison`, version: "0.2.0" });
+  const client = new Client({ name: `${name}-comparison`, version: "0.3.0" });
   await client.connect(transport);
   const call = async (suffix, args = {}) => {
     const result = await client.callTool({

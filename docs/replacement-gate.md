@@ -25,6 +25,20 @@ Required result:
 - no critical or high severity defects remain;
 - `npm run verify` and `npm run audit:release` pass.
 
+Run the Playwright-parity frontend gates as well:
+
+```powershell
+npm run gate:qa
+npm run gate:clean-qa
+```
+
+`gate:qa` covers forms, probes, iframe observation, scoped screenshots,
+console/network capture, dialogs, upload/download, drag/drop, history, trace,
+loopback evaluate, and restoration of pre-existing emulation and events.
+`gate:clean-qa` covers incognito preflight, concurrent-session rejection,
+owned-window cleanup, and immediate clean restart. It requires
+**Allow in incognito** for TabWard.
+
 Compare both installed browser MCPs against the same local fixture:
 
 ```powershell
@@ -50,7 +64,7 @@ cookies, storage, downloads, or user-generated data.
 
 ## Migration
 
-After both gates pass, verify TabWard from the private GitHub snapshot, then
-disable the legacy MCP and skill in Factory. Preserve its local files
-until several further TabWard-only tasks have succeeded, so rollback remains
-possible.
+After all automated gates and the real-task gate pass, verify TabWard from the
+private GitHub snapshot, then disable rollback integrations in Factory.
+Preserve their local files until several further TabWard-only tasks have
+succeeded.

@@ -23,6 +23,8 @@ const OWNERSHIP_KEY = "tabOwnership";
 const WORKSPACE_GROUPS_KEY = "workspaceGroups";
 const WORKSPACE_WINDOWS_KEY = "workspaceWindows";
 const SESSION_POLICIES_KEY = "sessionPolicies";
+const CLEAN_QA_STATES_KEY = "cleanQaStates";
+const EMULATION_STATES_KEY = "emulationStates";
 const DOWNLOAD_IDS_KEY = "downloadIds";
 const MAX_RESULT_BYTES = 64 * 1024 * 1024;
 const OUTBOX_DB = "tabward-protocol";
@@ -565,15 +567,12 @@ const cdpTabs = new Set();
 const cdpEventBrokers = new Map();
 const storageSnapshots = new Map();
 const MAX_CDP_EVENTS = 5000;
+const VIEWPORT_TOLERANCE_PX = 2;
 
 chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId !== undefined) {
     cdpTabs.delete(source.tabId);
-    const broker = cdpEventBrokers.get(source.tabId);
-    if (broker) {
-      broker.started = false;
-      broker.detachedAt = Date.now();
-    }
+    cdpEventBrokers.delete(source.tabId);
   }
 });
 
@@ -820,7 +819,10 @@ async function resolveSessionContext(payload = {}) {
   if (payload.sessionId) {
     return {
       id: String(payload.sessionId),
-      name: String(payload.sessionName || "TabWard MCP")
+      name: String(payload.sessionName || "TabWard MCP"),
+      mode: String(payload.sessionMode || "managed"),
+      cleanQa: payload.cleanQa === true,
+      expiresAt: Number(payload.sessionExpiresAt || 0) || null
     };
   }
   if (activeSessionContext?.id) {
@@ -871,6 +873,7 @@ async function rememberSessionWindow(session, windowId) {
   windows[session.id] = {
     windowId,
     sessionName: session.name,
+    cleanQa: session.cleanQa === true,
     createdAt: windows[session.id]?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -894,9 +897,12 @@ async function getSessionWorkspace(session) {
     return policies[session.id].workspace;
   }
   const settings = await getUserSettings();
-  const workspace = settings.openInSeparateWindow ? "isolated" : "current";
+  const workspace = session.cleanQa === true || settings.openInSeparateWindow
+    ? "isolated"
+    : "current";
   policies[session.id] = {
     workspace,
+    cleanQa: session.cleanQa === true,
     createdAt: new Date().toISOString()
   };
   await sessionSet({ [SESSION_POLICIES_KEY]: policies });
@@ -907,6 +913,180 @@ async function forgetSessionPolicy(sessionId) {
   const policies = await getSessionPolicies();
   delete policies[sessionId];
   await sessionSet({ [SESSION_POLICIES_KEY]: policies });
+}
+
+async function getCleanQaStates() {
+  const state = await sessionGet({ [CLEAN_QA_STATES_KEY]: {} });
+  return state[CLEAN_QA_STATES_KEY] || {};
+}
+
+async function setCleanQaStates(states) {
+  await sessionSet({ [CLEAN_QA_STATES_KEY]: states });
+}
+
+async function incognitoAccessAllowed() {
+  return Boolean(await chrome.extension.isAllowedIncognitoAccess());
+}
+
+async function incognitoWindows() {
+  return (await chrome.windows.getAll({
+    populate: true,
+    windowTypes: ["normal"]
+  })).filter((window) => window.incognito === true);
+}
+
+function publicCleanQaState(state) {
+  if (!state) return null;
+  return {
+    requested: true,
+    status: state.status,
+    clean: state.status === "ready" || state.status === "active",
+    tainted: state.status === "tainted",
+    windowId: state.windowId ?? null,
+    reason: state.reason || null
+  };
+}
+
+async function prepareCleanQa(session) {
+  if (session.mode !== "managed") {
+    throw new Error("Clean QA requires managed mode");
+  }
+  if (!(await incognitoAccessAllowed())) {
+    const error = new Error(
+      "Clean QA requires Chrome extension access in incognito. Enable 'Allow in incognito' for TabWard."
+    );
+    error.name = "IncognitoAccessRequired";
+    throw error;
+  }
+  const states = await getCleanQaStates();
+  const existing = await incognitoWindows();
+  const now = Date.now() / 1000;
+  let statesChanged = false;
+  for (const [sessionId, state] of Object.entries(states)) {
+    if (sessionId === session.id) continue;
+    const windowExists = Number.isInteger(state?.windowId)
+      && existing.some((window) => window.id === state.windowId);
+    const leaseExpired = Number.isFinite(Number(state?.leaseExpiresAt))
+      && Number(state.leaseExpiresAt) <= now;
+    if (state?.status === "closed" || (leaseExpired && !windowExists)) {
+      delete states[sessionId];
+      statesChanged = true;
+    }
+  }
+  if (statesChanged) {
+    await setCleanQaStates(states);
+  }
+  const competing = Object.values(states).find((state) =>
+    state?.sessionId !== session.id
+    && ["ready", "active", "tainted"].includes(state?.status)
+  );
+  if (competing) {
+    const error = new Error("Another TabWard Clean QA session is already active");
+    error.name = "CleanQaUnavailable";
+    throw error;
+  }
+  if (existing.length > 0) {
+    const error = new Error(
+      "Clean QA cannot start while another incognito window exists. Close it or use a regular managed session."
+    );
+    error.name = "CleanQaNotClean";
+    throw error;
+  }
+  states[session.id] = {
+    sessionId: session.id,
+    sessionName: session.name,
+    status: "ready",
+    windowId: null,
+    createdTabIds: [],
+    leaseExpiresAt: Number(session.expiresAt || 0) || null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  await setCleanQaStates(states);
+  return states[session.id];
+}
+
+async function markCleanQaTainted(sessionId, reason) {
+  const states = await getCleanQaStates();
+  const state = states[sessionId];
+  if (!state || state.status === "closed") return null;
+  states[sessionId] = {
+    ...state,
+    status: "tainted",
+    reason: String(reason || "Unexpected incognito state"),
+    updatedAt: new Date().toISOString()
+  };
+  await setCleanQaStates(states);
+  return states[sessionId];
+}
+
+async function validateCleanQa(session) {
+  if (session.cleanQa !== true) return null;
+  const states = await getCleanQaStates();
+  let state = states[session.id];
+  if (!state) {
+    state = {
+      sessionId: session.id,
+      sessionName: session.name,
+      status: "tainted",
+      windowId: null,
+      createdTabIds: [],
+      leaseExpiresAt: Number(session.expiresAt || 0) || null,
+      reason: "Clean QA state was lost",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    states[session.id] = state;
+    await setCleanQaStates(states);
+    return state;
+  }
+  const leaseExpiresAt = Number(session.expiresAt || 0);
+  if (Number.isFinite(leaseExpiresAt)
+    && leaseExpiresAt > Number(state.leaseExpiresAt || 0) + 30) {
+    state = {
+      ...state,
+      leaseExpiresAt,
+      updatedAt: new Date().toISOString()
+    };
+    states[session.id] = state;
+    await setCleanQaStates(states);
+  }
+  const windows = await incognitoWindows();
+  if (state.status === "ready") {
+    if (windows.length > 0) {
+      state = await markCleanQaTainted(
+        session.id,
+        "An incognito window appeared before the Clean QA workspace was created"
+      );
+    }
+    return state;
+  }
+  const ownedWindow = windows.find((window) => window.id === state.windowId);
+  if (!ownedWindow) {
+    return markCleanQaTainted(session.id, "The Clean QA incognito window is no longer available");
+  }
+  if (windows.some((window) => window.id !== state.windowId)) {
+    return markCleanQaTainted(session.id, "Another incognito window exists");
+  }
+  const ownership = await getOwnership();
+  const foreignTab = (ownedWindow.tabs || []).find((tab) => {
+    const record = ownership[tab.id];
+    return !record || record.sessionId !== session.id
+      || !["created", "created-child"].includes(record.kind);
+  });
+  if (foreignTab) {
+    return markCleanQaTainted(
+      session.id,
+      `Incognito tab ${foreignTab.id} is not owned by this Clean QA session`
+    );
+  }
+  return state;
+}
+
+async function forgetCleanQaState(sessionId) {
+  const states = await getCleanQaStates();
+  delete states[sessionId];
+  await setCleanQaStates(states);
 }
 
 async function sessionGet(keys) {
@@ -924,6 +1104,21 @@ async function getWorkTabs() {
 
 async function setWorkTabs(workTabs) {
   await sessionSet({ [WORK_TABS_KEY]: workTabs });
+}
+
+async function getEmulationStates() {
+  const state = await sessionGet({ [EMULATION_STATES_KEY]: {} });
+  return state[EMULATION_STATES_KEY] || {};
+}
+
+async function setEmulationState(tabId, value) {
+  const states = await getEmulationStates();
+  if (value) {
+    states[tabId] = value;
+  } else {
+    delete states[tabId];
+  }
+  await sessionSet({ [EMULATION_STATES_KEY]: states });
 }
 
 async function getOwnership() {
@@ -966,6 +1161,7 @@ async function rememberTab(tab, kind = "created", context = null) {
     kind,
     sessionId: session.id,
     sessionName: session.name,
+    cleanQa: session.cleanQa === true,
     ownedAt: new Date().toISOString()
   };
   await setOwnership(ownership);
@@ -1010,6 +1206,8 @@ async function assertTabOwnership(tabId, options = {}) {
 
 async function forgetTab(tabId) {
   await bestEffort(cdpDetach(tabId), 2000, "cdp detach on forget");
+  cdpEventBrokers.delete(tabId);
+  await setEmulationState(tabId, null);
   const ownership = await getOwnership();
   const workTabs = await getWorkTabs();
   delete ownership[tabId];
@@ -1019,6 +1217,8 @@ async function forgetTab(tabId) {
 
 async function releaseOwnership(tabId, keepWorkState = false) {
   await bestEffort(cdpDetach(tabId), 2000, "cdp detach on release");
+  cdpEventBrokers.delete(tabId);
+  await setEmulationState(tabId, null);
   const ownership = await getOwnership();
   const workTabs = await getWorkTabs();
   if (keepWorkState && ownership[tabId]) {
@@ -1377,6 +1577,14 @@ async function withWorkingTab(tabId, label, operation) {
   } finally {
     await bestEffort(markTabIdle(tabId), 2500, "mark tab idle");
   }
+}
+
+async function runOwnedTabOperation(tabId, label, operation, visual = true) {
+  if (visual === false) {
+    await assertTabOwnership(tabId);
+    return operation();
+  }
+  return withWorkingTab(tabId, label, operation);
 }
 
 function pageText(maxChars) {
@@ -2473,7 +2681,8 @@ function pageResolveActionTarget(payload) {
   }
 
   let candidates = [];
-  const selector = payload.ref || payload.selector || locator?.ref;
+  const selector = payload.ref || payload.selector
+    || locator?.ref || locator?.selector || locator?.css;
   if (selector && !staleDocument) {
     candidates = deepQuery(selector);
   } else {
@@ -2492,7 +2701,11 @@ function pageResolveActionTarget(payload) {
   candidates = candidates.filter((element) => visible(element) && enabled(element));
   let recovered = false;
   let locatorScoreValue = 0;
-  if (locator) {
+  const locatorHasIdentity = locator && [
+    "documentId", "fingerprint", "tag", "id", "name", "type",
+    "role", "ariaLabel", "placeholder", "text", "href"
+  ].some((key) => locator[key]);
+  if (locatorHasIdentity) {
     const exact = candidates.length === 1 ? candidates[0] : null;
     const exactScore = exact ? locatorScore(exact, locator) : 0;
     const minimumScore = Math.max(20, Number(payload.minLocatorScore || 36));
@@ -2767,9 +2980,10 @@ function pageLocatorSnapshot(locator = {}) {
   } else if (locator.label) {
     candidates = deepRoots().flatMap((root) => Array.from(root.querySelectorAll("input,textarea,select,button")))
       .filter((element) => textMatches(
-        element.labels?.length
-          ? Array.from(element.labels).map((label) => label.innerText || label.textContent).join(" ")
-          : element.getAttribute("aria-label"),
+        element.getAttribute("aria-label")
+          || (element.labels?.length
+            ? Array.from(element.labels).map((label) => label.innerText || label.textContent).join(" ")
+            : ""),
         locator.label,
         locator.exact !== false
       ));
@@ -2825,6 +3039,7 @@ function pageLocatorSnapshot(locator = {}) {
       documentId: globalThis.__TABWARD_OBSERVE_DOCUMENT_ID__ || "",
       fingerprint,
       tag: element.tagName.toLowerCase(),
+      type: element.getAttribute("type") || "",
       role: implicitRole(element),
       name: accessibleName(element).slice(0, 500),
       text: (element.type === "password" ? "[REDACTED]" : normalize(element.innerText || element.textContent || element.value)).slice(0, 500),
@@ -2884,6 +3099,15 @@ function pageLocatorDomAction(payload) {
     element.dispatchEvent(new Event("change", { bubbles: true }));
     return { ok: true, values: Array.from(element.selectedOptions || []).map((option) => option.value) };
   }
+  if (payload.action === "check" || payload.action === "uncheck") {
+    if (!(element instanceof HTMLInputElement) || element.type !== "checkbox") {
+      return { ok: false, error: `${payload.action} requires an input[type=checkbox] target` };
+    }
+    element.checked = payload.action === "check";
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true, checked: element.checked };
+  }
   if (payload.action === "focus") {
     element.focus();
     return { ok: document.activeElement === element };
@@ -2893,6 +3117,240 @@ function pageLocatorDomAction(payload) {
     return { ok: document.activeElement !== element };
   }
   return { ok: false, error: `Unsupported DOM action: ${payload.action}` };
+}
+
+function pageProbe(payload) {
+  const limit = Math.max(1, Math.min(200, Number(payload.limit || 50)));
+  const allowedStyles = new Set([
+    "display", "visibility", "opacity", "position", "overflow", "overflow-x",
+    "overflow-y", "width", "height", "max-width", "max-height", "color",
+    "background-color", "font-size", "line-height", "z-index", "transform"
+  ]);
+  function roots(root = document) {
+    const values = [root];
+    for (const element of root.querySelectorAll("*")) {
+      if (element.shadowRoot) values.push(...roots(element.shadowRoot));
+    }
+    return values;
+  }
+  function resolveSelector(selector) {
+    const segments = String(selector || "").split(/\s*>>>\s*/).filter(Boolean);
+    let root = document;
+    let element = null;
+    for (let index = 0; index < segments.length; index += 1) {
+      element = root.querySelector(segments[index]);
+      if (!element) return null;
+      if (index < segments.length - 1) {
+        root = element.shadowRoot;
+        if (!root) return null;
+      }
+    }
+    return element;
+  }
+  function normalized(value) {
+    return String(value ?? "").replace(/\s+/g, " ").trim();
+  }
+  function deepElements() {
+    return roots().flatMap((root) => Array.from(root.querySelectorAll("*")));
+  }
+  function implicitRole(element) {
+    return element.getAttribute("role")
+      || ({
+        BUTTON: "button", A: element.hasAttribute("href") ? "link" : "",
+        INPUT: ["checkbox", "radio"].includes(element.type) ? element.type : "textbox",
+        SELECT: "combobox", TEXTAREA: "textbox", IMG: "img"
+      }[element.tagName] || "");
+  }
+  function accessibleName(element) {
+    const labelledBy = element.getAttribute("aria-labelledby");
+    if (labelledBy) {
+      return labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.textContent || "").join(" ");
+    }
+    if (element.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+      if (label) return label.textContent || "";
+    }
+    const wrappingLabel = element.closest("label");
+    return element.getAttribute("aria-label")
+      || wrappingLabel?.textContent
+      || element.getAttribute("alt")
+      || element.getAttribute("title")
+      || element.getAttribute("placeholder")
+      || element.innerText
+      || element.value
+      || "";
+  }
+  function resolveLocator(locator) {
+    const direct = locator?.ref || locator?.selector || locator?.css;
+    if (direct) {
+      try {
+        return resolveSelector(direct);
+      } catch (_error) {
+        return null;
+      }
+    }
+    let candidates = deepElements();
+    if (locator?.testId) {
+      candidates = candidates.filter((element) =>
+        element.getAttribute("data-testid") === locator.testId
+        || element.getAttribute("data-test-id") === locator.testId
+      );
+    }
+    if (locator?.role) {
+      candidates = candidates.filter((element) => implicitRole(element) === locator.role);
+    }
+    const checks = [
+      ["name", (element) => accessibleName(element)],
+      ["label", (element) => accessibleName(element)],
+      ["text", (element) => element.innerText || element.textContent],
+      ["placeholder", (element) => element.getAttribute("placeholder")],
+      ["alt", (element) => element.getAttribute("alt")],
+      ["title", (element) => element.getAttribute("title")]
+    ];
+    for (const [key, read] of checks) {
+      if (!locator?.[key]) continue;
+      const expected = normalized(locator[key]);
+      candidates = candidates.filter((element) => {
+        const actual = normalized(read(element));
+        return locator.exact === true ? actual === expected : actual.includes(expected);
+      });
+    }
+    if (locator?.visible !== false) candidates = candidates.filter(visible);
+    const index = Math.max(0, Number(locator?.index || 0));
+    return candidates[index] || null;
+  }
+  function rect(element) {
+    const value = element.getBoundingClientRect();
+    return {
+      x: Math.round(value.x), y: Math.round(value.y),
+      width: Math.round(value.width), height: Math.round(value.height),
+      top: Math.round(value.top), right: Math.round(value.right),
+      bottom: Math.round(value.bottom), left: Math.round(value.left)
+    };
+  }
+  function visible(element) {
+    const style = getComputedStyle(element);
+    const box = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden"
+      && style.opacity !== "0" && box.width > 0 && box.height > 0;
+  }
+  const selector = payload.selector;
+  const locator = payload.locator || (selector ? { selector } : null);
+  const target = locator ? resolveLocator(locator) : null;
+  const operation = String(payload.operation || "page_metrics");
+  if (selector && !target) return { ok: false, error: "Probe target was not found" };
+  if (operation === "page_metrics") {
+    return {
+      ok: true,
+      viewport: { width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio },
+      document: {
+        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
+      },
+      scroll: { x: scrollX, y: scrollY }
+    };
+  }
+  if (operation === "overflow") {
+    const viewportWidth = document.documentElement.clientWidth;
+    const viewportHeight = document.documentElement.clientHeight;
+    const offenders = roots().flatMap((root) => Array.from(root.querySelectorAll("*")))
+      .map((element) => ({ element, box: element.getBoundingClientRect() }))
+      .filter(({ element, box }) => visible(element) && (
+        box.right > viewportWidth + 1 || box.left < -1 || box.bottom > viewportHeight + 1
+      ))
+      .slice(0, limit)
+      .map(({ element, box }) => ({
+        tag: element.tagName.toLowerCase(),
+        id: element.id || "",
+        className: String(element.className || "").slice(0, 200),
+        rect: {
+          x: Math.round(box.x), y: Math.round(box.y),
+          width: Math.round(box.width), height: Math.round(box.height),
+          right: Math.round(box.right), bottom: Math.round(box.bottom)
+        }
+      }));
+    return {
+      ok: true,
+      horizontal: document.documentElement.scrollWidth > viewportWidth + 1,
+      vertical: document.documentElement.scrollHeight > viewportHeight + 1,
+      viewport: { width: viewportWidth, height: viewportHeight },
+      document: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
+      offenders
+    };
+  }
+  if (operation === "box") {
+    const box = rect(target);
+    const top = document.elementFromPoint(
+      Math.max(0, Math.min(innerWidth - 1, box.x + box.width / 2)),
+      Math.max(0, Math.min(innerHeight - 1, box.y + box.height / 2))
+    );
+    return {
+      ok: true, rect: box, visible: visible(target),
+      inViewport: box.bottom > 0 && box.right > 0 && box.top < innerHeight && box.left < innerWidth,
+      receivesEvents: top === target || target.contains(top),
+      overlappedBy: top && top !== target && !target.contains(top)
+        ? { tag: top.tagName.toLowerCase(), id: top.id || "", className: String(top.className || "").slice(0, 200) }
+        : null
+    };
+  }
+  if (operation === "computed_style") {
+    const style = getComputedStyle(target);
+    const requested = (payload.properties || []).filter((name) => allowedStyles.has(String(name))).slice(0, 50);
+    return { ok: true, properties: Object.fromEntries(requested.map((name) => [name, style.getPropertyValue(name)])) };
+  }
+  if (operation === "dom") {
+    const property = String(payload.property || "");
+    const attribute = String(payload.attribute || "");
+    const safeProperties = new Set(["textContent", "innerText", "value", "checked", "disabled", "selected", "tagName"]);
+    return {
+      ok: true,
+      count: selector
+        ? roots().reduce((sum, root) => {
+          try {
+            return sum + root.querySelectorAll(selector).length;
+          } catch (_error) {
+            return sum;
+          }
+        }, 0)
+        : target ? 1 : 0,
+      text: String(target?.innerText || target?.textContent || "").slice(0, 5_000),
+      attribute: attribute ? target?.getAttribute(attribute) : undefined,
+      property: safeProperties.has(property) ? target?.[property] : undefined
+    };
+  }
+  if (operation === "image") {
+    return {
+      ok: true,
+      tag: target.tagName.toLowerCase(),
+      loaded: target.tagName === "IMG" ? target.complete && target.naturalWidth > 0 : true,
+      currentSrc: String(target.currentSrc || target.src || "").slice(0, 2_000),
+      naturalWidth: Number(target.naturalWidth || 0),
+      naturalHeight: Number(target.naturalHeight || 0),
+      rect: rect(target)
+    };
+  }
+  if (operation === "animation") {
+    return {
+      ok: true,
+      animations: target.getAnimations({ subtree: true }).slice(0, limit).map((animation) => ({
+        playState: animation.playState,
+        currentTime: Number(animation.currentTime || 0),
+        startTime: Number(animation.startTime || 0),
+        timing: animation.effect?.getComputedTiming?.()
+      }))
+    };
+  }
+  if (operation === "accessibility") {
+    return {
+      ok: true,
+      role: implicitRole(target),
+      name: String(target.getAttribute("aria-label") || target.innerText || target.value || "").trim().slice(0, 500),
+      disabled: target.disabled === true || target.getAttribute("aria-disabled") === "true",
+      expanded: target.getAttribute("aria-expanded"),
+      checked: target.checked === true || target.getAttribute("aria-checked") === "true"
+    };
+  }
+  return { ok: false, error: `Unsupported probe: ${operation}` };
 }
 
 function pageStorageOperation(payload) {
@@ -3554,6 +4012,48 @@ function waitForDownloadComplete(downloadId, timeoutMs) {
   });
 }
 
+async function reconcileCreatedDownload(startedAt, options = {}) {
+  const items = await chrome.downloads.search({
+    orderBy: ["-startTime"],
+    limit: 100
+  });
+  const candidates = items
+    .filter((item) => {
+      if (options.beforeIds?.has(item.id)) return false;
+      const itemTime = item.startTime ? new Date(item.startTime).getTime() : 0;
+      return itemTime + 1000 >= startedAt;
+    })
+    .map((item) => {
+      let score = 0;
+      if (options.expectedUrl && item.url === options.expectedUrl) {
+        score += 100;
+      } else if (options.expectedUrl) {
+        try {
+          const expected = new URL(options.expectedUrl);
+          const actual = new URL(item.url);
+          if (expected.origin === actual.origin && expected.pathname === actual.pathname) {
+            score += 60;
+          }
+        } catch (_error) {
+        }
+      }
+      if (options.sourceUrl && item.referrer) {
+        try {
+          if (new URL(options.sourceUrl).origin === new URL(item.referrer).origin) {
+            score += 30;
+          }
+        } catch (_error) {
+        }
+      }
+      return { item, score };
+    })
+    .filter((candidate) => candidate.score >= (options.expectedUrl ? 60 : 30))
+    .sort((left, right) => right.score - left.score);
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1 && candidates[0].score === candidates[1].score) return null;
+  return candidates[0];
+}
+
 function waitForNewTab(sourceTabId, startedAt, timeoutMs) {
   let cancel = null;
   const promise = new Promise((resolve) => {
@@ -3670,7 +4170,67 @@ async function commandOpenTab(payload) {
   let tab;
   let windowCreated = false;
   let workspaceWindowId;
-  if (workspace === "isolated") {
+  if (session.cleanQa === true) {
+    let cleanState = await validateCleanQa(session);
+    if (!cleanState || cleanState.status === "tainted") {
+      const error = new Error(cleanState?.reason || "Clean QA state is unavailable");
+      error.name = "CleanQaTainted";
+      throw error;
+    }
+    if (cleanState.status === "ready") {
+      const createdWindow = await chrome.windows.create({
+        url,
+        focused: false,
+        type: "normal",
+        incognito: true
+      });
+      tab = createdWindow.tabs?.[0];
+      if (!tab?.id || createdWindow.id === undefined || createdWindow.incognito !== true) {
+        throw new Error("Chrome did not return a Clean QA incognito window and tab");
+      }
+      workspaceWindowId = createdWindow.id;
+      windowCreated = true;
+      await rememberSessionWindow(session, createdWindow.id);
+      await rememberTab(tab, "created", session);
+      const states = await getCleanQaStates();
+      cleanState = {
+        ...states[session.id],
+        status: "active",
+        windowId: createdWindow.id,
+        createdTabIds: [tab.id],
+        updatedAt: new Date().toISOString()
+      };
+      states[session.id] = cleanState;
+      await setCleanQaStates(states);
+      cleanState = await validateCleanQa(session);
+      if (cleanState?.status === "tainted") {
+        await bestEffort(chrome.tabs.remove(tab.id), 5000, "close tainted Clean QA tab");
+        await bestEffort(chrome.windows.remove(createdWindow.id), 5000, "close tainted Clean QA window");
+        await forgetTab(tab.id);
+        const error = new Error(cleanState.reason || "Clean QA became tainted while opening its workspace");
+        error.name = "CleanQaTainted";
+        throw error;
+      }
+    } else {
+      workspaceWindowId = cleanState.windowId;
+      tab = await chrome.tabs.create({
+        url,
+        active: Boolean(payload.active),
+        windowId: cleanState.windowId
+      });
+      await rememberTab(tab, "created", session);
+      const states = await getCleanQaStates();
+      states[session.id] = {
+        ...states[session.id],
+        createdTabIds: Array.from(new Set([
+          ...(states[session.id]?.createdTabIds || []),
+          tab.id
+        ])),
+        updatedAt: new Date().toISOString()
+      };
+      await setCleanQaStates(states);
+    }
+  } else if (workspace === "isolated") {
     const existingWindow = await getLiveSessionWindow(session);
     if (existingWindow) {
       workspaceWindowId = existingWindow.id;
@@ -3708,10 +4268,12 @@ async function commandOpenTab(payload) {
     tab = await chrome.tabs.create(createInfo);
     workspaceWindowId = tab.windowId;
   }
-  await rememberTab(tab, "created", session);
+  if (session.cleanQa !== true) {
+    await rememberTab(tab, "created", session);
+  }
   let groupId = tab.groupId;
   let groupError = null;
-  if (payload.group !== false) {
+  if (payload.group !== false && session.cleanQa !== true) {
     try {
       groupId = await withTimeout(
         putInWorkspace(
@@ -3758,7 +4320,10 @@ async function commandOpenTab(payload) {
     requestedWorkspace,
     workspaceEnforcedBy: "extension_user_setting",
     workspaceWindowId,
-    windowCreated
+    windowCreated,
+    cleanQa: publicCleanQaState(
+      session.cleanQa === true ? await validateCleanQa(session) : null
+    )
   };
 }
 
@@ -3795,6 +4360,17 @@ async function commandNavigateAdvanced(payload) {
       networkIdle = await waitForNetworkIdle(payload.tabId, timeoutMs, Number(payload.idleMs || 500));
     }
     return { ok: true, tab: slimTab(loaded), waitUntil, networkIdle };
+  });
+}
+
+async function commandHistory(payload, direction) {
+  return withWorkingTab(payload.tabId, direction === "back" ? "Back" : "Forward", async () => {
+    const timeoutMs = Math.max(100, Number(payload.timeoutMs || 30000));
+    const tab = direction === "back"
+      ? await chrome.tabs.goBack(payload.tabId)
+      : await chrome.tabs.goForward(payload.tabId);
+    if (payload.wait === false) return { ok: true, tab: slimTab(tab), direction };
+    return { ok: true, tab: slimTab(await waitForTabComplete(payload.tabId, timeoutMs)), direction };
   });
 }
 
@@ -3848,6 +4424,9 @@ async function commandTabs(payload) {
     workspace,
     workspaceEnforcedBy: "extension_user_setting",
     workspaceWindowId: workspaceWindow?.id ?? null,
+    cleanQa: publicCleanQaState(
+      session.cleanQa === true ? await validateCleanQa(session) : null
+    ),
     warnings: [
       ...(knownTabsResult && knownTabsResult.ok === false ? [knownTabsResult.error] : []),
       ...(activeTabsResult && activeTabsResult.ok === false ? [activeTabsResult.error] : [])
@@ -4374,7 +4953,7 @@ async function cdpSetInputFiles(tabId, ref, files) {
 }
 
 async function commandLocatorAction(payload) {
-  return withWorkingTab(payload.tabId, `Action: ${payload.action}`, async () => {
+  return runOwnedTabOperation(payload.tabId, `Action: ${payload.action}`, async () => {
     const options = payload.options || {};
     const frameId = options.frameId;
     const action = String(payload.action || "");
@@ -4483,6 +5062,23 @@ async function commandLocatorAction(payload) {
       if (target.checked !== desired) {
         await dispatchClick(payload.tabId, target, options);
       }
+      await sleep(50, activeCommandSignal);
+      let checked = await locatorSnapshot(payload.tabId, payload.locator, frameId);
+      if (checked?.target?.checked !== desired && options.domFallback !== false) {
+        const fallback = await executeInTab(payload.tabId, pageLocatorDomAction, [{
+          ref: target.ref,
+          action
+        }], { frameId });
+        if (!fallback?.ok) {
+          throw new Error(fallback?.error || `${action} was not accepted`);
+        }
+        native = false;
+        fallbackUsed = true;
+        checked = await locatorSnapshot(payload.tabId, payload.locator, frameId);
+      }
+      if (checked?.target?.checked !== desired) {
+        throw new Error(`${action} did not reach the requested checkbox state`);
+      }
     } else if (["select", "focus", "blur"].includes(action)) {
       const result = await executeInTab(payload.tabId, pageLocatorDomAction, [{
         ref: target.ref,
@@ -4498,17 +5094,21 @@ async function commandLocatorAction(payload) {
         frameId: options.targetFrameId,
         receivesEvents: true
       });
-      await cdpSend(payload.tabId, "Input.dispatchMouseEvent", {
-        type: "mouseMoved", x: target.x, y: target.y, button: "none"
+      const dragData = {
+        items: [{
+          mimeType: "text/plain",
+          data: String(options.dragData ?? target.text ?? "")
+        }],
+        dragOperationsMask: 1
+      };
+      await cdpSend(payload.tabId, "Input.dispatchDragEvent", {
+        type: "dragEnter", x: destination.x, y: destination.y, data: dragData
       });
-      await cdpSend(payload.tabId, "Input.dispatchMouseEvent", {
-        type: "mousePressed", x: target.x, y: target.y, button: "left", buttons: 1, clickCount: 1
+      await cdpSend(payload.tabId, "Input.dispatchDragEvent", {
+        type: "dragOver", x: destination.x, y: destination.y, data: dragData
       });
-      await cdpSend(payload.tabId, "Input.dispatchMouseEvent", {
-        type: "mouseMoved", x: destination.x, y: destination.y, button: "left", buttons: 1
-      });
-      await cdpSend(payload.tabId, "Input.dispatchMouseEvent", {
-        type: "mouseReleased", x: destination.x, y: destination.y, button: "left", clickCount: 1
+      await cdpSend(payload.tabId, "Input.dispatchDragEvent", {
+        type: "drop", x: destination.x, y: destination.y, data: dragData
       });
       return { ok: true, action, source: target, destination };
     } else if (action === "upload") {
@@ -4539,7 +5139,53 @@ async function commandLocatorAction(payload) {
         { step: "next_action", value: options.nextAction || null }
       ]
     };
-  });
+  }, payload.visual !== false);
+}
+
+async function commandForm(payload) {
+  const results = [];
+  for (const [index, field] of (payload.fields || []).entries()) {
+    const startedAt = Date.now();
+    try {
+      const result = await commandLocatorAction({
+        tabId: payload.tabId,
+        action: field.action,
+        locator: field.locator,
+        value: field.value,
+        options: field.options || {},
+        timeoutMs: payload.timeoutMs,
+        cursor: false,
+        visual: false
+      });
+      results.push({
+        index, action: field.action, ok: result?.ok !== false,
+        elapsedMs: Date.now() - startedAt,
+        target: result?.target ? {
+          tag: result.target.tag, role: result.target.role,
+          name: result.target.name, ref: result.target.ref
+        } : null
+      });
+      if (result?.ok === false) return { ok: false, stoppedAt: index, fields: results };
+    } catch (error) {
+      results.push({ index, action: field.action, ok: false, error: toSafeError(error) });
+      return { ok: false, stoppedAt: index, fields: results };
+    }
+  }
+  let submitted = false;
+  if (payload.submitLocator) {
+    await commandLocatorAction({
+      tabId: payload.tabId,
+      action: "click",
+      locator: payload.submitLocator,
+      options: {},
+      timeoutMs: payload.timeoutMs,
+      cursor: false
+      ,
+      visual: false
+    });
+    submitted = true;
+  }
+  return { ok: true, fields: results, submitted };
 }
 
 async function commandLocatorWait(payload) {
@@ -4739,6 +5385,33 @@ async function commandDownloadClick(payload) {
       };
     }
     if (signal?.timedOut) {
+      const reconciled = await reconcileCreatedDownload(startedAt, {
+        beforeIds: new Set(beforeDownloads.map((item) => item.id)),
+        expectedUrl: target.href,
+        sourceUrl: sourceTab.url
+      });
+      if (reconciled?.item) {
+        const completed = await waitForDownloadComplete(reconciled.item.id, 5000);
+        const download = completed || reconciled.item;
+        await rememberDownload(download.id);
+        return {
+          ok: download.state === "complete",
+          kind: "download_started",
+          actionAccepted: true,
+          verified: download.state === "complete",
+          downloadId: download.id,
+          filename: download.filename?.split(/[\\/]/).pop() || "",
+          mime: download.mime || "",
+          size: download.fileSize ?? download.totalBytes ?? 0,
+          status: download.state,
+          click: action,
+          download: slimDownload(download),
+          correlation: {
+            reconciled: true,
+            score: reconciled.score
+          }
+        };
+      }
       const newTab = await newTabPromise;
       if (newTab?.tab) {
         return {
@@ -4957,6 +5630,7 @@ async function commandAttach(payload) {
 
 async function commandDetach(payload) {
   await cdpDetach(payload.tabId);
+  cdpEventBrokers.delete(payload.tabId);
   return { ok: true, tabId: payload.tabId, attached: false };
 }
 
@@ -5091,7 +5765,7 @@ async function commandNetworkHar(payload) {
     ok: true,
     log: {
       version: "1.2",
-      creator: { name: "TabWard", version: "0.2.0" },
+      creator: { name: "TabWard", version: "0.3.0" },
       pages: [],
       entries
     }
@@ -5154,30 +5828,117 @@ async function commandInterceptionStop(payload) {
   return { ok: true };
 }
 
+function pageViewportState() {
+  return {
+    width: globalThis.innerWidth,
+    height: globalThis.innerHeight,
+    deviceScaleFactor: globalThis.devicePixelRatio
+  };
+}
+
 async function commandEmulation(payload) {
-  const settings = payload.settings || {};
+  const settings = { ...(payload.settings || {}) };
+  const presets = {
+    desktop: { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false, touch: false },
+    mobile: { width: 393, height: 852, deviceScaleFactor: 3, mobile: true, touch: true, maxTouchPoints: 5 },
+    tablet: { width: 820, height: 1180, deviceScaleFactor: 2, mobile: true, touch: true, maxTouchPoints: 5 }
+  };
+  if (settings.preset && presets[settings.preset]) {
+    settings.viewport = presets[settings.preset];
+  }
   if (settings.clear === true) {
-    await bestEffort(cdpSend(payload.tabId, "Emulation.clearDeviceMetricsOverride", {}), 3000, "clear metrics");
-    await bestEffort(cdpSend(payload.tabId, "Emulation.clearGeolocationOverride", {}), 3000, "clear geolocation");
-    await bestEffort(cdpSend(payload.tabId, "Emulation.setEmulatedMedia", { media: "", features: [] }), 3000, "clear media");
-    await bestEffort(cdpSend(payload.tabId, "Emulation.setTimezoneOverride", { timezoneId: "" }), 3000, "clear timezone");
-    return { ok: true, cleared: true };
+    const cleanup = {
+      metrics: await bestEffort(cdpSend(payload.tabId, "Emulation.clearDeviceMetricsOverride", {}), 3000, "clear metrics"),
+      touch: await bestEffort(cdpSend(payload.tabId, "Emulation.setTouchEmulationEnabled", { enabled: false }), 3000, "clear touch"),
+      geolocation: await bestEffort(cdpSend(payload.tabId, "Emulation.clearGeolocationOverride", {}), 3000, "clear geolocation"),
+      media: await bestEffort(cdpSend(payload.tabId, "Emulation.setEmulatedMedia", { media: "", features: [] }), 3000, "clear media"),
+      timezone: await bestEffort(cdpSend(payload.tabId, "Emulation.setTimezoneOverride", { timezoneId: "" }), 3000, "clear timezone"),
+      locale: await bestEffort(cdpSend(payload.tabId, "Emulation.setLocaleOverride", { locale: "" }), 3000, "clear locale"),
+      network: await bestEffort(cdpSend(payload.tabId, "Network.emulateNetworkConditions", {
+        offline: false,
+        latency: 0,
+        downloadThroughput: -1,
+        uploadThroughput: -1
+      }), 3000, "clear network")
+    };
+    const failures = Object.entries(cleanup)
+      .filter(([, result]) => result?.ok === false)
+      .map(([operation, result]) => ({ operation, error: result.error }));
+    if (failures.length === 0) {
+      await setEmulationState(payload.tabId, null);
+    }
+    return { ok: failures.length === 0, cleared: true, cleanup, failures };
   }
   const applied = [];
   if (settings.viewport) {
     const viewport = settings.viewport;
-    await cdpSend(payload.tabId, "Emulation.setDeviceMetricsOverride", {
-      width: Math.max(0, Number(viewport.width || 1280)),
-      height: Math.max(0, Number(viewport.height || 720)),
-      deviceScaleFactor: Math.max(0, Number(viewport.deviceScaleFactor || 1)),
+    const requestedWidth = Math.max(0, Number(viewport.width || 1280));
+    const requestedHeight = Math.max(0, Number(viewport.height || 720));
+    const requestedDeviceScaleFactor = Math.max(0, Number(viewport.deviceScaleFactor || 1));
+    const metrics = {
+      width: requestedWidth,
+      height: requestedHeight,
+      deviceScaleFactor: requestedDeviceScaleFactor,
       mobile: viewport.mobile === true,
       screenOrientation: viewport.screenOrientation
-    });
-    if (viewport.touch === true) {
+    };
+    let observed = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await cdpSend(payload.tabId, "Emulation.setDeviceMetricsOverride", metrics);
       await cdpSend(payload.tabId, "Emulation.setTouchEmulationEnabled", {
-        enabled: true,
-        maxTouchPoints: Number(viewport.maxTouchPoints || 1)
+        enabled: viewport.touch === true,
+        maxTouchPoints: viewport.touch === true
+          ? Number(viewport.maxTouchPoints || 1)
+          : 1
       });
+      await sleep(50, activeCommandSignal);
+      observed = await executeInTab(payload.tabId, pageViewportState);
+      const sizeMatched = Math.abs(Number(observed?.width || 0) - requestedWidth) <= VIEWPORT_TOLERANCE_PX
+        && Math.abs(Number(observed?.height || 0) - requestedHeight) <= VIEWPORT_TOLERANCE_PX;
+      const scaleMatched = requestedDeviceScaleFactor === 0
+        || Math.abs(Number(observed?.deviceScaleFactor || 0) - requestedDeviceScaleFactor) < 0.01;
+      if (sizeMatched && scaleMatched) {
+        break;
+      }
+      if (attempt < 2) {
+        if (Number(observed?.width) > 0) {
+          metrics.width = Math.max(
+            1,
+            Math.round(metrics.width * requestedWidth / Number(observed.width))
+          );
+        }
+        if (Number(observed?.height) > 0) {
+          metrics.height = Math.max(
+            1,
+            Math.round(metrics.height * requestedHeight / Number(observed.height))
+          );
+        }
+        if (Number(observed?.deviceScaleFactor) > 0 && requestedDeviceScaleFactor > 0) {
+          metrics.deviceScaleFactor *= requestedDeviceScaleFactor
+            / Number(observed.deviceScaleFactor);
+        }
+      }
+    }
+    const sizeMatched = Math.abs(Number(observed?.width || 0) - requestedWidth) <= VIEWPORT_TOLERANCE_PX
+      && Math.abs(Number(observed?.height || 0) - requestedHeight) <= VIEWPORT_TOLERANCE_PX;
+    const scaleMatched = requestedDeviceScaleFactor === 0
+      || Math.abs(Number(observed?.deviceScaleFactor || 0) - requestedDeviceScaleFactor) < 0.01;
+    if (!sizeMatched || !scaleMatched) {
+      await bestEffort(
+        cdpSend(payload.tabId, "Emulation.clearDeviceMetricsOverride", {}),
+        3000,
+        "rollback unstable viewport emulation"
+      );
+      await bestEffort(
+        cdpSend(payload.tabId, "Emulation.setTouchEmulationEnabled", { enabled: false }),
+        3000,
+        "rollback unstable touch emulation"
+      );
+      const error = new Error(
+        `Viewport emulation did not stabilize at ${requestedWidth}x${requestedHeight}@${requestedDeviceScaleFactor}; observed ${observed?.width}x${observed?.height}@${observed?.deviceScaleFactor}`
+      );
+      error.name = "EmulationVerificationError";
+      throw error;
     }
     applied.push("viewport");
   }
@@ -5223,6 +5984,14 @@ async function commandEmulation(payload) {
     });
     applied.push("network");
   }
+  const previous = (await getEmulationStates())[payload.tabId] || {};
+  await setEmulationState(payload.tabId, {
+    ...previous,
+    ...settings,
+    viewport: settings.viewport
+      ? { ...(previous.viewport || {}), ...settings.viewport }
+      : previous.viewport
+  });
   return { ok: true, applied };
 }
 
@@ -5387,7 +6156,23 @@ async function commandScreenshot(payload) {
   if (format !== "png") {
     params.quality = quality;
   }
-  if (payload.clip && typeof payload.clip === "object") {
+  if (payload.scope === "element") {
+    const target = await resolveLocator(payload.tabId, payload.locator, {
+      timeoutMs: payload.timeoutMs || 30000,
+      receivesEvents: false,
+      frameId: payload.frameId
+    });
+    const metrics = await cdpSend(payload.tabId, "Page.getLayoutMetrics", {});
+    const viewport = metrics.cssVisualViewport || metrics.visualViewport || {};
+    params.clip = {
+      x: Math.max(0, Number(viewport.pageX || 0) + Number(target.rect?.x || 0)),
+      y: Math.max(0, Number(viewport.pageY || 0) + Number(target.rect?.y || 0)),
+      width: Math.max(1, Number(target.rect?.width || 1)),
+      height: Math.max(1, Number(target.rect?.height || 1)),
+      scale: 1
+    };
+    params.captureBeyondViewport = true;
+  } else if (payload.clip && typeof payload.clip === "object") {
     params.clip = payload.clip;
   } else if (payload.fullPage === true) {
     const metrics = await cdpSend(payload.tabId, "Page.getLayoutMetrics", {});
@@ -5434,7 +6219,22 @@ async function commandScreenshot(payload) {
 }
 
 async function commandEvaluate(payload) {
-  if (payload.privileged !== true) {
+  const tab = await chrome.tabs.get(payload.tabId);
+  if (payload.localOnly === true) {
+    await assertTabOwnership(payload.tabId, { createdOnly: true });
+    let url;
+    try {
+      url = new URL(String(tab.url || ""));
+    } catch {
+      throw new Error("Managed evaluate requires a valid loopback URL");
+    }
+    if (!["http:", "https:"].includes(url.protocol)
+      || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+      const error = new Error("Managed evaluate is allowed only on localhost or loopback pages; use tabward_probe instead");
+      error.name = "LocalEvaluateOnly";
+      throw error;
+    }
+  } else if (payload.privileged !== true) {
     const error = new Error("Runtime evaluation requires privileged mode");
     error.name = "PrivilegedModeError";
     throw error;
@@ -5455,7 +6255,181 @@ async function commandEvaluate(payload) {
   if (result.exceptionDetails) {
     return { ok: false, error: { description: result.exceptionDetails.exception?.description || result.exceptionDetails.text, line: result.exceptionDetails.lineNumber, column: result.exceptionDetails.columnNumber } };
   }
+  const serialized = JSON.stringify(result.result ?? null);
+  if (serialized.length > 1_000_000) {
+    const error = new Error("Evaluate result exceeded 1,000,000 characters");
+    error.name = "ResultTooLarge";
+    throw error;
+  }
   return { ok: true, result: result.result };
+}
+
+async function commandProbe(payload) {
+  const resolvedPayload = { ...payload };
+  if (payload.locator) {
+    const snapshot = await locatorSnapshot(payload.tabId, payload.locator, payload.frameId);
+    if (!snapshot?.target?.ref) {
+      return { ok: false, error: "Probe target was not found" };
+    }
+    resolvedPayload.locator = { selector: snapshot.target.ref };
+    delete resolvedPayload.selector;
+  }
+  return sanitizeBrowserPayload(await executeInTab(
+    payload.tabId,
+    pageProbe,
+    [resolvedPayload],
+    { frameId: payload.frameId }
+  ));
+}
+
+async function commandQa(payload) {
+  const steps = [];
+  const screenshots = [];
+  const cleanup = [];
+  const categories = [
+    ...(payload.captureConsole === false ? [] : ["console"]),
+    ...(payload.captureNetwork === false ? [] : ["network"])
+  ];
+  const hadCdpAttachment = cdpTabs.has(payload.tabId);
+  const priorBroker = cdpEventBrokers.get(payload.tabId);
+  const priorBrokerState = priorBroker ? {
+    categories: new Set(priorBroker.categories),
+    started: priorBroker.started
+  } : null;
+  const priorEmulationState = (await getEmulationStates())[payload.tabId];
+  const priorEmulation = priorEmulationState
+    ? structuredClone(priorEmulationState)
+    : null;
+  let eventCursor = 0;
+  let emulationApplied = false;
+  let eventsStarted = false;
+  let result = null;
+  try {
+    if (payload.preset || payload.viewport) {
+      emulationApplied = true;
+      const emulation = await commandEmulation({
+        tabId: payload.tabId,
+        settings: { preset: payload.preset, viewport: payload.viewport }
+      });
+      steps.push({ type: "emulation", ok: true, result: emulation });
+    }
+    if (categories.length) {
+      const started = await commandEventsStart({ tabId: payload.tabId, categories });
+      eventsStarted = true;
+      eventCursor = started.cursor || 0;
+      steps.push({ type: "events_start", ok: true, categories });
+    }
+    for (const probe of payload.probes || []) {
+      const result = await commandProbe({
+        tabId: payload.tabId,
+        ...probe,
+        frameId: probe.frame_id ?? probe.frameId
+      });
+      steps.push({ type: "probe", operation: probe.operation, ok: result?.ok !== false, result });
+      if (result?.ok === false) {
+        return { ok: false, steps, screenshots, cleanup };
+      }
+    }
+    for (const assertion of payload.assertions || []) {
+      const result = await commandLocatorAssert({
+        tabId: payload.tabId,
+        ...assertion,
+        timeoutMs: payload.timeoutMs
+      });
+      steps.push({ type: "assertion", assertion: assertion.assertion, ok: result.passed === true, result });
+      if (!result.passed) {
+        return { ok: false, steps, screenshots, cleanup };
+      }
+    }
+    for (const [index, shot] of (payload.screenshots || []).entries()) {
+      const result = await commandScreenshot({
+        tabId: payload.tabId,
+        scope: shot.scope,
+        locator: shot.locator,
+        frameId: shot.frame_id ?? shot.frameId,
+        fullPage: shot.scope === "full_page",
+        format: "png",
+        timeoutMs: payload.timeoutMs,
+        visual: false
+      });
+      screenshots.push({ ...result, name: shot.name || `qa-${index + 1}` });
+    }
+    const events = categories.length
+      ? await commandEventsPoll({ tabId: payload.tabId, cursor: eventCursor, categories, limit: 500 })
+      : { events: [] };
+    const consoleErrors = (events.events || []).filter((event) =>
+      event.category === "console"
+      && /exception|error/i.test(`${event.method} ${JSON.stringify(event.params || {})}`)
+    );
+    result = {
+      ok: consoleErrors.length === 0,
+      steps,
+      screenshots,
+      events: events.events || [],
+      consoleErrors,
+      cleanup
+    };
+    return result;
+  } finally {
+    const operations = [];
+    if (emulationApplied) {
+      const cleared = await bestEffort(commandEmulation({
+        tabId: payload.tabId,
+        settings: { clear: true }
+      }), 8000, "clear QA emulation");
+      let restored = null;
+      if (cleared?.ok !== false && priorEmulation) {
+        restored = await bestEffort(commandEmulation({
+          tabId: payload.tabId,
+          settings: priorEmulation
+        }), 8000, "restore pre-QA emulation");
+      }
+      operations.push([
+        "emulation",
+        {
+          ok: cleared?.ok !== false && restored?.ok !== false,
+          cleared,
+          restored,
+          previousStateRestored: Boolean(priorEmulation)
+        }
+      ]);
+    }
+    if (eventsStarted) {
+      const broker = cdpEventBrokers.get(payload.tabId);
+      if (broker && priorBrokerState) {
+        broker.categories = priorBrokerState.categories;
+        broker.started = priorBrokerState.started;
+      } else if (broker) {
+        broker.categories.clear();
+        broker.started = false;
+      }
+      operations.push(["events", {
+        ok: true,
+        previousStateRestored: Boolean(priorBrokerState)
+      }]);
+    }
+    if (!hadCdpAttachment && cdpTabs.has(payload.tabId)) {
+      operations.push([
+        "cdp",
+        await bestEffort(cdpDetach(payload.tabId), 3000, "detach QA CDP")
+      ]);
+    } else {
+      operations.push(["cdp", {
+        ok: true,
+        preservedExistingAttachment: hadCdpAttachment
+      }]);
+    }
+    if (!priorBroker) {
+      cdpEventBrokers.delete(payload.tabId);
+    }
+    for (const [operation, value] of operations) {
+      cleanup.push({ operation, ok: value?.ok !== false, result: value });
+    }
+    if (result) {
+      const cleanupFailed = cleanup.some((item) => item.ok === false);
+      if (cleanupFailed) result.ok = false;
+    }
+  }
 }
 
 async function commandInputMouse(payload) {
@@ -5631,8 +6605,12 @@ async function commandWorkflow(payload) {
 async function commandNameSession(payload) {
   const session = await resolveSessionContext(payload);
   session.name = payload.name || session.name || "TabWard session";
+  let cleanQa = null;
+  if (session.cleanQa === true) {
+    cleanQa = await prepareCleanQa(session);
+  }
   const workspace = await getSessionWorkspace(session);
-  return { ok: true, session, workspace };
+  return { ok: true, session, workspace, cleanQa: publicCleanQaState(cleanQa) };
 }
 
 async function commandAdoptTab(payload) {
@@ -5719,14 +6697,44 @@ async function commandReleaseWorkspace(payload) {
   const ownership = await getOwnership();
   const released = [];
   const closed = [];
+  let cleanQa = null;
+  if (session.cleanQa === true) {
+    cleanQa = await validateCleanQa(session);
+  }
+  const closeCreatedTabs = payload.closeCreatedTabs === true || session.cleanQa === true;
+  const cleanWindowId = cleanQa?.windowId ?? null;
+  let foreignCleanTabs = [];
+  let cleanTabsVerified = true;
+  let cleanTabsVerificationError = null;
+  let cleanWindowClosed = !Number.isInteger(cleanWindowId);
+  let cleanWindowCloseError = null;
+  if (Number.isInteger(cleanWindowId)) {
+    const cleanTabsResult = await bestEffort(
+      chrome.tabs.query({ windowId: cleanWindowId }),
+      3000,
+      "list Clean QA tabs during cleanup"
+    );
+    cleanTabsVerified = Array.isArray(cleanTabsResult);
+    cleanTabsVerificationError = cleanTabsVerified ? null : cleanTabsResult?.error;
+    const cleanTabs = cleanTabsVerified ? cleanTabsResult : [];
+    foreignCleanTabs = cleanTabs.filter((tab) => {
+      const record = ownership[tab.id];
+      return !record || record.sessionId !== session.id;
+    });
+  }
+  const canCloseCreatedTabs = closeCreatedTabs
+    && (session.cleanQa !== true || cleanTabsVerified);
   for (const [rawTabId, record] of Object.entries(ownership)) {
     if (record?.sessionId !== session.id || record.kind === "released") {
+      continue;
+    }
+    if (session.cleanQa === true && !cleanTabsVerified) {
       continue;
     }
     const tabId = Number(rawTabId);
     await bestEffort(finishTabWork(tabId), 2500, "finish before workspace release");
     if (
-      payload.closeCreatedTabs === true
+      canCloseCreatedTabs
       && ["created", "created-child"].includes(record.kind)
     ) {
       await bestEffort(chrome.tabs.remove(tabId), 5000, "close workspace tab");
@@ -5737,13 +6745,59 @@ async function commandReleaseWorkspace(payload) {
       released.push(tabId);
     }
   }
+  if (Number.isInteger(cleanWindowId) && cleanTabsVerified && foreignCleanTabs.length === 0) {
+    const closeResult = await bestEffort(
+      chrome.windows.remove(cleanWindowId),
+      5000,
+      "close Clean QA window"
+    );
+    if (closeResult?.ok === false) {
+      const remainingWindows = await bestEffort(
+        incognitoWindows(),
+        3000,
+        "verify Clean QA window cleanup"
+      );
+      cleanWindowClosed = Array.isArray(remainingWindows)
+        && !remainingWindows.some((window) => window.id === cleanWindowId);
+      cleanWindowCloseError = cleanWindowClosed ? null : closeResult.error;
+    } else {
+      cleanWindowClosed = true;
+    }
+  }
   await forgetSessionWindow(session.id);
   await forgetSessionPolicy(session.id);
+  if (cleanWindowClosed || foreignCleanTabs.length > 0) {
+    await forgetCleanQaState(session.id);
+  } else {
+    const states = await getCleanQaStates();
+    if (states[session.id]) {
+      states[session.id] = {
+        ...states[session.id],
+        status: "tainted",
+        reason: cleanTabsVerified
+          ? "Could not close the Clean QA window"
+          : "Could not verify Clean QA tabs during cleanup",
+        leaseExpiresAt: Date.now() / 1000,
+        updatedAt: new Date().toISOString()
+      };
+      await setCleanQaStates(states);
+    }
+  }
   return {
     ok: true,
     released,
     closed,
-    workspaceWindowPreserved: payload.closeCreatedTabs !== true
+    workspaceWindowPreserved: session.cleanQa === true
+      ? !cleanWindowClosed
+      : payload.closeCreatedTabs !== true,
+    cleanQa: session.cleanQa === true ? {
+      closed: cleanWindowClosed,
+      wasTainted: cleanQa?.status === "tainted",
+      foreignTabsPreserved: foreignCleanTabs.map((tab) => tab.id),
+      inventoryVerified: cleanTabsVerified,
+      verificationError: cleanTabsVerificationError,
+      closeError: cleanWindowCloseError
+    } : null
   };
 }
 
@@ -5782,7 +6836,7 @@ async function commandGetInfo(payload) {
   return {
     ok: true,
     extensionId: chrome.runtime.id,
-    version: "0.2.0",
+    version: "0.3.0",
     cdpAttachedTabs: Array.from(cdpTabs),
     transport: transportStatus(),
     session: session && session.ok === false ? null : session,
@@ -5826,6 +6880,8 @@ const handlers = {
   openTab: commandOpenTab,
   navigate: commandNavigate,
   navigateAdvanced: commandNavigateAdvanced,
+  goBack: (payload) => commandHistory(payload, "back"),
+  goForward: (payload) => commandHistory(payload, "forward"),
   tabs: commandTabs,
   getText: commandGetText,
   getHtml: commandGetHtml,
@@ -5842,6 +6898,7 @@ const handlers = {
   smartClick: commandSmartClick,
   smartFill: commandSmartFill,
   locatorAction: commandLocatorAction,
+  form: commandForm,
   locatorWait: commandLocatorWait,
   locatorAssert: commandLocatorAssert,
   workflow: commandWorkflow,
@@ -5884,6 +6941,8 @@ const handlers = {
   screencastStop: commandScreencastStop,
   screenshot: commandScreenshot,
   evaluate: commandEvaluate,
+  probe: commandProbe,
+  qa: commandQa,
   inputMouse: commandInputMouse,
   inputKey: commandInputKey,
   inputScroll: commandInputScroll,
@@ -5909,11 +6968,25 @@ async function dispatch(command) {
   const payload = command.payload || {};
   const previousSessionContext = activeSessionContext;
   activeSessionContext = payload.sessionId
-    ? { id: String(payload.sessionId), name: String(payload.sessionName || "TabWard MCP") }
+    ? {
+      id: String(payload.sessionId),
+      name: String(payload.sessionName || "TabWard MCP"),
+      mode: String(payload.sessionMode || "managed"),
+      cleanQa: payload.cleanQa === true,
+      expiresAt: Number(payload.sessionExpiresAt || 0) || null
+    }
     : null;
   try {
     if (payload.tabId !== undefined && type !== "adoptTab" && type !== "openTab") {
       await assertTabOwnership(payload.tabId, { context: activeSessionContext || undefined });
+      if (activeSessionContext?.cleanQa === true) {
+        const cleanState = await validateCleanQa(activeSessionContext);
+        if (cleanState?.status === "tainted") {
+          const error = new Error(cleanState.reason || "Clean QA state is tainted");
+          error.name = "CleanQaTainted";
+          throw error;
+        }
+      }
     }
     const timeoutMs = Number.isFinite(payload.commandTimeoutMs)
       ? payload.commandTimeoutMs
@@ -6006,7 +7079,9 @@ chrome.tabs.onCreated.addListener((tab) => {
     }
     const session = {
       id: opener.sessionId,
-      name: opener.sessionName || "TabWard MCP"
+      name: opener.sessionName || "TabWard MCP",
+      mode: "managed",
+      cleanQa: opener.cleanQa === true
     };
     const workspaceWindow = await getLiveSessionWindow(session);
     let ownedTab = tab;
@@ -6018,6 +7093,22 @@ chrome.tabs.onCreated.addListener((tab) => {
     }
     await rememberTab(ownedTab, "created-child", session);
     try {
+      if (session.cleanQa === true) {
+        const states = await getCleanQaStates();
+        if (states[session.id]) {
+          states[session.id] = {
+            ...states[session.id],
+            createdTabIds: Array.from(new Set([
+              ...(states[session.id].createdTabIds || []),
+              ownedTab.id
+            ])),
+            updatedAt: new Date().toISOString()
+          };
+          await setCleanQaStates(states);
+        }
+        await validateCleanQa(session);
+        return;
+      }
       const groupId = await putInWorkspace(
         ownedTab.id,
         ownedTab.windowId,

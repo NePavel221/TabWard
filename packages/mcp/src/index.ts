@@ -11,7 +11,7 @@ import {
   type Session
 } from "./session.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const bridge = new BrokerClient();
 const sessions = new SessionPolicy();
 const objectSchema = z.record(z.unknown());
@@ -33,6 +33,40 @@ const locatorSchema = z.object({
   strict: z.boolean().optional(),
   visible: z.boolean().optional()
 }).passthrough();
+const probeOperationSchema = z.enum([
+  "overflow", "box", "computed_style", "dom",
+  "image", "animation", "accessibility", "page_metrics"
+]);
+const formFieldSchema = z.object({
+  locator: locatorSchema,
+  action: z.enum(["fill", "type", "check", "uncheck", "select"]),
+  value: z.unknown().optional(),
+  options: objectSchema.optional()
+}).strict();
+const viewportSchema = z.object({
+  width: z.number().int().min(1).max(10_000),
+  height: z.number().int().min(1).max(10_000),
+  deviceScaleFactor: z.number().min(0.1).max(10).optional(),
+  mobile: z.boolean().optional(),
+  touch: z.boolean().optional(),
+  maxTouchPoints: z.number().int().min(0).max(20).optional()
+}).strict();
+const emulationSettingsSchema = z.object({
+  preset: z.enum(["desktop", "mobile", "tablet"]).optional(),
+  clear: z.boolean().optional(),
+  viewport: viewportSchema.optional(),
+  geolocation: z.object({
+    latitude: z.number().min(-90).max(90),
+    longitude: z.number().min(-180).max(180),
+    accuracy: z.number().min(0).optional()
+  }).strict().optional(),
+  timezone: z.string().max(100).optional(),
+  locale: z.string().max(50).optional(),
+  media: z.string().max(50).optional(),
+  colorScheme: z.enum(["light", "dark", "no-preference"]).optional(),
+  reducedMotion: z.enum(["reduce", "no-preference"]).optional(),
+  userAgent: z.string().max(1_000).optional()
+}).strict();
 
 function hasLocator(locator: z.infer<typeof locatorSchema>): boolean {
   return [
@@ -53,7 +87,8 @@ const server = new McpServer({
     "Start a managed session by default.",
     "Managed sessions access only tabs they create.",
     "Observe before acting and close the session when finished.",
-    "Existing-tab adoption and privileged operations require full_profile mode."
+    "Managed sessions include full QA tools for tabs they create.",
+    "Existing-tab adoption, profile storage, interception, and expert CDP require full_profile mode."
   ].join(" ")
 });
 
@@ -70,7 +105,9 @@ function context(session: Session): Record<string, unknown> {
     sessionName: session.name,
     sessionMode: session.mode,
     canAdoptExistingTabs: session.capabilities.has("adopt_tabs"),
-    workspace: session.workspace
+    workspace: session.workspace,
+    cleanQa: session.cleanQa,
+    sessionExpiresAt: session.expiresAt
   };
 }
 
@@ -106,6 +143,10 @@ function syncSessionTabs(
   const windowId = tabIdFrom(result.workspaceWindowId);
   if (windowId !== null) {
     session.workspaceWindowId = windowId;
+  }
+  if (typeof result.cleanQa === "object" && result.cleanQa !== null) {
+    session.cleanQaTainted =
+      (result.cleanQa as { tainted?: unknown }).tainted === true;
   }
 }
 
@@ -171,9 +212,13 @@ server.registerTool("tabward_session_start", {
     ),
     name: z.string().min(1).max(80).default("TabWard MCP"),
     ttl_seconds: z.number().int().min(60).max(86_400).default(1800),
-    capabilities: z.array(z.string()).optional()
+    capabilities: z.array(z.string()).optional(),
+    clean_qa: z.boolean().default(false)
   }
-}, async ({ mode, name, ttl_seconds, capabilities }) => {
+}, async ({ mode, name, ttl_seconds, capabilities, clean_qa }) => {
+  if (clean_qa && mode !== "managed") {
+    throw new Error("clean_qa requires managed mode");
+  }
   if (bridge.status().state !== "connected") {
     throw new Error("TabWard extension is not connected or paired");
   }
@@ -182,14 +227,17 @@ server.registerTool("tabward_session_start", {
     workspace: "current",
     name,
     ttlSeconds: ttl_seconds,
-    capabilities
+    capabilities,
+    cleanQa: clean_qa
   });
   try {
     const named = await bridge.send("nameSession", {
       ...context(session),
-      name: session.name
-    }, 5_000) as { workspace?: unknown };
+      name: session.name,
+      cleanQa: session.cleanQa
+    }, 5_000) as { workspace?: unknown; cleanQa?: { tainted?: unknown } };
     session.workspace = named.workspace === "isolated" ? "isolated" : "current";
+    session.cleanQaTainted = named.cleanQa?.tainted === true;
   } catch (error) {
     sessions.close(session.id);
     throw error;
@@ -217,7 +265,7 @@ server.registerTool("tabward_session_close", {
   const cleanup = await bridge.send("releaseWorkspace", {
     ...context(session),
     closeCreatedTabs: close_created_tabs
-  }, 10_000);
+  }, session.cleanQa ? 60_000 : 10_000);
   sessions.close(session_id);
   return output({
     ok: true,
@@ -233,7 +281,7 @@ server.registerTool("tabward_tabs", {
     operation: z.enum([
       "list", "open", "adopt", "release",
       "activate", "close", "reload", "navigate",
-      "finish", "handoff", "deliverable"
+      "back", "forward", "finish", "handoff", "deliverable"
     ]).default("list"),
     tab_id: z.number().int().positive().optional(),
     url: z.string().default("about:blank"),
@@ -293,6 +341,8 @@ server.registerTool("tabward_tabs", {
     close: "closeTab",
     reload: "reload",
     navigate: "navigate",
+    back: "goBack",
+    forward: "goForward",
     finish: "finish",
     handoff: "handoff",
     deliverable: "deliverable"
@@ -334,9 +384,11 @@ server.registerTool("tabward_observe", {
     include: z.array(z.string()).optional(),
     visible_only: z.boolean().default(true),
     max_chars: z.number().int().min(1_000).max(200_000).default(50_000),
-    frame_id: z.number().int().optional()
+    frame_id: z.number().int().optional(),
+    all_frames: z.boolean().default(false),
+    max_frames: z.number().int().min(1).max(100).default(20)
   }
-}, async ({ session_id, tab_id, mode, selector, include, visible_only, max_chars, frame_id }) => {
+}, async ({ session_id, tab_id, mode, selector, include, visible_only, max_chars, frame_id, all_frames, max_frames }) => {
   const commands: Record<string, string> = {
     snapshot: "observe", text: "getText", html: "getHtml",
     state: "getPageState", tables: "extractTables",
@@ -353,7 +405,9 @@ server.registerTool("tabward_observe", {
     include: compact[mode] ?? include,
     visibleOnly: visible_only,
     maxChars: max_chars,
-    frameId: frame_id
+    frameId: frame_id,
+    allFrames: all_frames,
+    maxFrames: max_frames
   }, { tabId: tab_id }));
 });
 
@@ -394,6 +448,30 @@ server.registerTool("tabward_action", {
 }
 );
 
+server.registerTool("tabward_form", {
+  description: "Fill several fields in one ordered, idempotent browser command. Submission is never implicit.",
+  inputSchema: {
+    session_id: z.string(),
+    tab_id: z.number().int().positive(),
+    fields: z.array(formFieldSchema).min(1).max(100),
+    submit_locator: locatorSchema.optional(),
+    timeout_ms: z.number().int().min(100).max(600_000).default(30_000)
+  }
+}, async ({ session_id, tab_id, fields, submit_locator, timeout_ms }) => {
+  for (const [index, field] of fields.entries()) {
+    if (!hasLocator(field.locator)) throw new Error(`fields[${index}].locator must identify an element`);
+    if (["fill", "type", "select"].includes(field.action) && field.value === undefined) {
+      throw new Error(`fields[${index}].value is required for ${field.action}`);
+    }
+  }
+  if (submit_locator && !hasLocator(submit_locator)) {
+    throw new Error("submit_locator must identify an element");
+  }
+  return output(await send(session_id, "action", "form", {
+    fields, submitLocator: submit_locator, timeoutMs: timeout_ms
+  }, { tabId: tab_id, timeoutMs: timeout_ms }));
+});
+
 server.registerTool("tabward_wait", {
   description: "Wait for locator, text, URL, load, DOM content, or network idle.",
   inputSchema: {
@@ -411,7 +489,7 @@ server.registerTool("tabward_wait", {
 }, async ({ session_id, tab_id, locator, state, text, url, timeout_ms }) =>
   output(await send(session_id, "read", "locatorWait", {
     locator: locator ?? {}, state, text, url, timeoutMs: timeout_ms
-  }, { tabId: tab_id, timeoutMs: timeout_ms }))
+  }, { tabId: tab_id, timeoutMs: timeout_ms + 5_000 }))
 );
 
 server.registerTool("tabward_assert", {
@@ -428,7 +506,7 @@ server.registerTool("tabward_assert", {
 }, async ({ session_id, tab_id, assertion, locator, expected, timeout_ms, soft }) => {
   const result = await send(session_id, "read", "locatorAssert", {
     assertion, locator: locator ?? {}, expected, timeoutMs: timeout_ms
-  }, { tabId: tab_id, timeoutMs: timeout_ms });
+  }, { tabId: tab_id, timeoutMs: timeout_ms + 5_000 });
   if (result.passed === false && !soft) {
     throw new Error(String(result.error || `Assertion failed: ${assertion}`));
   }
@@ -495,7 +573,7 @@ server.registerTool("tabward_emulation", {
   inputSchema: {
     session_id: z.string(),
     tab_id: z.number().int().positive(),
-    settings: objectSchema
+    settings: emulationSettingsSchema
   }
 }, async ({ session_id, tab_id, settings }) =>
   output(await send(session_id, "emulation", "emulation", { settings }, { tabId: tab_id }))
@@ -525,9 +603,17 @@ server.registerTool("tabward_artifact", {
       "screencast_start", "screencast_frame", "screencast_stop"
     ]).default("screenshot"),
     name: z.string().optional(),
-    options: objectSchema.optional()
+    options: objectSchema.optional(),
+    scope: z.enum(["viewport", "full_page", "element"]).default("viewport"),
+    locator: locatorSchema.optional(),
+    format: z.enum(["png", "jpeg", "webp"]).default("png"),
+    quality: z.number().int().min(0).max(100).default(80),
+    frame_id: z.number().int().optional()
   }
-}, async ({ session_id, tab_id, operation, name, options }) => {
+}, async ({ session_id, tab_id, operation, name, options, scope, locator, format, quality, frame_id }) => {
+  if (operation === "screenshot" && scope === "element" && (!locator || !hasLocator(locator))) {
+    throw new Error("locator is required for an element screenshot");
+  }
   const commands = {
     screenshot: "screenshot", trace_start: "traceStart", trace_stop: "traceStop",
     screencast_start: "screencastStart", screencast_frame: "screencastFrame",
@@ -537,7 +623,15 @@ server.registerTool("tabward_artifact", {
     || operation.startsWith("screencast")
     ? "tracing"
     : "artifacts";
-  const result = await send(session_id, capability, commands[operation], options ?? {}, {
+  const result = await send(session_id, capability, commands[operation], {
+    ...(options ?? {}),
+    scope,
+    locator,
+    format,
+    quality,
+    frameId: frame_id,
+    fullPage: scope === "full_page"
+  }, {
     tabId: tab_id, timeoutMs: 60_000
   });
   if ((operation === "screenshot" || operation === "screencast_frame")
@@ -556,7 +650,7 @@ server.registerTool("tabward_artifact", {
 });
 
 server.registerTool("tabward_evaluate", {
-  description: "Evaluate privileged JavaScript in a full-profile session-owned tab.",
+  description: "Evaluate JavaScript on a managed loopback tab or in an explicitly privileged full-profile tab.",
   inputSchema: {
     session_id: z.string(),
     tab_id: z.number().int().positive(),
@@ -564,12 +658,114 @@ server.registerTool("tabward_evaluate", {
     await_promise: z.boolean().default(true),
     return_by_value: z.boolean().default(true)
   }
-}, async ({ session_id, tab_id, expression, await_promise, return_by_value }) =>
-  output(await send(session_id, "evaluate", "evaluate", {
-    expression, awaitPromise: await_promise,
-    returnByValue: return_by_value, privileged: true
-  }, { tabId: tab_id }))
-);
+}, async ({ session_id, tab_id, expression, await_promise, return_by_value }) => {
+  const session = sessions.get(session_id);
+  const capability: Capability = session.mode === "managed" ? "evaluate_local" : "evaluate";
+  return output(await send(session_id, capability, "evaluate", {
+    expression,
+    awaitPromise: await_promise,
+    returnByValue: return_by_value,
+    privileged: session.mode === "full_profile",
+    localOnly: session.mode === "managed"
+  }, { tabId: tab_id }));
+});
+
+server.registerTool("tabward_probe", {
+  description: "Run a bounded structured page probe without arbitrary JavaScript.",
+  inputSchema: {
+    session_id: z.string(),
+    tab_id: z.number().int().positive(),
+    operation: probeOperationSchema,
+    locator: locatorSchema.optional(),
+    selector: z.string().max(2_000).optional(),
+    properties: z.array(z.string().max(100)).max(50).optional(),
+    attribute: z.string().max(100).optional(),
+    property: z.string().max(100).optional(),
+    limit: z.number().int().min(1).max(200).default(50),
+    frame_id: z.number().int().optional()
+  }
+}, async ({ session_id, tab_id, operation, locator, selector, properties, attribute, property, limit, frame_id }) => {
+  if (!["overflow", "page_metrics"].includes(operation)
+    && (!locator || !hasLocator(locator))
+    && !selector) {
+    throw new Error(`locator or selector is required for ${operation}`);
+  }
+  return output(await send(session_id, "probes", "probe", {
+    operation, locator, selector, properties, attribute, property, limit,
+    frameId: frame_id
+  }, { tabId: tab_id }));
+});
+
+server.registerTool("tabward_qa", {
+  description: "Run a deterministic managed QA pass with emulation, probes, assertions, event capture, and screenshots.",
+  inputSchema: {
+    session_id: z.string(),
+    tab_id: z.number().int().positive(),
+    preset: z.enum(["desktop", "mobile", "tablet"]).optional(),
+    viewport: viewportSchema.optional(),
+    probes: z.array(z.object({
+      operation: probeOperationSchema,
+      locator: locatorSchema.optional(),
+      selector: z.string().max(2_000).optional(),
+      properties: z.array(z.string().max(100)).max(50).optional(),
+      frame_id: z.number().int().optional()
+    }).strict()).max(50).default([]),
+    assertions: z.array(z.object({
+      assertion: z.enum(["url", "title", "text", "value", "count", "visible", "hidden", "enabled", "editable", "checked"]),
+      locator: locatorSchema.optional(),
+      expected: z.unknown().optional()
+    }).strict()).max(100).default([]),
+    screenshots: z.array(z.object({
+      scope: z.enum(["viewport", "full_page", "element"]),
+      locator: locatorSchema.optional(),
+      frame_id: z.number().int().optional(),
+      name: z.string().max(200).optional()
+    }).strict()).max(20).default([]),
+    capture_console: z.boolean().default(true),
+    capture_network: z.boolean().default(true),
+    timeout_ms: z.number().int().min(100).max(600_000).default(120_000)
+  }
+}, async ({ session_id, tab_id, preset, viewport, probes, assertions, screenshots, capture_console, capture_network, timeout_ms }) => {
+  for (const [index, probe] of probes.entries()) {
+    if (!["overflow", "page_metrics"].includes(probe.operation)
+      && (!probe.locator || !hasLocator(probe.locator))
+      && !probe.selector) {
+      throw new Error(`probes[${index}] requires locator or selector`);
+    }
+  }
+  for (const [index, assertion] of assertions.entries()) {
+    if (!["url", "title"].includes(assertion.assertion)
+      && (!assertion.locator || !hasLocator(assertion.locator))) {
+      throw new Error(`assertions[${index}] requires locator`);
+    }
+  }
+  for (const [index, screenshot] of screenshots.entries()) {
+    if (screenshot.scope === "element"
+      && (!screenshot.locator || !hasLocator(screenshot.locator))) {
+      throw new Error(`screenshots[${index}] requires locator`);
+    }
+  }
+  const result = await send(session_id, "probes", "qa", {
+    preset, viewport, probes, assertions, screenshots,
+    captureConsole: capture_console,
+    captureNetwork: capture_network,
+    timeoutMs: timeout_ms
+  }, {
+    tabId: tab_id,
+    timeoutMs: Math.min(600_000, timeout_ms + 30_000)
+  }) as Record<string, unknown>;
+  if (Array.isArray(result.screenshots)) {
+    for (const [index, item] of result.screenshots.entries()) {
+      if (typeof item === "object" && item !== null && typeof (item as { data?: unknown }).data === "string") {
+        const shot = item as Record<string, unknown>;
+        const data = String(shot.data);
+        delete shot.data;
+        shot.artifact = await saveBase64Artifact(data, String(shot.name || `qa-${index + 1}`), ".png");
+      }
+    }
+  }
+  return output(result);
+});
 
 server.registerTool("tabward_cdp", {
   description: "Send an expert-level Chrome DevTools Protocol command.",
@@ -614,7 +810,7 @@ server.registerTool("tabward_downloads", {
     timeoutMs: timeout_ms
   }, {
     ...(tab_id === undefined ? {} : { tabId: tab_id }),
-    timeoutMs: timeout_ms
+    timeoutMs: Math.min(600_000, timeout_ms + 20_000)
   }));
 });
 
@@ -629,15 +825,24 @@ server.registerTool("tabward_download_click", {
 }, async ({ session_id, tab_id, locator, timeout_ms }) =>
   output(await send(session_id, "downloads", "downloadClick", {
     locator, timeoutMs: timeout_ms
-  }, { tabId: tab_id, timeoutMs: timeout_ms }))
+  }, {
+    tabId: tab_id,
+    timeoutMs: Math.min(600_000, timeout_ms + 20_000)
+  }))
 );
 
 await bridge.start();
-await server.connect(new StdioServerTransport());
+const transport = new StdioServerTransport();
+await server.connect(transport);
 
+let shuttingDown = false;
 async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   await bridge.stop();
   process.exit(0);
 }
+process.stdin.once("end", shutdown);
+process.stdin.once("close", shutdown);
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

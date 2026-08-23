@@ -5,7 +5,7 @@ It combines a standard stdio MCP server with a paired Chrome extension, so an
 agent can use the websites where the user is already signed in without sending
 browser traffic through a TabWard cloud service.
 
-> **Status:** private `0.2.0` beta for Windows and Google Chrome. Expect setup
+> **Status:** private `0.3.0` beta for Windows and Google Chrome. Expect setup
 > changes before the first public release.
 
 ## Why TabWard
@@ -16,8 +16,13 @@ browser traffic through a TabWard cloud service.
 - Lets the user choose a TabWard group in the current window or a separate
   Chrome window.
 - Pairs the local MCP and extension with a one-time six-digit code.
-- Exposes 19 `tabward_*` tools for navigation, semantic observation, actions,
-  assertions, events, network control, storage, downloads, artifacts, and CDP.
+- Exposes 22 `tabward_*` tools, including forms, structured probes, composite
+  frontend QA, screenshots, assertions, events, emulation, downloads, and CDP.
+- Offers fail-closed Clean QA in a separate incognito window when Chrome's
+  **Allow in incognito** setting is enabled for TabWard.
+- Restricts managed JavaScript evaluation to loopback pages.
+- Provides a persistent English/Russian extension interface; the initial
+  language follows Chrome and manual selection is saved.
 - Keeps the MCP transport on `127.0.0.1`.
 
 ## Components
@@ -96,6 +101,11 @@ workflow in
 ## Access model
 
 - **Managed mode:** works only in tabs created by the current session.
+- **Managed QA:** includes forms, uploads, screenshots, probes, events,
+  tracing, emulation, and loopback-only evaluate in owned tabs.
+- **Clean QA:** `clean_qa: true` creates a separate incognito window only
+  after proving that no other incognito window exists. TabWard closes only its
+  owned Clean QA window and fails closed if ownership cannot be proven.
 - **Existing tabs:** unavailable unless the user enables
   **Allow access to existing tabs** and starts a full-profile session.
 - **Current window:** the default; each session receives its own TabWard group.
@@ -128,6 +138,15 @@ release tree for forbidden files and likely secrets.
 Run `npm run gate:replacement` after installing the package and reloading the
 extension to execute the repeated local browser gate. See
 [`docs/replacement-gate.md`](docs/replacement-gate.md).
+
+Run the dedicated frontend gates against the loaded extension:
+
+```powershell
+npm run gate:qa
+npm run gate:clean-qa
+```
+
+The Clean QA gate requires **Allow in incognito** for TabWard.
 
 The private beta intentionally uses this local command as its required
 pre-push gate instead of GitHub Actions.

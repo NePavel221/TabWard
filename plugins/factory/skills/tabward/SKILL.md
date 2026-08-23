@@ -1,6 +1,6 @@
 ---
 name: tabward
-version: 0.2.0
+version: 0.3.0
 description: |
   Control authenticated Chrome pages through the local TabWard MCP. Use for
   agent-owned tabs, semantic browser actions, screenshots, events, downloads,
@@ -21,9 +21,14 @@ managed sessions, which can access only tabs created by that session.
    separate-window workspace preference.
 3. Open tabs with `tabward_tabs`, then observe before acting.
 4. Use semantic locators instead of raw coordinates.
-5. Use privileged evaluate, CDP, interception, uploads, or full-profile adoption
-   only when the task requires them and user intent is clear.
-6. Always close the session. Preserve created tabs unless cleanup is requested.
+5. Use `tabward_form`, `tabward_probe`, and `tabward_qa` for repeatable
+   frontend QA. Managed evaluate is allowed only on loopback pages.
+6. Use `clean_qa: true` only for a requested fresh incognito context. It
+   requires Chrome's **Allow in incognito** setting for TabWard and fails
+   closed if other incognito state exists.
+7. Use privileged evaluate, CDP, interception, or full-profile adoption only
+   when the task requires them and user intent is clear.
+8. Always close the session. Preserve created tabs unless cleanup is requested.
 
 ## Safety
 

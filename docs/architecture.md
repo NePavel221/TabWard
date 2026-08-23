@@ -22,3 +22,14 @@ by observation instead of a blind retry.
 Persistent popup settings form an extension-enforced policy ceiling for
 existing-tab access and workspace placement, so an MCP client cannot silently
 override the user's choice. No TabWard cloud service receives browser content.
+
+Managed sessions expose a bounded frontend QA layer through `tabward_form`,
+`tabward_probe`, and `tabward_qa`. All locators resolve through the same
+ownership-scoped locator engine. Composite QA snapshots and restores
+pre-existing emulation, event capture, and CDP attachment state; Chrome
+service-worker restart-safe metadata lives in `chrome.storage.session`.
+
+Clean QA adds a lease-backed `ready` → `active` → `tainted` state machine.
+Before creating an incognito window it proves that no other incognito window
+exists. Cleanup inventories the owned window before closing anything and
+preserves the window if inventory or ownership cannot be confirmed.

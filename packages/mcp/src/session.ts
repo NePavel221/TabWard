@@ -1,23 +1,25 @@
 import { randomUUID } from "node:crypto";
 
-export const SAFE_CAPABILITIES = [
+export const MANAGED_QA_CAPABILITIES = [
   "read",
   "action",
   "artifacts",
-  "downloads"
+  "downloads",
+  "emulation",
+  "evaluate_local",
+  "events",
+  "probes",
+  "tracing",
+  "uploads"
 ] as const;
 
 export const FULL_PROFILE_CAPABILITIES = [
-  ...SAFE_CAPABILITIES,
+  ...MANAGED_QA_CAPABILITIES,
   "adopt_tabs",
   "cdp",
-  "emulation",
   "evaluate",
-  "events",
   "network_interception",
-  "storage",
-  "tracing",
-  "uploads"
+  "storage"
 ] as const;
 
 export type Capability = typeof FULL_PROFILE_CAPABILITIES[number];
@@ -37,6 +39,8 @@ export interface Session {
   createdTabIds: Set<number>;
   adoptedTabIds: Set<number>;
   workspaceWindowId: number | null;
+  cleanQa: boolean;
+  cleanQaTainted: boolean;
 }
 
 function isCapability(value: string): value is Capability {
@@ -52,13 +56,15 @@ export class SessionPolicy {
     workspace?: WorkspaceMode;
     ttlSeconds?: number;
     capabilities?: string[];
+    cleanQa?: boolean;
   } = {}): Session {
     const {
       name = "TabWard MCP",
       mode = "managed",
       workspace = "current",
       ttlSeconds = 1800,
-      capabilities
+      capabilities,
+      cleanQa = false
     } = options;
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 86_400) {
       throw new Error("ttl_seconds must be between 60 and 86400");
@@ -66,7 +72,7 @@ export class SessionPolicy {
     const allowed = new Set<Capability>(
       mode === "full_profile"
         ? FULL_PROFILE_CAPABILITIES
-        : SAFE_CAPABILITIES
+        : MANAGED_QA_CAPABILITIES
     );
     const requested = capabilities ?? [...allowed];
     const unknown = requested.filter((item) => !isCapability(item));
@@ -94,7 +100,9 @@ export class SessionPolicy {
       tabIds: new Set(),
       createdTabIds: new Set(),
       adoptedTabIds: new Set(),
-      workspaceWindowId: null
+      workspaceWindowId: null,
+      cleanQa,
+      cleanQaTainted: false
     };
     this.#sessions.set(session.id, session);
     return session;
@@ -198,6 +206,8 @@ export function publicSession(session: Session): Record<string, unknown> {
     workspaceWindowId: session.workspaceWindowId,
     tabIds: [...session.tabIds].sort((a, b) => a - b),
     createdTabIds: [...session.createdTabIds].sort((a, b) => a - b),
-    adoptedTabIds: [...session.adoptedTabIds].sort((a, b) => a - b)
+    adoptedTabIds: [...session.adoptedTabIds].sort((a, b) => a - b),
+    cleanQa: session.cleanQa,
+    cleanQaTainted: session.cleanQaTainted
   };
 }

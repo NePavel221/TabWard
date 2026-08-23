@@ -32,8 +32,10 @@ function nextMessage(socket) {
 
 async function withTemporaryState(run) {
   const oldLocalAppData = process.env.LOCALAPPDATA;
+  const oldStateDir = process.env.TABWARD_STATE_DIR;
   const temporaryState = `${process.env.TEMP}\\tabward-test-${process.pid}-${Date.now()}`;
   process.env.LOCALAPPDATA = temporaryState;
+  process.env.TABWARD_STATE_DIR = temporaryState;
   try {
     return await run();
   } finally {
@@ -41,6 +43,11 @@ async function withTemporaryState(run) {
       delete process.env.LOCALAPPDATA;
     } else {
       process.env.LOCALAPPDATA = oldLocalAppData;
+    }
+    if (oldStateDir === undefined) {
+      delete process.env.TABWARD_STATE_DIR;
+    } else {
+      process.env.TABWARD_STATE_DIR = oldStateDir;
     }
     await rm(temporaryState, { recursive: true, force: true });
   }

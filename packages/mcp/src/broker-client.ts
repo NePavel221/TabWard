@@ -15,9 +15,13 @@ type Health = Record<string, unknown> & {
 };
 
 class BrokerRequestError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly remoteName?: string
+  ) {
     super(message);
-    this.name = "BrokerRequestError";
+    this.name = remoteName || "BrokerRequestError";
   }
 }
 
@@ -51,7 +55,8 @@ async function request(
   if (!response.ok || value.ok === false) {
     throw new BrokerRequestError(
       response.status,
-      String(value.error || `TabWard broker HTTP ${response.status}`)
+      String(value.error || `TabWard broker HTTP ${response.status}`),
+      typeof value.name === "string" ? value.name : undefined
     );
   }
   return value;

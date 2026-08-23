@@ -20,6 +20,29 @@ test("managed sessions reject privileged capabilities", () => {
   );
 });
 
+test("managed sessions include bounded frontend QA capabilities", () => {
+  const policy = new SessionPolicy();
+  const session = policy.start({ cleanQa: true });
+  for (const capability of [
+    "action", "artifacts", "downloads", "emulation", "evaluate_local",
+    "events", "probes", "tracing", "uploads"
+  ]) {
+    assert.equal(session.capabilities.has(capability), true, capability);
+  }
+  assert.equal(session.capabilities.has("evaluate"), false);
+  assert.equal(session.capabilities.has("storage"), false);
+  assert.equal(session.cleanQa, true);
+  assert.equal(session.cleanQaTainted, false);
+});
+
+test("managed sessions reject full-profile evaluate", () => {
+  const policy = new SessionPolicy();
+  assert.throws(
+    () => policy.start({ capabilities: ["read", "evaluate"] }),
+    /require full_profile/
+  );
+});
+
 test("a tab cannot be owned by two sessions", () => {
   const policy = new SessionPolicy();
   const first = policy.start({ name: "first" });
