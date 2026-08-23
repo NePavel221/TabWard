@@ -5,7 +5,11 @@ import { execFileSync } from "node:child_process";
 const root = resolve(import.meta.dirname, "..");
 const source = join(root, "apps", "extension");
 const output = join(root, "dist", "extension");
-const zip = join(root, "dist", "tabward-extension-0.1.0.zip");
+const sourceManifest = JSON.parse(await readFile(
+  join(root, "apps", "extension", "manifest.json"),
+  "utf8"
+));
+const zip = join(root, "dist", `tabward-extension-${sourceManifest.version}.zip`);
 
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });

@@ -7,7 +7,7 @@ import {
 import { WebSocket, WebSocketServer } from "ws";
 import { createPairingToken, readPairingToken } from "./state.js";
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const DEFAULT_WS_PORT = 18766;
 const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 60_000;
@@ -76,6 +76,7 @@ export class ExtensionBridge extends EventEmitter {
   #connectedAt: string | null = null;
   #state: BridgeStatus["state"] = "not_running";
   #pending = new Map<string, PendingCommand>();
+  #commandTail: Promise<void> = Promise.resolve();
 
   constructor(port = Number(process.env.TABWARD_PORT || DEFAULT_WS_PORT)) {
     super();
@@ -136,6 +137,24 @@ export class ExtensionBridge extends EventEmitter {
     payload: Record<string, unknown> = {},
     timeoutMs = COMMAND_TIMEOUT_MS
   ): Promise<unknown> {
+    const previous = this.#commandTail;
+    let release!: () => void;
+    this.#commandTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => {});
+    try {
+      return await this.#sendNow(type, payload, timeoutMs);
+    } finally {
+      release();
+    }
+  }
+
+  async #sendNow(
+    type: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number
+  ): Promise<unknown> {
     const socket = this.#socket;
     if (!socket || socket.readyState !== WebSocket.OPEN || this.#state !== "connected") {
       throw new Error(
@@ -152,7 +171,7 @@ export class ExtensionBridge extends EventEmitter {
       type,
       payload
     };
-    return new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#pending.delete(id);
         reject(new Error(`TabWard command timed out: ${type}`));
@@ -206,6 +225,11 @@ export class ExtensionBridge extends EventEmitter {
         }
         if (message.kind === "result") {
           this.#receiveResult(message as unknown as ResultEnvelope);
+          socket.send(JSON.stringify({
+            kind: "result_ack",
+            id: message.id,
+            protocolVersion: PROTOCOL_VERSION
+          }));
         }
       } catch {
         socket.close(1008, "invalid protocol message");

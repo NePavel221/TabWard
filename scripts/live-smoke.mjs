@@ -21,7 +21,7 @@ const expectedWorkspace = process.env.TABWARD_EXPECT_WORKSPACE || null;
 const expectedExistingAccess =
   process.env.TABWARD_EXPECT_EXISTING_ACCESS
   || (sessionMode === "managed" ? "denied" : null);
-const client = new Client({ name: "tabward-live-smoke", version: "0.1.0" });
+const client = new Client({ name: "tabward-live-smoke", version: "0.2.0" });
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: useGlobalCommand

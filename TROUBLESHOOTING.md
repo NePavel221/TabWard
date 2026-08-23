@@ -54,3 +54,28 @@
   installs that archive globally, and removes the temporary archive.
 - Validation: `droid mcp list` reports `tabward stdio connected`.
 - Applies to: local package installation before public npm publication.
+
+## A second TabWard MCP closes or conflicts with the first
+
+- Symptom: an older `0.1.x` installation reports `EADDRINUSE`, loses the
+  extension connection, or a live smoke closes an existing MCP transport.
+- Cause: each old stdio process owned the fixed extension WebSocket port.
+- Working method: install `0.2.0` or newer. One on-demand `tabward-broker`
+  owns ports `18766` and `18767`; all stdio MCP clients authenticate to and
+  reuse that broker.
+- Validation: the two-client stdio integration test receives the same broker
+  instance ID from both clients.
+- Applies to: concurrent Factory sessions and other MCP clients.
+
+## Live gate sees broker but extension is not ready
+
+- Symptom: health initially reports broker metadata with extension state
+  `not_running` immediately after broker start or extension reload.
+- Cause: the extension reconnects with bounded backoff and may not have reached
+  the new broker before the first health call.
+- Working method: wait up to 45 seconds for `connected`; fail immediately for
+  `pairing_required` or `version_mismatch`. Do not treat the first
+  `not_running` response as a permanent failure.
+- Validation: the installed-package restart smoke starts a new broker and
+  completes three browser cycles.
+- Applies to: replacement gate and first MCP call after reload.

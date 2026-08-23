@@ -1,6 +1,6 @@
 ---
 name: tabward
-version: 0.1.0
+version: 0.2.0
 description: |
   Control authenticated Chrome pages through the local TabWard MCP. Use for
   agent-owned tabs, semantic browser actions, screenshots, events, downloads,

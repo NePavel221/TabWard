@@ -7,7 +7,7 @@ import {
 } from "../dist/index.js";
 
 test("protocol constants and extension origins are bounded", () => {
-  assert.equal(PROTOCOL_VERSION, 1);
+  assert.equal(PROTOCOL_VERSION, 2);
   assert.equal(DEFAULT_WS_PORT, 18766);
   assert.equal(
     isLocalExtensionOrigin("chrome-extension://abcdefghijklmnopabcdefghijklmnop"),

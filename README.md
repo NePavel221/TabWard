@@ -5,7 +5,7 @@ It combines a standard stdio MCP server with a paired Chrome extension, so an
 agent can use the websites where the user is already signed in without sending
 browser traffic through a TabWard cloud service.
 
-> **Status:** private `0.1.0` beta for Windows and Google Chrome. Expect setup
+> **Status:** private `0.2.0` beta for Windows and Google Chrome. Expect setup
 > changes before the first public release.
 
 ## Why TabWard
@@ -23,11 +23,13 @@ browser traffic through a TabWard cloud service.
 ## Components
 
 ```text
-MCP client -> tabward-mcp -> paired WebSocket on 127.0.0.1
-           -> TabWard Chrome extension -> Chrome APIs and CDP
+MCP clients -> tabward-mcp -> authenticated localhost broker
+            -> paired WebSocket -> TabWard Chrome extension
+            -> Chrome APIs and CDP
 ```
 
 - `packages/mcp/`: client-neutral Node.js stdio MCP server.
+- `tabward-broker`: one on-demand process shared by concurrent MCP clients.
 - `apps/extension/`: Manifest V3 Chrome extension.
 - `plugins/factory/`: optional Factory plugin and TabWard operating skill.
 - `packages/protocol/`: protocol constants and compatibility tests.
@@ -84,7 +86,9 @@ Join-Path (npm root --global) '@tabward\mcp\dist\index.js'
 
 Configure a standard stdio server with `node` as the command and the printed
 absolute path as its only argument. Calling Node directly avoids lifecycle
-problems with Windows npm `.cmd` wrappers. Factory-specific clients can install
+problems with Windows npm `.cmd` wrappers. The first MCP client starts the
+broker on demand; later clients reuse it instead of competing for the extension
+port. Factory-specific clients can install
 the included skill; other clients use the MCP tool descriptions and the safe
 workflow in
 [`plugins/factory/skills/tabward/SKILL.md`](plugins/factory/skills/tabward/SKILL.md).
@@ -120,6 +124,10 @@ npm run verify
 `npm run verify` checks TypeScript, tests the MCP and extension contracts,
 builds the MCP, packages the unpacked extension and Store ZIP, and audits the
 release tree for forbidden files and likely secrets.
+
+Run `npm run gate:replacement` after installing the package and reloading the
+extension to execute the repeated local browser gate. See
+[`docs/replacement-gate.md`](docs/replacement-gate.md).
 
 The private beta intentionally uses this local command as its required
 pre-push gate instead of GitHub Actions.

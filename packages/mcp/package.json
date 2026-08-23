@@ -1,11 +1,12 @@
 {
   "name": "@tabward/mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local MCP server for the TabWard Chrome extension",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "tabward-mcp": "dist/index.js"
+    "tabward-mcp": "dist/index.js",
+    "tabward-broker": "dist/broker-server.js"
   },
   "main": "dist/index.js",
   "files": [

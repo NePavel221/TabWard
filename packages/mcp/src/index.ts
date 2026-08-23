@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { saveBase64Artifact, saveJsonArtifact } from "./artifacts.js";
-import { ExtensionBridge } from "./bridge.js";
+import { BrokerClient } from "./broker-client.js";
 import {
   publicSession,
   SessionPolicy,
@@ -11,8 +11,8 @@ import {
   type Session
 } from "./session.js";
 
-const VERSION = "0.1.0";
-const bridge = new ExtensionBridge();
+const VERSION = "0.2.0";
+const bridge = new BrokerClient();
 const sessions = new SessionPolicy();
 const objectSchema = z.record(z.unknown());
 const locatorSchema = z.object({
@@ -33,6 +33,16 @@ const locatorSchema = z.object({
   strict: z.boolean().optional(),
   visible: z.boolean().optional()
 }).passthrough();
+
+function hasLocator(locator: z.infer<typeof locatorSchema>): boolean {
+  return [
+    "ref", "selector", "css", "xpath", "testId", "label",
+    "name", "text", "role", "placeholder", "alt", "title"
+  ].some((key) => {
+    const value = locator[key as keyof typeof locator];
+    return typeof value === "string" && value.length > 0;
+  });
+}
 
 const server = new McpServer({
   name: "TabWard",
@@ -145,6 +155,7 @@ server.registerTool("tabward_health", {
   description: "Check the local MCP, pairing state, and Chrome extension connection.",
   inputSchema: {}
 }, async () => output({
+  ...(await bridge.refresh().catch(() => bridge.start()).then(() => ({})).catch(() => ({}))),
   ok: bridge.status().state === "connected",
   serverVersion: VERSION,
   bridge: { host: bridge.host, port: bridge.port, ...bridge.status() },
@@ -216,19 +227,23 @@ server.registerTool("tabward_session_close", {
 });
 
 server.registerTool("tabward_tabs", {
-  description: "List, open, adopt, release, activate, close, reload, or navigate tabs.",
+  description: "List, open, adopt, release, activate, close, reload, navigate, finish, hand off, or mark a deliverable tab.",
   inputSchema: {
     session_id: z.string().min(1),
     operation: z.enum([
       "list", "open", "adopt", "release",
-      "activate", "close", "reload", "navigate"
+      "activate", "close", "reload", "navigate",
+      "finish", "handoff", "deliverable"
     ]).default("list"),
     tab_id: z.number().int().positive().optional(),
     url: z.string().default("about:blank"),
     active: z.boolean().default(false),
     wait: z.boolean().default(true)
+    ,
+    summary: z.string().max(2_000).optional(),
+    label: z.string().max(80).optional()
   }
-}, async ({ session_id, operation, tab_id, url, active, wait }) => {
+}, async ({ session_id, operation, tab_id, url, active, wait, summary, label }) => {
   const session = sessions.get(session_id);
   if (operation === "list") {
     const result = await bridge.send("tabs", context(session)) as Record<string, unknown>;
@@ -277,12 +292,15 @@ server.registerTool("tabward_tabs", {
     activate: "activateTab",
     close: "closeTab",
     reload: "reload",
-    navigate: "navigate"
+    navigate: "navigate",
+    finish: "finish",
+    handoff: "handoff",
+    deliverable: "deliverable"
   } as const;
   const result = await send(session_id, "action", commands[operation], {
-    url, active, wait
+    url, active, wait, summary, label
   }, { tabId: tab_id });
-  if (operation === "release" || operation === "close") {
+  if (operation === "release" || operation === "close" || operation === "handoff") {
     sessions.releaseTab(session.id, tab_id);
   }
   return output(result);
@@ -353,14 +371,27 @@ server.registerTool("tabward_action", {
     options: objectSchema.optional(),
     timeout_ms: z.number().int().min(100).max(600_000).default(30_000)
   }
-}, async ({ session_id, tab_id, action, locator, value, options, timeout_ms }) =>
-  output(await send(
+}, async ({ session_id, tab_id, action, locator, value, options, timeout_ms }) => {
+  if (!hasLocator(locator)) {
+    throw new Error("locator must identify an element");
+  }
+  if (["fill", "type", "press", "select", "upload"].includes(action) && value === undefined) {
+    throw new Error(`value is required for ${action}`);
+  }
+  if (action === "drag") {
+    const target = options?.targetLocator;
+    if (typeof target !== "object" || target === null || !hasLocator(target as z.infer<typeof locatorSchema>)) {
+      throw new Error("options.targetLocator must identify the drag destination");
+    }
+  }
+  return output(await send(
     session_id,
     action === "upload" ? "uploads" : "action",
     "locatorAction",
     { action, locator, value, options: options ?? {}, timeoutMs: timeout_ms },
     { tabId: tab_id, timeoutMs: timeout_ms }
-  ))
+  ));
+}
 );
 
 server.registerTool("tabward_wait", {

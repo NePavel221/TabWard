@@ -7,7 +7,9 @@ const forbiddenNames = new Set([
   ".env",
   "bridge.json",
   "bridge.runtime.json",
-  "pairing.json"
+  "pairing.json",
+  "runtime.json",
+  "broker-start.lock"
 ]);
 const forbiddenExtensions = new Set([".pem", ".key", ".log"]);
 const textExtensions = new Set([
@@ -68,6 +70,7 @@ async function walk(directory) {
       !rel.includes("/test/")
       && rel !== "TROUBLESHOOTING.md"
       && rel !== "scripts/audit-release.mjs"
+      && rel !== "scripts/compare-browser-mcp.mjs"
     ) {
       for (const check of releaseResiduePatterns) {
         if (residueScanExtensions.has(extname(entry.name)) && check.pattern.test(content)) {

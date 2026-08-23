@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const DEFAULT_WS_PORT = 18766;
 export const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
@@ -24,6 +24,12 @@ export interface ResultEnvelope {
   payload: unknown;
 }
 
+export interface ResultAckEnvelope {
+  kind: "result_ack";
+  id: string;
+  protocolVersion: number;
+}
+
 export interface HelloEnvelope {
   kind: "hello";
   protocolVersion: number;
@@ -42,6 +48,7 @@ export interface PairingEnvelope {
 export type WireEnvelope =
   | CommandEnvelope
   | ResultEnvelope
+  | ResultAckEnvelope
   | HelloEnvelope
   | PairingEnvelope;
 

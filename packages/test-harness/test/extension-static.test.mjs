@@ -16,7 +16,11 @@ test("extension uses paired WebSocket transport without native messaging", async
   ));
 
   assert.match(background, /ws:\/\/127\.0\.0\.1:18766/);
+  assert.match(background, /const PROTOCOL_VERSION = 2/);
   assert.match(background, /pairing_required/);
+  assert.match(background, /result_ack/);
+  assert.match(background, /resultOutbox/);
+  assert.match(background, /indexedDB\.open/);
   assert.doesNotMatch(background, /message\.code.*pairingCode/);
   assert.doesNotMatch(background, /connectNative|nativeKeepalive|bridgeFetch|pollLoop/);
   assert.match(

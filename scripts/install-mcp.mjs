@@ -3,7 +3,7 @@ import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 if (process.platform !== "win32") {
-  throw new Error("TabWard 0.1.0 supports the automated MCP installer on Windows only");
+  throw new Error("TabWard supports the automated MCP installer on Windows only");
 }
 
 const root = resolve(import.meta.dirname, "..");

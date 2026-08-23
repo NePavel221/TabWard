@@ -1,4 +1,4 @@
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const WS_URL = "ws://127.0.0.1:18766";
 const PAIRING_TOKEN_KEY = "pairingToken";
 const USER_SETTINGS_KEY = "userSettings";
@@ -25,6 +25,9 @@ const WORKSPACE_WINDOWS_KEY = "workspaceWindows";
 const SESSION_POLICIES_KEY = "sessionPolicies";
 const DOWNLOAD_IDS_KEY = "downloadIds";
 const MAX_RESULT_BYTES = 64 * 1024 * 1024;
+const OUTBOX_DB = "tabward-protocol";
+const OUTBOX_STORE = "resultOutbox";
+const OUTBOX_LIMIT = 128;
 const SAFE_CDP_METHODS = new Set([
   "Accessibility.getFullAXTree",
   "DOM.describeNode",
@@ -47,6 +50,113 @@ let transportReconnectAttempt = 0;
 let pairingCode = null;
 let transportLastError = null;
 let connectedAt = null;
+let outboxFlushPromise = null;
+
+function openOutbox() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(OUTBOX_DB, 1);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(OUTBOX_STORE)) {
+        database.createObjectStore(OUTBOX_STORE, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open TabWard outbox"));
+  });
+}
+
+async function outboxTransaction(mode, run) {
+  const database = await openOutbox();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(OUTBOX_STORE, mode);
+      const store = transaction.objectStore(OUTBOX_STORE);
+      let value;
+      try {
+        value = run(store);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      transaction.oncomplete = () => resolve(value);
+      transaction.onerror = () => reject(transaction.error || new Error("TabWard outbox transaction failed"));
+      transaction.onabort = () => reject(transaction.error || new Error("TabWard outbox transaction aborted"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function outboxPut(envelope) {
+  const database = await openOutbox();
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(OUTBOX_STORE, "readwrite");
+      const store = transaction.objectStore(OUTBOX_STORE);
+      const existingRequest = store.getKey(envelope.id);
+      existingRequest.onerror = () => reject(existingRequest.error);
+      existingRequest.onsuccess = () => {
+        if (existingRequest.result !== undefined) {
+          store.put({ id: envelope.id, envelope, createdAt: Date.now() });
+          return;
+        }
+        const countRequest = store.count();
+        countRequest.onerror = () => reject(countRequest.error);
+        countRequest.onsuccess = () => {
+          if (countRequest.result >= OUTBOX_LIMIT) {
+            transaction.abort();
+            reject(new Error("TabWard result outbox capacity exceeded"));
+            return;
+          }
+          store.add({ id: envelope.id, envelope, createdAt: Date.now() });
+        };
+      };
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("TabWard outbox write failed"));
+      transaction.onabort = () => {
+        if (transaction.error) reject(transaction.error);
+      };
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function outboxDelete(id) {
+  await outboxTransaction("readwrite", (store) => store.delete(id));
+}
+
+async function outboxList() {
+  const database = await openOutbox();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(OUTBOX_STORE, "readonly");
+      const request = transaction.objectStore(OUTBOX_STORE).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error || new Error("Could not read TabWard outbox"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function flushOutbox(socket = transportSocket) {
+  if (outboxFlushPromise) return outboxFlushPromise;
+  outboxFlushPromise = (async () => {
+    if (!socket || socket.readyState !== WebSocket.OPEN || transportState !== "connected") return;
+    const entries = (await outboxList()).sort((left, right) => left.createdAt - right.createdAt);
+    for (const entry of entries) {
+      if (socket.readyState !== WebSocket.OPEN || transportState !== "connected") return;
+      socket.send(JSON.stringify(entry.envelope));
+    }
+  })();
+  try {
+    await outboxFlushPromise;
+  } finally {
+    outboxFlushPromise = null;
+  }
+}
 
 function scheduleTransportReconnect() {
   if (transportReconnectTimer || reloadScheduled) {
@@ -170,6 +280,13 @@ async function handleTransportMessage(socket, raw) {
     pairingCode = null;
     transportState = "connected";
     connectedAt = new Date().toISOString();
+    await flushOutbox(socket);
+    return;
+  }
+  if (message.kind === "result_ack") {
+    if (typeof message.id === "string") {
+      await outboxDelete(message.id);
+    }
     return;
   }
   if (message.kind === "pong") {
@@ -195,7 +312,7 @@ async function handleTransportMessage(socket, raw) {
   };
   const serialized = JSON.stringify(envelope);
   if (new TextEncoder().encode(serialized).length > MAX_RESULT_BYTES) {
-    socket.send(JSON.stringify({
+    const tooLarge = {
       kind: "result",
       id: message.id,
       protocolVersion: PROTOCOL_VERSION,
@@ -204,10 +321,13 @@ async function handleTransportMessage(socket, raw) {
         name: "ResultTooLarge",
         message: "Command result exceeded 64 MiB"
       }
-    }));
+    };
+    await outboxPut(tooLarge);
+    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(tooLarge));
     return;
   }
-  socket.send(serialized);
+  await outboxPut(envelope);
+  if (socket.readyState === WebSocket.OPEN) socket.send(serialized);
 }
 
 function approvePairing(code) {
@@ -4971,7 +5091,7 @@ async function commandNetworkHar(payload) {
     ok: true,
     log: {
       version: "1.2",
-      creator: { name: "TabWard", version: "0.1.0" },
+      creator: { name: "TabWard", version: "0.2.0" },
       pages: [],
       entries
     }
@@ -5662,7 +5782,7 @@ async function commandGetInfo(payload) {
   return {
     ok: true,
     extensionId: chrome.runtime.id,
-    version: "0.1.0",
+    version: "0.2.0",
     cdpAttachedTabs: Array.from(cdpTabs),
     transport: transportStatus(),
     session: session && session.ok === false ? null : session,

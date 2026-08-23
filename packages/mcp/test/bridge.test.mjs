@@ -54,7 +54,7 @@ test("pairing code is exposed to MCP but not sent to the extension", { timeout: 
       const socket = await connect(bridge.port);
       socket.send(JSON.stringify({
         kind: "hello",
-        protocolVersion: 1,
+        protocolVersion: 2,
         extensionId,
         extensionVersion: "0.1.0"
       }));
@@ -77,7 +77,7 @@ test("extension id must match its Chrome origin", { timeout: 10_000 }, async () 
       const socket = await connect(bridge.port);
       socket.send(JSON.stringify({
         kind: "hello",
-        protocolVersion: 1,
+        protocolVersion: 2,
         extensionId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         extensionVersion: "0.1.0"
       }));

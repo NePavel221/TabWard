@@ -18,6 +18,8 @@ droid mcp add tabward node $TabWardServer
 ```
 
 The direct Node entry avoids Windows `.cmd` subprocess lifecycle issues.
+It connects to a shared on-demand broker, so parallel Factory sessions do not
+compete for the extension WebSocket port.
 
 ## Install the Factory skill
 

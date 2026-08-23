@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TabWard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Give AI agents controlled local access to authenticated, agent-owned Chrome tabs.",
   "minimum_chrome_version": "116",
   "icons": {

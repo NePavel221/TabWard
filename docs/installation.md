@@ -53,9 +53,8 @@ only argument:
 ```
 
 Do not configure the npm `.cmd` wrapper as the subprocess on Windows; some MCP
-clients cannot terminate its child Node process cleanly. Do not start two
-TabWard MCP processes at the same time because both bind
-`127.0.0.1:18766`.
+clients cannot terminate its child Node process cleanly. Multiple TabWard MCP
+processes are supported: they discover and reuse one on-demand local broker.
 
 ## Update
 
@@ -76,5 +75,6 @@ droid plugin update tabward@TabWard --scope user
 3. Run `droid mcp remove tabward`.
 4. Run `npm uninstall --global @tabward/mcp`.
 5. Stop any remaining TabWard MCP process.
-6. Delete `%LOCALAPPDATA%\TabWard` only if its pairing and local artifacts are
+6. Stop the remaining `tabward-broker` process.
+7. Delete `%LOCALAPPDATA%\TabWard` only if its pairing and local artifacts are
    no longer needed.
