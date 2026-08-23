@@ -55,6 +55,20 @@
 - Validation: `droid mcp list` reports `tabward stdio connected`.
 - Applies to: local package installation before public npm publication.
 
+## MCP installer reports success but global version stays old
+
+- Symptom: `npm run install:mcp` reports the new version, while
+  `npm list --global @tabward/mcp --depth=0` still shows the old version.
+- Cause: invoking the script through `npm --prefix <repo>` exports
+  `npm_config_prefix=<repo>`. Child `npm install --global` inherits it and
+  installs into the workspace instead of the user's real global prefix.
+- Working method: remove inherited `npm_config_prefix` for the installer's
+  internal npm calls, resolve `npm root --global`, then verify the installed
+  manifest version and server entry before reporting success.
+- Validation: global npm reports the requested TabWard version and the printed
+  server path is under the user's global npm root.
+- Applies to: `npm run install:mcp` on Windows.
+
 ## A second TabWard MCP closes or conflicts with the first
 
 - Symptom: an older `0.1.x` installation reports `EADDRINUSE`, loses the

@@ -2,8 +2,8 @@
 
 ## Current Goal
 
-Finish the private `0.3.0` release commit, push, and installed-package check,
-then continue the 20-task real-use gate before disabling rollback integrations.
+Continue the 20-task real-use gate for the private `0.3.0` build before
+disabling rollback integrations.
 
 ## Current State
 
@@ -16,8 +16,9 @@ Final `npm run verify` and release audit pass. Frontend QA passes 12/12,
 including restoration of pre-existing emulation and events; Clean QA passes
 5/5; replacement endurance passes 50/50 without leaked tabs; managed live smoke
 passes with isolated workspace and existing-tab access denied. The unpacked
-0.3.0 extension is rebuilt and connected. Sanitized reports remain under
-`.factory/temp/` and are not committed.
+0.3.0 extension is rebuilt and connected. The source is pushed to private
+`main`; the global MCP and Factory plugin are installed at 0.3.0. Sanitized
+reports remain under `.factory/temp/` and are not committed.
 
 ## Last 3 Tasks
 
@@ -27,16 +28,13 @@ passes with isolated workspace and existing-tab access denied. The unpacked
 
 ## Next Step
 
-Review the final Git diff and staged set, commit and push `0.3.0`, run
-`npm run install:mcp`, update the Factory plugin, and verify the installed
-package plus MCP connection. Then complete 20 distinct real tasks without
-fallback, including authenticated reads, multi-step scenarios, navigation,
-forms, child tabs, downloads, and cleanup.
+Complete 20 distinct real tasks without fallback, including authenticated
+reads, multi-step scenarios, navigation, forms, child tabs, downloads, and
+cleanup. Record only sanitized outcomes.
 
 ## Risks / Do Not Forget
 
 - Keep the GitHub repository private until a separate public-release review.
-- The 0.3.0 changes are not yet committed or pushed at this handoff point.
 - Do not claim full replacement readiness until the real-use gate reaches 20/20.
 - Do not disable Playwright MCP or remove the legacy integration before their
   real-use/parity gates pass.

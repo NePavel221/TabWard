@@ -21,6 +21,9 @@ const npmCli = process.env.npm_execpath || join(
   "bin",
   "npm-cli.js"
 );
+const npmEnvironment = { ...process.env };
+delete npmEnvironment.npm_config_prefix;
+delete npmEnvironment.NPM_CONFIG_PREFIX;
 
 await mkdir(tempDirectory, { recursive: true });
 await rm(archive, { force: true });
@@ -30,7 +33,8 @@ function run(args) {
   const result = spawnSync(process.execPath, [npmCli, ...args], {
     cwd: root,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    env: npmEnvironment
   });
   if (result.error) {
     throw result.error;
@@ -69,6 +73,16 @@ const serverPath = join(
   "dist",
   "index.js"
 ).replaceAll("\\", "/");
+const installedManifest = JSON.parse(await readFile(
+  join(npmRoot, "@tabward", "mcp", "package.json"),
+  "utf8"
+));
+if (installedManifest.version !== packageJson.version) {
+  throw new Error(
+    `Installed @tabward/mcp version ${installedManifest.version} does not match ${packageJson.version}`
+  );
+}
+await access(serverPath);
 
 console.log(JSON.stringify({
   ok: true,

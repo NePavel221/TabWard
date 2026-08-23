@@ -165,6 +165,10 @@ test("private beta documentation and Factory skill are portable", async () => {
     resolve(root, "plugins", "factory", "skills", "tabward", "SKILL.md"),
     "utf8"
   );
+  const installer = await readFile(
+    resolve(root, "scripts", "install-mcp.mjs"),
+    "utf8"
+  );
   const marketplace = JSON.parse(await readFile(
     resolve(root, ".factory-plugin", "marketplace.json"),
     "utf8"
@@ -175,5 +179,7 @@ test("private beta documentation and Factory skill are portable", async () => {
   assert.match(readme, /droid mcp add tabward node/);
   assert.match(skill, /tabward_health/);
   assert.match(skill, /mode="managed"/);
+  assert.match(installer, /delete npmEnvironment\.npm_config_prefix/);
+  assert.match(installer, /installedManifest\.version !== packageJson\.version/);
   assert.equal(marketplace.plugins[0].name, "tabward");
 });
