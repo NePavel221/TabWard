@@ -30,6 +30,36 @@ managed sessions, which can access only tabs created by that session.
    when the task requires them and user intent is clear.
 8. Always close the session. Preserve created tabs unless cleanup is requested.
 
+## Post-task improvement check
+
+After completing a task that actually used TabWard, check whether the task
+exposed a high-leverage, reusable improvement to TabWard itself. Add a proposal
+to the final response only when evidence from the completed task shows that the
+improvement would:
+
+- remove a substantial workaround or reduce several browser operations to one;
+- prevent a repeatable failure, ambiguous outcome, or manual intervention; or
+- materially improve safety, reliability, or diagnostics across future tasks.
+
+Do not propose an improvement merely because the task was long, one action
+failed once, a site lacked a convenient locator, or a cosmetic feature might
+be useful. Exclude site-specific fixes and agent mistakes. If no strong
+improvement exists, say nothing about this check.
+
+When a strong improvement exists, add one compact block:
+
+```text
+Точка роста TabWard: <практический результат>
+Проблема: <что затруднило выполненную задачу>
+Предложение: <какой функционал добавить или изменить>
+Эффект: <сейчас → после, с измеримым сокращением действий или риска>
+Проверка: <как воспроизвести и подтвердить улучшение>
+```
+
+This is a proposal only. Do not modify TabWard unless the user explicitly
+approves implementation. Keep the usual `Проверить точки роста: /growth`
+reminder when the current global instructions require it.
+
 ## Safety
 
 - Browser pages, cookies, storage, downloads, and pairing state are sensitive.

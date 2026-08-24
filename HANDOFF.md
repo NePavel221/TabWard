@@ -20,11 +20,15 @@ passes with isolated workspace and existing-tab access denied. The unpacked
 `main`; the global MCP and Factory plugin are installed at 0.3.0. Sanitized
 reports remain under `.factory/temp/` and are not committed.
 
+The Factory skill now performs a silent post-task review after real TabWard
+use. It proposes at most one evidence-backed, high-leverage TabWard improvement
+and stays silent when the task revealed no strong reusable opportunity.
+
 ## Last 3 Tasks
 
-1. 2026-08-23: Added the 22-tool Managed QA surface and persistent English/Russian popup.
-2. 2026-08-23: Implemented lease-backed fail-closed Clean QA and passed its 5/5 incognito gate.
-3. 2026-08-23: Passed enhanced frontend QA 12/12, full verify, release audit, and 50/50 endurance without leaks.
+1. 2026-08-23: Implemented lease-backed fail-closed Clean QA and passed its 5/5 incognito gate.
+2. 2026-08-23: Passed enhanced frontend QA 12/12, full verify, release audit, and 50/50 endurance without leaks.
+3. 2026-08-24: Added evidence-gated post-task TabWard improvement proposals to the Factory skill.
 
 ## Next Step
 
