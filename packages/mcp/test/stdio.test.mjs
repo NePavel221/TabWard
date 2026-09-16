@@ -15,6 +15,7 @@ const expectedTools = [
   "tabward_navigate",
   "tabward_observe",
   "tabward_action",
+  "tabward_upload",
   "tabward_form",
   "tabward_wait",
   "tabward_assert",
@@ -73,7 +74,7 @@ test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, a
       arguments: {}
     });
     assert.equal(health.isError, undefined);
-    assert.equal(health.structuredContent.serverVersion, "0.3.0");
+    assert.equal(health.structuredContent.serverVersion, "0.3.1");
     assert.equal(health.structuredContent.bridge.host, "127.0.0.1");
     assert.equal(Number.isInteger(health.structuredContent.bridge.port), true);
     assert.equal(health.structuredContent.bridge.port > 0, true);

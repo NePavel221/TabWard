@@ -105,6 +105,8 @@ test("frontend QA handlers expose forms, probes, history, and scoped screenshots
   assert.match(background, /const snapshot = await locatorSnapshot\(payload\.tabId, payload\.locator/);
   assert.match(background, /element\.checked = payload\.action === "check"/);
   assert.match(background, /did not reach the requested checkbox state/);
+  assert.match(background, /includeHidden: action === "upload"/);
+  assert.match(background, /payload\.includeHidden === true \|\| visible\(element\)/);
 });
 
 test("popup persists a Chrome-derived English or Russian language", async () => {

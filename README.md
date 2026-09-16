@@ -5,7 +5,7 @@ It combines a standard stdio MCP server with a paired Chrome extension, so an
 agent can use the websites where the user is already signed in without sending
 browser traffic through a TabWard cloud service.
 
-> **Status:** private `0.3.0` beta for Windows and Google Chrome. Expect setup
+> **Status:** private `0.3.1` beta for Windows and Google Chrome. Expect setup
 > changes before the first public release.
 
 ## Why TabWard
@@ -16,7 +16,7 @@ browser traffic through a TabWard cloud service.
 - Lets the user choose a TabWard group in the current window or a separate
   Chrome window.
 - Pairs the local MCP and extension with a one-time six-digit code.
-- Exposes 22 `tabward_*` tools, including forms, structured probes, composite
+- Exposes 23 `tabward_*` tools, including forms, local file attachment, structured probes, composite
   frontend QA, screenshots, assertions, events, emulation, downloads, and CDP.
 - Offers fail-closed Clean QA in a separate incognito window when Chrome's
   **Allow in incognito** setting is enabled for TabWard.
@@ -114,6 +114,16 @@ workflow in
 
 The extension enforces these settings. An MCP caller cannot silently override
 them.
+
+## Attach local files
+
+Use `tabward_upload` to attach files without opening the Windows file picker.
+Pass one or more absolute local paths and, when needed, a locator for the
+corresponding `input[type=file]`. If the page has exactly one file input, the
+locator may be omitted. Hidden file inputs used by custom attachment buttons
+are supported. TabWard verifies that every requested path is a readable file
+before the browser receives it; choosing a directory or a missing file fails
+without interacting with the page.
 
 ## Documentation
 

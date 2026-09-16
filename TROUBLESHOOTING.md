@@ -142,3 +142,30 @@
 - Validation: `npm run gate:qa` confirms that pre-existing viewport and console
   capture still work after composite QA.
 - Applies to: `tabward_qa` cleanup and MV3 service-worker restarts.
+
+## Chrome Reload keeps showing the old extension version
+
+- Symptom: the repository and packaged extension show a new version, but
+  `chrome://extensions` still shows the old version after clicking Reload.
+- Cause: Reload restarts the extension from its previously selected source
+  directory. It does not switch Chrome to another repository or `dist` folder.
+- Working method: remove only the old TabWard extension card, select
+  **Load unpacked**, and choose the verified `dist/extension` directory. Pair
+  the new extension again if Chrome assigns a new extension ID.
+- Validation: Chrome shows version `0.3.1`, health reports extension version
+  `0.3.1`, and `npm run gate:qa` passes 12/12 including hidden file upload.
+- Applies to: switching local unpacked TabWard builds.
+
+## Hidden file input cannot receive an upload
+
+- Symptom: attaching a file fails with `Locator matched 0 visible elements`
+  even though the page has an attachment button.
+- Cause: custom upload buttons commonly wrap a hidden `input[type=file]`, while
+  the generic actionable locator previously required every target to be
+  visible.
+- Working method: use `tabward_upload`. Upload resolution allows hidden file
+  inputs, validates each absolute local path before browser interaction, and
+  calls CDP `DOM.setFileInputFiles` without opening the operating-system picker.
+- Validation: the frontend QA fixture uses a hidden file input and confirms the
+  attached filename; the full gate passes 12/12.
+- Applies to: court portals and other sites with custom attachment controls.

@@ -71,7 +71,7 @@ label{display:block;margin:12px 0}.card{padding:16px;border:2px solid #246;borde
   <button id="fetch" type="button">Fetch data</button><output id="fetch-result">idle</output>
   <button id="history" type="button">Push route</button>
   <button id="dialog" type="button">Open dialog</button>
-  <label>Upload <input id="upload" type="file"></label><output id="upload-result">idle</output>
+  <label for="upload">Upload</label><input id="upload" type="file" hidden><output id="upload-result">idle</output>
   <a id="download" href="/download" download>Download fixture</a>
   <div id="drag-source" draggable="true">Drag source</div>
   <div id="drop-target">Drop target</div><output id="drag-result">idle</output>
@@ -485,12 +485,11 @@ try {
   });
 
   await check("upload", async () => {
-    await call("tabward_action", {
+    await call("tabward_upload", {
       session_id: sessionId,
       tab_id: tabId,
-      action: "upload",
       locator: { selector: "#upload" },
-      value: [uploadPath]
+      file_paths: [uploadPath]
     });
     await call("tabward_assert", {
       session_id: sessionId,

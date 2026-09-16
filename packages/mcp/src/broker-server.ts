@@ -55,7 +55,7 @@ const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     json(response, 200, {
       ok: true,
-      brokerVersion: "0.3.0",
+      brokerVersion: "0.3.1",
       pid: process.pid,
       instanceId,
       uptimeSeconds: Math.floor(process.uptime()),

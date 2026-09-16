@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { stat } from "node:fs/promises";
+import { basename, isAbsolute } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -11,7 +13,7 @@ import {
   type Session
 } from "./session.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const bridge = new BrokerClient();
 const sessions = new SessionPolicy();
 const objectSchema = z.record(z.unknown());
@@ -76,6 +78,28 @@ function hasLocator(locator: z.infer<typeof locatorSchema>): boolean {
     const value = locator[key as keyof typeof locator];
     return typeof value === "string" && value.length > 0;
   });
+}
+
+async function validateUploadPaths(filePaths: string[]): Promise<string[]> {
+  const normalized = filePaths.map((filePath) => String(filePath).trim());
+  if (normalized.some((filePath) => !filePath)) {
+    throw new Error("file_paths must not contain empty paths");
+  }
+  for (const filePath of normalized) {
+    if (!isAbsolute(filePath)) {
+      throw new Error(`Upload path must be absolute: ${basename(filePath) || "[unnamed file]"}`);
+    }
+    let metadata;
+    try {
+      metadata = await stat(filePath);
+    } catch {
+      throw new Error(`Upload file does not exist or is not readable: ${basename(filePath)}`);
+    }
+    if (!metadata.isFile()) {
+      throw new Error(`Upload path is not a file: ${basename(filePath)}`);
+    }
+  }
+  return normalized;
 }
 
 const server = new McpServer({
@@ -438,15 +462,50 @@ server.registerTool("tabward_action", {
       throw new Error("options.targetLocator must identify the drag destination");
     }
   }
+  const actionValue = action === "upload"
+    ? await validateUploadPaths(Array.isArray(value) ? value.map(String) : [String(value)])
+    : value;
   return output(await send(
     session_id,
     action === "upload" ? "uploads" : "action",
     "locatorAction",
-    { action, locator, value, options: options ?? {}, timeoutMs: timeout_ms },
+    { action, locator, value: actionValue, options: options ?? {}, timeoutMs: timeout_ms },
     { tabId: tab_id, timeoutMs: timeout_ms }
   ));
 }
 );
+
+server.registerTool("tabward_upload", {
+  description: "Attach one or more readable local files to a file input without opening the operating-system file picker. Hidden input[type=file] elements are supported.",
+  inputSchema: {
+    session_id: z.string(),
+    tab_id: z.number().int().positive(),
+    file_paths: z.array(z.string().min(1)).min(1).max(50),
+    locator: locatorSchema.optional(),
+    frame_id: z.number().int().min(0).optional(),
+    timeout_ms: z.number().int().min(100).max(600_000).default(30_000)
+  }
+}, async ({ session_id, tab_id, file_paths, locator, frame_id, timeout_ms }) => {
+  const uploadLocator = locator ?? {
+    selector: "input[type=file]",
+    visible: false
+  };
+  if (!hasLocator(uploadLocator)) {
+    throw new Error("locator must identify a file input");
+  }
+  const validatedPaths = await validateUploadPaths(file_paths);
+  return output(await send(session_id, "uploads", "locatorAction", {
+    action: "upload",
+    locator: uploadLocator,
+    value: validatedPaths,
+    options: {
+      frameId: frame_id,
+      includeHidden: true,
+      stable: false
+    },
+    timeoutMs: timeout_ms
+  }, { tabId: tab_id, timeoutMs: timeout_ms }));
+});
 
 server.registerTool("tabward_form", {
   description: "Fill several fields in one ordered, idempotent browser command. Submission is never implicit.",

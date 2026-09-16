@@ -2698,7 +2698,9 @@ function pageResolveActionTarget(payload) {
       });
   }
 
-  candidates = candidates.filter((element) => visible(element) && enabled(element));
+  candidates = candidates.filter((element) =>
+    (payload.includeHidden === true || visible(element)) && enabled(element)
+  );
   let recovered = false;
   let locatorScoreValue = 0;
   const locatorHasIdentity = locator && [
@@ -2721,7 +2723,7 @@ function pageResolveActionTarget(payload) {
       }
       const pool = deepRoots().flatMap((root) => Array.from(root.querySelectorAll(
         "a[href],button,input,textarea,select,summary,[role='button'],[role='link'],[role='textbox'],[onclick],[tabindex]"
-      ))).filter(visible);
+      ))).filter((element) => payload.includeHidden === true || visible(element));
       const ranked = pool
         .map((element) => ({ element, score: locatorScore(element, locator) }))
         .filter((item) => item.score >= minimumScore)
@@ -4773,7 +4775,13 @@ async function locatorSnapshot(tabId, locator, frameId) {
 async function resolveLocator(tabId, locator, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs || 30000));
   const deadline = Date.now() + timeoutMs;
-  const actionableLocator = { ...(locator || {}), visible: true, enabledOnly: true, actionable: true };
+  const includeHidden = options.includeHidden === true;
+  const actionableLocator = {
+    ...(locator || {}),
+    visible: includeHidden ? false : true,
+    enabledOnly: true,
+    actionable: !includeHidden
+  };
   let latest = null;
   while (Date.now() <= deadline) {
     throwIfCommandAborted();
@@ -4787,7 +4795,8 @@ async function resolveLocator(tabId, locator, options = {}) {
       const recovered = await executeInTab(tabId, pageResolveActionTarget, [{
         locator,
         allowRecovery: true,
-        minLocatorScore: options.minLocatorScore
+        minLocatorScore: options.minLocatorScore,
+        includeHidden
       }], { frameId: options.frameId });
       if (recovered?.ok === true && recovered.ref) {
         latest = await locatorSnapshot(tabId, {
@@ -4806,20 +4815,20 @@ async function resolveLocator(tabId, locator, options = {}) {
     }
     const strict = locator?.strict !== false && locator?.index === undefined;
     if (latest?.count === 0 && options.preflight !== false) {
-      const error = new Error("Locator matched 0 visible elements");
+      const error = new Error(`Locator matched 0 ${includeHidden ? "" : "visible "}elements`);
       error.name = "LocatorError";
       error.candidateCount = 0;
       throw error;
     }
     if (latest?.count > 1 && strict) {
-      const error = new Error(`Strict locator matched ${latest.count} visible elements`);
+      const error = new Error(`Strict locator matched ${latest.count} ${includeHidden ? "" : "visible "}elements`);
       error.name = "StrictModeError";
       error.candidates = latest.matches;
       throw error;
     }
     const strictMatch = !strict || latest.count <= 1;
     const stateMatch = target
-      && (options.visible === false || target.visible)
+      && (includeHidden || options.visible === false || target.visible)
       && (options.enabled === false || target.enabled)
       && (options.editable !== true || target.editable)
       && (options.receivesEvents === false || target.receivesEvents);
@@ -4962,6 +4971,7 @@ async function commandLocatorAction(payload) {
       frameId,
       editable: ["fill", "type"].includes(action),
       receivesEvents: !["focus", "blur", "select", "upload"].includes(action),
+      includeHidden: action === "upload",
       allowRecovery: options.allowRecovery === true,
       minLocatorScore: options.minLocatorScore,
       stable: options.stable !== false
@@ -5765,7 +5775,7 @@ async function commandNetworkHar(payload) {
     ok: true,
     log: {
       version: "1.2",
-      creator: { name: "TabWard", version: "0.3.0" },
+      creator: { name: "TabWard", version: "0.3.1" },
       pages: [],
       entries
     }
@@ -6836,7 +6846,7 @@ async function commandGetInfo(payload) {
   return {
     ok: true,
     extensionId: chrome.runtime.id,
-    version: "0.3.0",
+    version: "0.3.1",
     cdpAttachedTabs: Array.from(cdpTabs),
     transport: transportStatus(),
     session: session && session.ok === false ? null : session,
