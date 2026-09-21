@@ -22,6 +22,18 @@
   command before npm operations.
 - Validation: `npm run verify` completes in TabWard.
 
+## Node 24 syntax check rejects JavaScript through an uppercase short path
+
+- Symptom: `node --check apps/extension/background.js` fails on Windows with
+  `ERR_UNKNOWN_FILE_EXTENSION` and reports the resolved 8.3 path ending in
+  uppercase `.JS`.
+- Cause: Node 24's ESM syntax-check path classifies the uppercase short-path
+  extension before parsing the source.
+- Working method: compile the text without executing it:
+  `node -e "new Function(require('fs').readFileSync(process.argv[1], 'utf8'))" <absolute-file>`.
+- Validation: both `background.js` and `stage-two.js` compile successfully.
+- Applies to: local extension JavaScript syntax checks on this Windows setup.
+
 ## Pairing code changes before approval
 
 - Symptom: `tabward_health` prints a new six-digit code repeatedly and the

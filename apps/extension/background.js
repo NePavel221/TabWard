@@ -1,4 +1,4 @@
-importScripts("stage-one.js");
+importScripts("stage-one.js", "stage-two.js");
 
 const PROTOCOL_VERSION = 2;
 const WS_URL = "ws://127.0.0.1:18766";
@@ -28,10 +28,19 @@ const SESSION_POLICIES_KEY = "sessionPolicies";
 const CLEAN_QA_STATES_KEY = "cleanQaStates";
 const EMULATION_STATES_KEY = "emulationStates";
 const DOWNLOAD_IDS_KEY = "downloadIds";
+const CDP_OWNERSHIP_KEY = "cdpOwnership";
 const MAX_RESULT_BYTES = 64 * 1024 * 1024;
 const OUTBOX_DB = "tabward-protocol";
 const OUTBOX_STORE = "resultOutbox";
 const OUTBOX_LIMIT = 128;
+const OUTBOX_MAX_BYTES = 32 * 1024 * 1024;
+const OUTBOX_RESERVATION_TTL_MS = 10 * 60_000;
+const EVENT_MAX_BYTES = 8 * 1024 * 1024;
+const TRACE_MAX_BYTES = 16 * 1024 * 1024;
+const SCREENCAST_MAX_BYTES = 16 * 1024 * 1024;
+const NETWORK_BODY_RESULT_MAX_BYTES = 7 * 1024 * 1024;
+const OPERATION_CONTEXT = Symbol("TabWardOperationContext");
+const WORKER_INSTANCE_ID = crypto.randomUUID();
 const SAFE_CDP_METHODS = new Set([
   "Accessibility.getFullAXTree",
   "DOM.describeNode",
@@ -44,8 +53,6 @@ const SAFE_CDP_METHODS = new Set([
   "Runtime.getProperties"
 ]);
 
-let activeCommandSignal = null;
-let activeSessionContext = null;
 let reloadScheduled = false;
 let transportSocket = null;
 let transportState = "not_running";
@@ -55,10 +62,12 @@ let pairingCode = null;
 let transportLastError = null;
 let connectedAt = null;
 let outboxFlushPromise = null;
+let outboxMutationTail = Promise.resolve();
+const activeOperations = new Map();
 
 function openOutbox() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(OUTBOX_DB, 1);
+    const request = indexedDB.open(OUTBOX_DB, 2);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains(OUTBOX_STORE)) {
@@ -98,22 +107,39 @@ async function outboxPut(envelope) {
     await new Promise((resolve, reject) => {
       const transaction = database.transaction(OUTBOX_STORE, "readwrite");
       const store = transaction.objectStore(OUTBOX_STORE);
-      const existingRequest = store.getKey(envelope.id);
+      const existingRequest = store.get(envelope.id);
       existingRequest.onerror = () => reject(existingRequest.error);
       existingRequest.onsuccess = () => {
-        if (existingRequest.result !== undefined) {
-          store.put({ id: envelope.id, envelope, createdAt: Date.now() });
-          return;
-        }
-        const countRequest = store.count();
-        countRequest.onerror = () => reject(countRequest.error);
-        countRequest.onsuccess = () => {
-          if (countRequest.result >= OUTBOX_LIMIT) {
+        const existing = existingRequest.result;
+        const listRequest = store.getAll();
+        listRequest.onerror = () => reject(listRequest.error);
+        listRequest.onsuccess = () => {
+          const bytes = TabWardStageTwo.byteLength(envelope);
+          const used = (listRequest.result || []).reduce(
+            (total, entry) => total + Number(
+              entry.bytes
+              || entry.reservedBytes
+              || (entry.envelope ? TabWardStageTwo.byteLength(entry.envelope) : 0)
+            ),
+            0
+          ) - Number(existing?.bytes || existing?.reservedBytes || 0);
+          if (bytes > Number(existing?.reservedBytes || bytes)
+            || used + bytes > OUTBOX_MAX_BYTES) {
             transaction.abort();
-            reject(new Error("TabWard result outbox capacity exceeded"));
+            reject(new Error("TabWard result outbox byte capacity exceeded"));
             return;
           }
-          store.add({ id: envelope.id, envelope, createdAt: Date.now() });
+          store.put({
+            id: envelope.id,
+            operationId: envelope.operationId,
+            fingerprint: envelope.fingerprint,
+            status: "completed",
+            envelope,
+            bytes,
+            reservedBytes: Number(existing?.reservedBytes || bytes),
+            createdAt: existing?.createdAt || Date.now(),
+            completedAt: Date.now()
+          });
         };
       };
       transaction.oncomplete = resolve;
@@ -127,8 +153,129 @@ async function outboxPut(envelope) {
   }
 }
 
-async function outboxDelete(id) {
-  await outboxTransaction("readwrite", (store) => store.delete(id));
+function outboxReservationBytes(type) {
+  return TabWardStageTwo.outboxReservationBytes(type);
+}
+
+async function reconcileOutboxReservations(now = Date.now()) {
+  const activeIds = new Set(activeOperations.keys());
+  await outboxTransaction("readwrite", (store) => {
+    const request = store.getAll();
+    request.onsuccess = () => {
+      const expiredIds = new Set(TabWardStageTwo.expiredReservationIds(
+        request.result,
+        activeIds,
+        now,
+        OUTBOX_RESERVATION_TTL_MS
+      ));
+      for (const entry of request.result || []) {
+        if (expiredIds.has(entry.id)) {
+          const envelope = {
+            kind: "result",
+            id: entry.operationId,
+            protocolVersion: PROTOCOL_VERSION,
+            ok: false,
+            operationId: entry.operationId,
+            fingerprint: entry.fingerprint,
+            payload: {
+              name: "OutcomeUnknown",
+              message: "The extension restarted before durable completion was recorded",
+              details: {
+                outcome: "effect_unknown",
+                effectPossible: true,
+                retrySafe: false,
+                reason: "expired orphaned outbox reservation"
+              }
+            }
+          };
+          const bytes = TabWardStageTwo.byteLength(envelope);
+          store.put({
+            ...entry,
+            status: "completed",
+            envelope,
+            bytes,
+            reservedBytes: bytes,
+            completedAt: now,
+            reconciled: true
+          });
+        }
+      }
+    };
+  });
+}
+
+async function outboxReserve(message) {
+  const run = async () => {
+    await reconcileOutboxReservations();
+    const database = await openOutbox();
+    try {
+      return await new Promise((resolve, reject) => {
+        const transaction = database.transaction(OUTBOX_STORE, "readwrite");
+        const store = transaction.objectStore(OUTBOX_STORE);
+        const request = store.getAll();
+        let result;
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+          const entries = request.result || [];
+          const existing = entries.find((entry) => entry.id === message.operationId);
+          if (existing) {
+            if (existing.fingerprint !== message.fingerprint) {
+              result = { state: "conflict" };
+              return;
+            }
+            result = existing.status === "completed" || existing.envelope
+              ? { state: "completed", envelope: existing.envelope }
+              : { state: activeOperations.has(message.operationId) ? "active" : "unknown" };
+            return;
+          }
+          const reservedBytes = outboxReservationBytes(message.type);
+          const usedBytes = entries.reduce(
+            (total, entry) => total + Number(
+              entry.bytes
+              || entry.reservedBytes
+              || (entry.envelope ? TabWardStageTwo.byteLength(entry.envelope) : 0)
+            ),
+            0
+          );
+          if (entries.length >= OUTBOX_LIMIT || usedBytes + reservedBytes > OUTBOX_MAX_BYTES) {
+            result = { state: "full", usedBytes, reservedBytes };
+            return;
+          }
+          store.add({
+            id: message.operationId,
+            operationId: message.operationId,
+            fingerprint: message.fingerprint,
+            status: "reserved",
+            reservedBytes,
+            createdAt: Date.now()
+          });
+          result = { state: "reserved", reservedBytes };
+        };
+        transaction.oncomplete = () => resolve(result);
+        transaction.onerror = () => reject(transaction.error || new Error("TabWard outbox reservation failed"));
+        transaction.onabort = () => reject(transaction.error || new Error("TabWard outbox reservation aborted"));
+      });
+    } finally {
+      database.close();
+    }
+  };
+  const current = outboxMutationTail.then(run, run);
+  outboxMutationTail = current.then(() => undefined, () => undefined);
+  return current;
+}
+
+async function outboxDelete(id, fingerprint = null) {
+  await outboxTransaction("readwrite", (store) => {
+    const request = store.get(id);
+    request.onsuccess = () => {
+      const record = request.result;
+      if (!record) return;
+      if (fingerprint && record.fingerprint && record.fingerprint !== fingerprint) {
+        return;
+      }
+      store.delete(id);
+    };
+  });
 }
 
 async function outboxList() {
@@ -149,7 +296,10 @@ async function flushOutbox(socket = transportSocket) {
   if (outboxFlushPromise) return outboxFlushPromise;
   outboxFlushPromise = (async () => {
     if (!socket || socket.readyState !== WebSocket.OPEN || transportState !== "connected") return;
-    const entries = (await outboxList()).sort((left, right) => left.createdAt - right.createdAt);
+    await reconcileOutboxReservations();
+    const entries = (await outboxList())
+      .filter((entry) => entry.envelope)
+      .sort((left, right) => left.createdAt - right.createdAt);
     for (const entry of entries) {
       if (socket.readyState !== WebSocket.OPEN || transportState !== "connected") return;
       socket.send(JSON.stringify(entry.envelope));
@@ -284,20 +434,90 @@ async function handleTransportMessage(socket, raw) {
     pairingCode = null;
     transportState = "connected";
     connectedAt = new Date().toISOString();
+    await reconcileStaleMetadata();
     await flushOutbox(socket);
     return;
   }
   if (message.kind === "result_ack") {
     if (typeof message.id === "string") {
-      await outboxDelete(message.id);
+      await outboxDelete(message.id, message.fingerprint);
     }
+    return;
+  }
+  if (message.kind === "result_backpressure") {
+    setTimeout(() => flushOutbox(), Math.max(100, Number(message.retryAfterMs || 1_000)));
     return;
   }
   if (message.kind === "pong") {
     return;
   }
+  if (message.kind === "cancel") {
+    const operation = activeOperations.get(message.operationId);
+    if (operation) {
+      operation.controller.abort();
+    }
+    socket.send(JSON.stringify({
+      kind: "cancel_ack",
+      protocolVersion: PROTOCOL_VERSION,
+      operationId: String(message.operationId || ""),
+      state: operation ? "active" : "not_found"
+    }));
+    return;
+  }
   if (message.kind !== "command") {
     throw new Error("Unknown TabWard protocol message");
+  }
+  const operation = TabWardStageTwo.operationContext(message);
+  const reservation = await outboxReserve(message);
+  if (reservation.state === "conflict") {
+    socket.send(JSON.stringify({
+      kind: "result",
+      id: operation.operationId,
+      protocolVersion: PROTOCOL_VERSION,
+      ok: false,
+      operationId: operation.operationId,
+      fingerprint: operation.fingerprint,
+      payload: {
+        name: "OperationConflict",
+        message: "operationId was reused with a different fingerprint",
+        details: {
+          outcome: "not_started",
+          effectPossible: false,
+          retrySafe: false
+        }
+      }
+    }));
+    return;
+  }
+  if (reservation.state === "completed") {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(reservation.envelope));
+    }
+    return;
+  }
+  if (reservation.state === "active") {
+    return;
+  }
+  if (reservation.state === "full") {
+    socket.send(JSON.stringify({
+      kind: "result",
+      id: operation.operationId,
+      protocolVersion: PROTOCOL_VERSION,
+      ok: false,
+      operationId: operation.operationId,
+      fingerprint: operation.fingerprint,
+      payload: {
+        name: "CapacityExceeded",
+        message: "TabWard result outbox is full before browser dispatch",
+        details: {
+          outcome: "not_started",
+          effectPossible: false,
+          retrySafe: true,
+          byteBudget: OUTBOX_MAX_BYTES
+        }
+      }
+    }));
+    return;
   }
   let ok = false;
   let payload;
@@ -305,20 +525,61 @@ async function handleTransportMessage(socket, raw) {
     && typeof message.operationId === "string"
     && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(message.operationId);
   const executionStarted = measured ? performance.now() : 0;
+  const controller = new AbortController();
+  const context = Object.freeze({
+    ...operation,
+    signal: controller.signal
+  });
+  activeOperations.set(operation.operationId, { controller, context });
   try {
-    payload = await dispatch(message);
+    if (reservation.state === "unknown") {
+      const error = new Error("A prior extension worker may have executed this operation");
+      error.name = "OutcomeUnknown";
+      error.details = {
+        outcome: "effect_unknown",
+        effectPossible: true,
+        retrySafe: false,
+        reason: "stale reserved operation after extension restart"
+      };
+      throw error;
+    }
+    if (Date.now() >= context.deadlineAt) {
+      const error = new Error("Operation deadline expired before extension dispatch");
+      error.name = "NotStarted";
+      error.details = {
+        outcome: "not_started",
+        effectPossible: false,
+        retrySafe: true
+      };
+      throw error;
+    }
+    payload = await dispatch(message, context);
     ok = payload?.ok !== false;
   } catch (error) {
+    if (TabWardStageTwo.abortIsEffectUnknown(controller.signal.aborted, error?.name)) {
+      error = Object.assign(new Error("Active operation was cancelled; browser effects cannot be excluded"), {
+        name: "OutcomeUnknown",
+        details: {
+          outcome: "effect_unknown",
+          effectPossible: true,
+          retrySafe: false,
+          reason: "active cancellation"
+        }
+      });
+    }
     payload = toSafeError(error);
+  } finally {
+    activeOperations.delete(operation.operationId);
   }
   let envelope = {
     kind: "result",
-    id: message.id,
+    id: operation.operationId,
     protocolVersion: PROTOCOL_VERSION,
     ok,
     payload,
+    operationId: operation.operationId,
+    fingerprint: operation.fingerprint,
     ...(measured ? {
-      operationId: message.operationId,
       telemetry: { extensionExecutionMs: performance.now() - executionStarted }
     } : {})
   };
@@ -326,22 +587,63 @@ async function handleTransportMessage(socket, raw) {
   if (new TextEncoder().encode(serialized).length > MAX_RESULT_BYTES) {
     envelope = {
       kind: "result",
-      id: message.id,
+      id: operation.operationId,
       protocolVersion: PROTOCOL_VERSION,
       ok: false,
       payload: {
         name: "ResultTooLarge",
-        message: "Command result exceeded 64 MiB"
+        message: "Command result exceeded 64 MiB",
+        details: {
+          outcome: "effect_unknown",
+          effectPossible: true,
+          retrySafe: false,
+          truncated: true
+        }
       },
-      ...(measured ? { operationId: envelope.operationId, telemetry: envelope.telemetry } : {})
+      operationId: operation.operationId,
+      fingerprint: operation.fingerprint,
+      ...(measured ? { telemetry: envelope.telemetry } : {})
     };
   }
   const commitStarted = measured ? performance.now() : 0;
-  await outboxPut(envelope);
+  try {
+    await outboxPut(envelope);
+  } catch (error) {
+    envelope = {
+      kind: "result",
+      id: operation.operationId,
+      protocolVersion: PROTOCOL_VERSION,
+      ok: false,
+      operationId: operation.operationId,
+      fingerprint: operation.fingerprint,
+      payload: {
+        name: "OutcomeUnknown",
+        message: "Command completed but its full result could not be committed durably",
+        details: {
+          outcome: "effect_unknown",
+          effectPossible: true,
+          retrySafe: false,
+          reason: "durable result byte reservation exceeded",
+          truncated: true
+        }
+      },
+      ...(measured ? { telemetry: envelope.telemetry } : {})
+    };
+    await outboxPut(envelope);
+  }
   // A replay contains execution timing only: the commit duration is known after
   // the durable write. Do not introduce a second write just to persist metrics.
   if (measured) envelope.telemetry.outboxCommitMs = performance.now() - commitStarted;
-  if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(envelope));
+  const resultSocket = TabWardStageTwo.resultTransportSocket(
+    transportSocket,
+    transportState,
+    WebSocket.OPEN
+  );
+  if (resultSocket) {
+    resultSocket.send(JSON.stringify(envelope));
+  } else {
+    await flushOutbox();
+  }
 }
 
 function approvePairing(code) {
@@ -382,8 +684,29 @@ function transportStatus() {
   };
 }
 
-function throwIfCommandAborted() {
-  if (activeCommandSignal?.aborted) {
+function commandContext(value) {
+  return value?.[OPERATION_CONTEXT] || value || null;
+}
+
+function commandSignal(value) {
+  return commandContext(value)?.signal || null;
+}
+
+function scopedPayload(source, value) {
+  const context = commandContext(source);
+  if (context) {
+    Object.defineProperty(value, OPERATION_CONTEXT, {
+      value: context,
+      enumerable: true,
+      configurable: false,
+      writable: false
+    });
+  }
+  return value;
+}
+
+function throwIfCommandAborted(value) {
+  if (commandSignal(value)?.aborted) {
     throw new DOMException("Command was cancelled", "AbortError");
   }
 }
@@ -426,6 +749,25 @@ async function bestEffort(promise, timeoutMs = 2500, label = "best effort operat
   } catch (error) {
     return { ok: false, error: toSafeError(error) };
   }
+}
+
+function classifyMissingTab(result) {
+  if (result?.ok !== false) return result;
+  const message = String(result.error?.message || "");
+  if (
+    result.error?.name === "NotFoundError"
+    || result.error?.name === "NoSuchTabError"
+    || /^No tab with id:\s*\d+/i.test(message)
+  ) {
+    return {
+      ...result,
+      error: {
+        ...result.error,
+        name: "NoSuchTabError"
+      }
+    };
+  }
+  return result;
 }
 
 function slimTab(tab) {
@@ -529,6 +871,15 @@ function toSafeError(error) {
       reservationHeld: error.details.reservationHeld === true,
       retrySafe: false
     };
+  } else if (error?.details && typeof error.details === "object") {
+    safe.details = Object.fromEntries(
+      [
+        "outcome", "effectPossible", "retrySafe", "reason",
+        "truncated", "partial", "byteBudget"
+      ]
+        .filter((key) => Object.prototype.hasOwnProperty.call(error.details, key))
+        .map((key) => [key, error.details[key]])
+    );
   }
   return safe;
 }
@@ -612,6 +963,10 @@ chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId !== undefined) {
     cdpTabs.delete(source.tabId);
     cdpEventBrokers.delete(source.tabId);
+    stateStore.mutate({ [CDP_OWNERSHIP_KEY]: {} }, (state) => {
+      delete state[CDP_OWNERSHIP_KEY][source.tabId];
+      return state;
+    }).catch(() => {});
   }
 });
 
@@ -620,12 +975,21 @@ function cdpBroker(tabId) {
     cdpEventBrokers.set(tabId, {
       sequence: 0,
       events: [],
+      eventBytes: 0,
+      eventsTruncated: false,
+      eventsDropped: 0,
       categories: new Set(),
       started: false,
       inFlight: new Set(),
       traceEvents: [],
+      traceBytes: 0,
+      traceTruncated: false,
+      traceDropped: 0,
       traceComplete: false,
       screencastFrames: [],
+      screencastBytes: 0,
+      screencastTruncated: false,
+      screencastDropped: 0,
       interception: false
     });
   }
@@ -664,17 +1028,30 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
     broker.inFlight.delete(params.requestId);
   } else if (method === "Tracing.dataCollected") {
-    broker.traceEvents.push(...(params.value || []));
+    for (const event of params.value || []) {
+      const bounded = TabWardStageTwo.boundedAppend(
+        broker.traceEvents,
+        sanitizeBrowserPayload(event),
+        { maxCount: MAX_CDP_EVENTS, maxBytes: TRACE_MAX_BYTES }
+      );
+      broker.traceEvents = bounded.entries;
+      broker.traceBytes = bounded.bytes;
+      broker.traceTruncated ||= bounded.truncated;
+      broker.traceDropped += bounded.droppedCount;
+    }
   } else if (method === "Tracing.tracingComplete") {
     broker.traceComplete = true;
   } else if (method === "Page.screencastFrame") {
-    broker.screencastFrames.push({
+    const bounded = TabWardStageTwo.boundedAppend(broker.screencastFrames, {
       data: params.data,
       metadata: params.metadata,
       sessionId: params.sessionId,
       receivedAt: Date.now()
-    });
-    broker.screencastFrames = broker.screencastFrames.slice(-5);
+    }, { maxCount: 5, maxBytes: SCREENCAST_MAX_BYTES });
+    broker.screencastFrames = bounded.entries;
+    broker.screencastBytes = bounded.bytes;
+    broker.screencastTruncated ||= bounded.truncated;
+    broker.screencastDropped += bounded.droppedCount;
     chrome.debugger.sendCommand(
       { tabId: source.tabId },
       "Page.screencastFrameAck",
@@ -686,16 +1063,17 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
   broker.sequence += 1;
-  broker.events.push(sanitizeBrowserPayload({
+  const bounded = TabWardStageTwo.boundedAppend(broker.events, sanitizeBrowserPayload({
     sequence: broker.sequence,
     timestamp: Date.now(),
     category,
     method,
     params
-  }));
-  if (broker.events.length > MAX_CDP_EVENTS) {
-    broker.events.splice(0, broker.events.length - MAX_CDP_EVENTS);
-  }
+  }), { maxCount: MAX_CDP_EVENTS, maxBytes: EVENT_MAX_BYTES });
+  broker.events = bounded.entries;
+  broker.eventBytes = bounded.bytes;
+  broker.eventsTruncated ||= bounded.truncated;
+  broker.eventsDropped += bounded.droppedCount;
 });
 
 async function cdpAttach(tabId) {
@@ -709,28 +1087,27 @@ async function cdpAttach(tabId) {
       "CDP attach"
     );
   } catch (firstError) {
-    const probe = await bestEffort(
-      chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
-      3000,
-      "CDP attach probe"
-    );
-    if (!probe || probe.ok === false) {
-      await bestEffort(chrome.debugger.detach({ tabId }), 2000, "detach before CDP attach retry");
-      await sleep(250, activeCommandSignal);
-      try {
-        await withTimeout(
-          chrome.debugger.attach({ tabId }, CDP_VERSION),
-          10000,
-          "CDP attach retry"
-        );
-      } catch (retryError) {
-        if (!String(retryError?.message || "").toLowerCase().includes("already attached")) {
-          throw firstError;
-        }
-      }
+    if (String(firstError?.message || "").toLowerCase().includes("already attached")) {
+      const error = new Error(
+        "Chrome reports an existing debugger attachment that this worker cannot prove it owns"
+      );
+      error.name = "DebuggerOwnershipUnknown";
+      throw error;
     }
+    throw firstError;
   }
   cdpTabs.add(tabId);
+  const ownership = await getOwnership();
+  await stateStore.mutate({ [CDP_OWNERSHIP_KEY]: {} }, (state) => {
+    state[CDP_OWNERSHIP_KEY][tabId] = {
+      tabId,
+      sessionId: ownership[tabId]?.sessionId || null,
+      workerInstanceId: WORKER_INSTANCE_ID,
+      leaseExpiresAt: Number(commandContext(ownership[tabId])?.expiresAt || 0) || null,
+      attachedAt: Date.now()
+    };
+    return state;
+  });
 }
 
 async function cdpDetach(tabId) {
@@ -745,6 +1122,10 @@ async function cdpDetach(tabId) {
     );
   } finally {
     cdpTabs.delete(tabId);
+    await stateStore.mutate({ [CDP_OWNERSHIP_KEY]: {} }, (state) => {
+      delete state[CDP_OWNERSHIP_KEY][tabId];
+      return state;
+    });
   }
 }
 
@@ -780,6 +1161,7 @@ async function cdpDetachAll() {
     }
   }
   cdpEventBrokers.clear();
+  await sessionSet({ [CDP_OWNERSHIP_KEY]: {} });
 }
 
 async function enableCdpEvents(tabId, categories) {
@@ -803,12 +1185,12 @@ async function enableCdpEvents(tabId, categories) {
   return broker;
 }
 
-async function waitForNetworkIdle(tabId, timeoutMs, idleMs = 500) {
+async function waitForNetworkIdle(tabId, timeoutMs, idleMs = 500, context = null) {
   const broker = await enableCdpEvents(tabId, ["network", "navigation"]);
   const deadline = Date.now() + timeoutMs;
   let idleSince = broker.inFlight.size === 0 ? Date.now() : null;
   while (Date.now() < deadline) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(context);
     if (broker.inFlight.size === 0) {
       idleSince = idleSince || Date.now();
       if (Date.now() - idleSince >= idleMs) {
@@ -817,7 +1199,7 @@ async function waitForNetworkIdle(tabId, timeoutMs, idleMs = 500) {
     } else {
       idleSince = null;
     }
-    await sleep(50, activeCommandSignal);
+    await sleep(50, commandSignal(context));
   }
   const error = new Error(`Network did not become idle within ${timeoutMs}ms`);
   error.name = "TimeoutError";
@@ -855,6 +1237,10 @@ async function ensureSession() {
 }
 
 async function resolveSessionContext(payload = {}) {
+  const scoped = commandContext(payload)?.session;
+  if (scoped?.id) {
+    return scoped;
+  }
   if (payload.sessionId) {
     return {
       id: String(payload.sessionId),
@@ -863,9 +1249,6 @@ async function resolveSessionContext(payload = {}) {
       cleanQa: payload.cleanQa === true,
       expiresAt: Number(payload.sessionExpiresAt || 0) || null
     };
-  }
-  if (activeSessionContext?.id) {
-    return activeSessionContext;
   }
   return ensureSession();
 }
@@ -886,7 +1269,10 @@ async function getWorkspaceWindows() {
 }
 
 async function setWorkspaceWindows(windows) {
-  await sessionSet({ [WORKSPACE_WINDOWS_KEY]: windows });
+  await stateStore.mutate({ [WORKSPACE_WINDOWS_KEY]: {} }, (state) => {
+    state[WORKSPACE_WINDOWS_KEY] = windows;
+    return state;
+  });
 }
 
 async function getLiveSessionWindow(session) {
@@ -908,21 +1294,24 @@ async function getLiveSessionWindow(session) {
 }
 
 async function rememberSessionWindow(session, windowId) {
-  const windows = await getWorkspaceWindows();
-  windows[session.id] = {
-    windowId,
-    sessionName: session.name,
-    cleanQa: session.cleanQa === true,
-    createdAt: windows[session.id]?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-  await setWorkspaceWindows(windows);
+  await stateStore.mutate({ [WORKSPACE_WINDOWS_KEY]: {} }, (state) => {
+    const windows = state[WORKSPACE_WINDOWS_KEY];
+    windows[session.id] = {
+      windowId,
+      sessionName: session.name,
+      cleanQa: session.cleanQa === true,
+      createdAt: windows[session.id]?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    return state;
+  });
 }
 
 async function forgetSessionWindow(sessionId) {
-  const windows = await getWorkspaceWindows();
-  delete windows[sessionId];
-  await setWorkspaceWindows(windows);
+  await stateStore.mutate({ [WORKSPACE_WINDOWS_KEY]: {} }, (state) => {
+    delete state[WORKSPACE_WINDOWS_KEY][sessionId];
+    return state;
+  });
 }
 
 async function getSessionPolicies() {
@@ -939,19 +1328,24 @@ async function getSessionWorkspace(session) {
   const workspace = session.cleanQa === true || settings.openInSeparateWindow
     ? "isolated"
     : "current";
-  policies[session.id] = {
-    workspace,
-    cleanQa: session.cleanQa === true,
-    createdAt: new Date().toISOString()
-  };
-  await sessionSet({ [SESSION_POLICIES_KEY]: policies });
+  await stateStore.mutate({ [SESSION_POLICIES_KEY]: {} }, (state) => {
+    if (!["isolated", "current"].includes(state[SESSION_POLICIES_KEY][session.id]?.workspace)) {
+      state[SESSION_POLICIES_KEY][session.id] = {
+        workspace,
+        cleanQa: session.cleanQa === true,
+        createdAt: new Date().toISOString()
+      };
+    }
+    return state;
+  });
   return workspace;
 }
 
 async function forgetSessionPolicy(sessionId) {
-  const policies = await getSessionPolicies();
-  delete policies[sessionId];
-  await sessionSet({ [SESSION_POLICIES_KEY]: policies });
+  await stateStore.mutate({ [SESSION_POLICIES_KEY]: {} }, (state) => {
+    delete state[SESSION_POLICIES_KEY][sessionId];
+    return state;
+  });
 }
 
 async function getCleanQaStates() {
@@ -960,7 +1354,10 @@ async function getCleanQaStates() {
 }
 
 async function setCleanQaStates(states) {
-  await sessionSet({ [CLEAN_QA_STATES_KEY]: states });
+  await stateStore.mutate({ [CLEAN_QA_STATES_KEY]: {} }, (state) => {
+    state[CLEAN_QA_STATES_KEY] = states;
+    return state;
+  });
 }
 
 async function incognitoAccessAllowed() {
@@ -1136,13 +1533,75 @@ async function sessionSet(values) {
   return chrome.storage.session.set(values);
 }
 
+const stateStore = TabWardStageTwo.createStateStore({
+  get: (defaults) => chrome.storage.session.get(defaults),
+  set: (values) => chrome.storage.session.set(values)
+});
+
+async function reconcileStaleMetadata(now = Date.now()) {
+  const windows = await bestEffort(
+    incognitoWindows(),
+    3000,
+    "inventory incognito windows during reconciliation"
+  );
+  const liveWindowIds = new Set(
+    Array.isArray(windows) ? windows.map((window) => window.id) : []
+  );
+  const state = await stateStore.read({
+    [CDP_OWNERSHIP_KEY]: {},
+    [CLEAN_QA_STATES_KEY]: {},
+    [OWNERSHIP_KEY]: {}
+  });
+  const resources = [
+    ...Object.values(state[CDP_OWNERSHIP_KEY] || {}).map((record) => ({
+      ...record,
+      id: record.tabId,
+      type: "debugger"
+    })),
+    ...Object.values(state[CLEAN_QA_STATES_KEY] || {}).map((record) => ({
+      ...record,
+      id: record.sessionId,
+      type: "clean_qa_lease",
+      leaseExpiresAt: Number(record.leaseExpiresAt || 0) * 1000
+    })),
+    ...Object.values(state[OWNERSHIP_KEY] || {}).map((record) => ({
+      ...record,
+      id: record.tabId,
+      type: "tab"
+    }))
+  ];
+  const plan = TabWardStageTwo.orphanReconciliationPlan(resources, now);
+  await stateStore.mutate({
+    [CDP_OWNERSHIP_KEY]: {},
+    [CLEAN_QA_STATES_KEY]: {}
+  }, (current) => {
+    for (const [tabId, record] of Object.entries(current[CDP_OWNERSHIP_KEY])) {
+      if (record?.workerInstanceId !== WORKER_INSTANCE_ID) {
+        delete current[CDP_OWNERSHIP_KEY][tabId];
+      }
+    }
+    for (const [sessionId, record] of Object.entries(current[CLEAN_QA_STATES_KEY])) {
+      const expired = Number.isFinite(Number(record?.leaseExpiresAt))
+        && Number(record.leaseExpiresAt) * 1000 <= now;
+      if (expired && !liveWindowIds.has(record?.windowId)) {
+        delete current[CLEAN_QA_STATES_KEY][sessionId];
+      }
+    }
+    return current;
+  });
+  return plan;
+}
+
 async function getWorkTabs() {
   const state = await sessionGet({ [WORK_TABS_KEY]: {} });
   return state[WORK_TABS_KEY] || {};
 }
 
 async function setWorkTabs(workTabs) {
-  await sessionSet({ [WORK_TABS_KEY]: workTabs });
+  await stateStore.mutate({ [WORK_TABS_KEY]: {} }, (state) => {
+    state[WORK_TABS_KEY] = workTabs;
+    return state;
+  });
 }
 
 async function getEmulationStates() {
@@ -1151,13 +1610,14 @@ async function getEmulationStates() {
 }
 
 async function setEmulationState(tabId, value) {
-  const states = await getEmulationStates();
-  if (value) {
-    states[tabId] = value;
-  } else {
-    delete states[tabId];
-  }
-  await sessionSet({ [EMULATION_STATES_KEY]: states });
+  await stateStore.mutate({ [EMULATION_STATES_KEY]: {} }, (state) => {
+    if (value) {
+      state[EMULATION_STATES_KEY][tabId] = value;
+    } else {
+      delete state[EMULATION_STATES_KEY][tabId];
+    }
+    return state;
+  });
 }
 
 async function getOwnership() {
@@ -1165,53 +1625,47 @@ async function getOwnership() {
   return state[OWNERSHIP_KEY] || {};
 }
 
-async function setOwnership(ownership) {
-  await sessionSet({ [OWNERSHIP_KEY]: ownership });
+async function mutateOwnership(mutator) {
+  return stateStore.mutate({ [OWNERSHIP_KEY]: {} }, (state) => {
+    const result = mutator(state[OWNERSHIP_KEY]);
+    if (result && result !== state[OWNERSHIP_KEY]) {
+      state[OWNERSHIP_KEY] = result;
+    }
+    return state;
+  });
 }
 
 async function reserveDownloadOwnership(sessionId) {
   const reservationId = crypto.randomUUID();
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  await sessionSet({
-    [DOWNLOAD_IDS_KEY]: TabWardStageOne.reserveDownload(
-      state[DOWNLOAD_IDS_KEY],
-      reservationId,
-      sessionId
-    )
+  await stateStore.mutate({ [DOWNLOAD_IDS_KEY]: [] }, (state) => {
+    state[DOWNLOAD_IDS_KEY] = TabWardStageOne.reserveDownload(
+      state[DOWNLOAD_IDS_KEY], reservationId, sessionId);
+    return state;
   });
   return reservationId;
 }
 
 async function fulfillDownloadOwnership(reservationId, downloadId, sessionId) {
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  await sessionSet({
-    [DOWNLOAD_IDS_KEY]: TabWardStageOne.fulfillDownloadReservation(
-      state[DOWNLOAD_IDS_KEY],
-      reservationId,
-      downloadId,
-      sessionId
-    )
+  await stateStore.mutate({ [DOWNLOAD_IDS_KEY]: [] }, (state) => {
+    state[DOWNLOAD_IDS_KEY] = TabWardStageOne.fulfillDownloadReservation(
+      state[DOWNLOAD_IDS_KEY], reservationId, downloadId, sessionId);
+    return state;
   });
 }
 
 async function rollbackDownloadOwnership(reservationId, sessionId) {
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  await sessionSet({
-    [DOWNLOAD_IDS_KEY]: TabWardStageOne.rollbackDownloadReservation(
-      state[DOWNLOAD_IDS_KEY],
-      reservationId,
-      sessionId
-    )
+  await stateStore.mutate({ [DOWNLOAD_IDS_KEY]: [] }, (state) => {
+    state[DOWNLOAD_IDS_KEY] = TabWardStageOne.rollbackDownloadReservation(
+      state[DOWNLOAD_IDS_KEY], reservationId, sessionId);
+    return state;
   });
 }
 
 async function releaseSessionDownloads(sessionId) {
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  await sessionSet({
-    [DOWNLOAD_IDS_KEY]: TabWardStageOne.releaseSessionDownloads(
-      state[DOWNLOAD_IDS_KEY],
-      sessionId
-    )
+  await stateStore.mutate({ [DOWNLOAD_IDS_KEY]: [] }, (state) => {
+    state[DOWNLOAD_IDS_KEY] = TabWardStageOne.releaseSessionDownloads(
+      state[DOWNLOAD_IDS_KEY], sessionId);
+    return state;
   });
 }
 
@@ -1224,23 +1678,19 @@ async function getKnownDownloadIds(sessionId) {
 }
 
 async function forgetDownload(downloadId, sessionId) {
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  await sessionSet({
-    [DOWNLOAD_IDS_KEY]: TabWardStageOne.forgetDownloadForSession(
-      state[DOWNLOAD_IDS_KEY],
-      downloadId,
-      sessionId
-    )
+  await stateStore.mutate({ [DOWNLOAD_IDS_KEY]: [] }, (state) => {
+    state[DOWNLOAD_IDS_KEY] = TabWardStageOne.forgetDownloadForSession(
+      state[DOWNLOAD_IDS_KEY], downloadId, sessionId);
+    return state;
   });
 }
 
-async function rememberTab(tab, kind = "created", context = null) {
+async function rememberTab(tab, kind, context) {
   if (!tab || tab.id === undefined) {
     throw new Error("Cannot own a tab without an id");
   }
-  const ownership = await getOwnership();
-  const session = context || await resolveSessionContext();
-  ownership[tab.id] = {
+  const session = TabWardStageTwo.operationSession(context);
+  const record = {
     tabId: tab.id,
     windowId: tab.windowId,
     groupId: tab.groupId,
@@ -1250,8 +1700,11 @@ async function rememberTab(tab, kind = "created", context = null) {
     cleanQa: session.cleanQa === true,
     ownedAt: new Date().toISOString()
   };
-  await setOwnership(ownership);
-  return ownership[tab.id];
+  await stateStore.mutate({ [OWNERSHIP_KEY]: {} }, (state) => {
+    state[OWNERSHIP_KEY][tab.id] = record;
+    return state;
+  });
+  return record;
 }
 
 async function assertTabOwnership(tabId, options = {}) {
@@ -1262,22 +1715,16 @@ async function assertTabOwnership(tabId, options = {}) {
   }
   const ownership = await getOwnership();
   const record = ownership[tabId];
-  const session = options.context || await resolveSessionContext();
-  if (!record || record.sessionId !== session.id || record.kind === "released") {
-    const error = new Error(`Tab ${tabId} is not owned by the active TabWard session`);
-    error.name = "OwnershipError";
-    throw error;
-  }
+  TabWardStageTwo.assertOwnedRecord(
+    record,
+    commandContext(options.context),
+    options
+  );
   if (record.kind === "adopted" && !(await getUserSettings()).allowExistingTabs) {
     await releaseOwnership(tabId);
     const error = new Error(
       "Access to existing user tabs is disabled in the TabWard extension"
     );
-    error.name = "OwnershipError";
-    throw error;
-  }
-  if (options.createdOnly && !["created", "created-child"].includes(record.kind)) {
-    const error = new Error(`Tab ${tabId} was adopted and cannot be closed automatically`);
     error.name = "OwnershipError";
     throw error;
   }
@@ -1294,33 +1741,41 @@ async function forgetTab(tabId) {
   await bestEffort(cdpDetach(tabId), 2000, "cdp detach on forget");
   cdpEventBrokers.delete(tabId);
   await setEmulationState(tabId, null);
-  const ownership = await getOwnership();
-  const workTabs = await getWorkTabs();
-  delete ownership[tabId];
-  delete workTabs[tabId];
-  await sessionSet({ [OWNERSHIP_KEY]: ownership, [WORK_TABS_KEY]: workTabs });
+  await stateStore.mutate({
+    [OWNERSHIP_KEY]: {},
+    [WORK_TABS_KEY]: {}
+  }, (state) => {
+    delete state[OWNERSHIP_KEY][tabId];
+    delete state[WORK_TABS_KEY][tabId];
+    return state;
+  });
 }
 
 async function releaseOwnership(tabId, keepWorkState = false) {
   await bestEffort(cdpDetach(tabId), 2000, "cdp detach on release");
   cdpEventBrokers.delete(tabId);
   await setEmulationState(tabId, null);
-  const ownership = await getOwnership();
-  const workTabs = await getWorkTabs();
-  if (keepWorkState && ownership[tabId]) {
-    ownership[tabId] = {
+  await stateStore.mutate({
+    [OWNERSHIP_KEY]: {},
+    [WORK_TABS_KEY]: {}
+  }, (state) => {
+    const ownership = state[OWNERSHIP_KEY];
+    const workTabs = state[WORK_TABS_KEY];
+    if (keepWorkState && ownership[tabId]) {
+      ownership[tabId] = {
       ...ownership[tabId],
       previousKind: ownership[tabId].kind,
       kind: "released",
       releasedAt: new Date().toISOString()
-    };
-  } else {
-    delete ownership[tabId];
-  }
-  if (!keepWorkState) {
-    delete workTabs[tabId];
-  }
-  await sessionSet({ [OWNERSHIP_KEY]: ownership, [WORK_TABS_KEY]: workTabs });
+      };
+    } else {
+      delete ownership[tabId];
+    }
+    if (!keepWorkState) {
+      delete workTabs[tabId];
+    }
+    return state;
+  });
   await bestEffort(updateWorkspaceVisual(), 2500, "update workspace on release");
 }
 
@@ -1341,14 +1796,30 @@ async function getKnownTabs() {
         sessionName: ownership[id]?.sessionName || null
       });
     } catch (_error) {
-      stale.push(id);
+      stale.push({
+        id,
+        sessionId: ownership[id]?.sessionId,
+        ownedAt: ownership[id]?.ownedAt,
+        kind: ownership[id]?.kind,
+        windowId: ownership[id]?.windowId
+      });
     }
   }
   if (stale.length > 0) {
-    for (const id of stale) {
-      delete ownership[id];
-    }
-    await setOwnership(ownership);
+    await mutateOwnership((current) => {
+      for (const staleRecord of stale) {
+        const currentRecord = current[staleRecord.id];
+        if (
+          currentRecord?.sessionId === staleRecord.sessionId
+          && currentRecord?.ownedAt === staleRecord.ownedAt
+          && currentRecord?.kind === staleRecord.kind
+          && currentRecord?.windowId === staleRecord.windowId
+        ) {
+          delete current[staleRecord.id];
+        }
+      }
+      return current;
+    });
   }
   return live;
 }
@@ -1358,9 +1829,9 @@ async function putInWorkspace(
   windowId,
   title = DEFAULT_GROUP_TITLE,
   collapsed = DEFAULT_GROUP_COLLAPSED,
-  context = null
+  context
 ) {
-  const session = context || await resolveSessionContext();
+  const session = TabWardStageTwo.operationSession(context);
   const state = await sessionGet({ [WORKSPACE_GROUPS_KEY]: {} });
   const groups = state[WORKSPACE_GROUPS_KEY] || {};
   const groupKey = `${session.id}:${windowId}`;
@@ -1396,16 +1867,16 @@ async function putInWorkspace(
   return groupId;
 }
 
-async function waitForTabComplete(tabId, timeoutMs = 30000) {
+async function waitForTabComplete(tabId, timeoutMs = 30000, context = null) {
   const deadline = Date.now() + timeoutMs;
   let tab = await chrome.tabs.get(tabId);
   while (Date.now() < deadline) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(context);
     tab = await chrome.tabs.get(tabId);
     if (tab.status === "complete") {
       return tab;
     }
-    await sleep(250, activeCommandSignal);
+    await sleep(250, commandSignal(context));
   }
   const error = new Error(`Tab ${tabId} did not finish loading within ${timeoutMs}ms`);
   error.name = "TimeoutError";
@@ -1422,7 +1893,30 @@ async function executeInTab(tabId, func, args = [], options = {}) {
     func,
     args
   });
-  return results && results[0] ? results[0].result : null;
+  if (!results || !results[0]) return null;
+  const execution = options.frameId !== undefined && options.frameId !== null
+    ? TabWardStageTwo.frameTarget(
+      results[0],
+      Number(options.frameId),
+      options.documentId
+    )
+    : results[0];
+  if (execution.result && typeof execution.result === "object") {
+    const value = {
+      ...execution.result,
+      frameId: execution.frameId,
+      executionDocumentId: execution.documentId
+    };
+    if (value.target && typeof value.target === "object") {
+      value.target = {
+        ...value.target,
+        frameId: execution.frameId,
+        executionDocumentId: execution.documentId
+      };
+    }
+    return value;
+  }
+  return execution.result;
 }
 
 async function executeInAllFrames(tabId, func, args = []) {
@@ -1436,6 +1930,43 @@ async function executeInAllFrames(tabId, func, args = []) {
     documentId: item.documentId,
     result: item.result
   }));
+}
+
+function boundedFrameAggregate(frames, maxFrames = 100, maxBytes = 8 * 1024 * 1024) {
+  let state = {
+    entries: [],
+    bytes: 0,
+    truncated: false,
+    droppedCount: 0,
+    droppedBytes: 0
+  };
+  for (const frame of frames || []) {
+    const next = TabWardStageTwo.boundedAppend(state.entries, frame, {
+      maxCount: maxFrames,
+      maxBytes
+    });
+    state = {
+      entries: next.entries,
+      bytes: next.bytes,
+      truncated: state.truncated || next.truncated,
+      droppedCount: state.droppedCount + next.droppedCount,
+      droppedBytes: state.droppedBytes + next.droppedBytes
+    };
+  }
+  const completeness = TabWardStageTwo.aggregateCompleteness(
+    state.entries,
+    state.truncated
+  );
+  return {
+    frames: state.entries,
+    frameCount: (frames || []).length,
+    retainedBytes: state.bytes,
+    truncated: completeness.truncated,
+    partial: completeness.partial,
+    droppedCount: state.droppedCount,
+    droppedBytes: state.droppedBytes,
+    complete: completeness.complete
+  };
 }
 
 async function ensureContentScript(tabId) {
@@ -1530,8 +2061,8 @@ async function updateWorkspaceVisual() {
   return { ok: results.every((item) => item.ok), groups: results };
 }
 
-async function markTabWorking(tabId, label = "TabWard", cursor = null) {
-  const ownership = await assertTabOwnership(tabId);
+async function markTabWorking(tabId, context, label = "TabWard", cursor = null) {
+  const ownership = await assertTabOwnership(tabId, { context });
   const workTabs = await getWorkTabs();
   const now = new Date().toISOString();
   workTabs[tabId] = {
@@ -1558,8 +2089,8 @@ async function markTabWorking(tabId, label = "TabWard", cursor = null) {
   });
 }
 
-async function markTabIdle(tabId, hideCursorAfterMs = IDLE_CURSOR_HIDE_MS) {
-  const ownership = await assertTabOwnership(tabId);
+async function markTabIdle(tabId, context, hideCursorAfterMs = IDLE_CURSOR_HIDE_MS) {
+  const ownership = await assertTabOwnership(tabId, { context });
   const workTabs = await getWorkTabs();
   const now = new Date().toISOString();
   workTabs[tabId] = {
@@ -1580,8 +2111,8 @@ async function markTabIdle(tabId, hideCursorAfterMs = IDLE_CURSOR_HIDE_MS) {
   return sendContentState(tabId, "TABWARD_PAGE_MARK_IDLE", { hideCursorAfterMs });
 }
 
-async function finishTabWork(tabId) {
-  const ownership = await assertTabOwnership(tabId);
+async function finishTabWork(tabId, context) {
+  const ownership = await assertTabOwnership(tabId, { context });
   const workTabs = await getWorkTabs();
   const now = new Date().toISOString();
   workTabs[tabId] = {
@@ -1603,8 +2134,8 @@ async function finishTabWork(tabId) {
   return sendContentState(tabId, "TABWARD_PAGE_CLEANUP", {});
 }
 
-async function handoffTab(tabId, label = "TabWard") {
-  const ownership = await assertTabOwnership(tabId);
+async function handoffTab(tabId, context, label = "TabWard") {
+  const ownership = await assertTabOwnership(tabId, { context });
   const workTabs = await getWorkTabs();
   const now = new Date().toISOString();
   workTabs[tabId] = {
@@ -1629,8 +2160,8 @@ async function handoffTab(tabId, label = "TabWard") {
   return { ok: true, tabId, status: "handoff" };
 }
 
-async function deliverableTab(tabId, summary = "") {
-  const ownership = await assertTabOwnership(tabId);
+async function deliverableTab(tabId, context, summary = "") {
+  const ownership = await assertTabOwnership(tabId, { context });
   const workTabs = await getWorkTabs();
   const now = new Date().toISOString();
   workTabs[tabId] = {
@@ -1655,22 +2186,22 @@ async function deliverableTab(tabId, summary = "") {
   return { ok: true, tabId, status: "deliverable", summary };
 }
 
-async function withWorkingTab(tabId, label, operation) {
-  await assertTabOwnership(tabId);
-  await bestEffort(markTabWorking(tabId, label), 2500, "mark tab working");
+async function withWorkingTab(tabId, context, label, operation) {
+  await assertTabOwnership(tabId, { context });
+  await bestEffort(markTabWorking(tabId, context, label), 2500, "mark tab working");
   try {
     return await operation();
   } finally {
-    await bestEffort(markTabIdle(tabId), 2500, "mark tab idle");
+    await bestEffort(markTabIdle(tabId, context), 2500, "mark tab idle");
   }
 }
 
-async function runOwnedTabOperation(tabId, label, operation, visual = true) {
+async function runOwnedTabOperation(tabId, context, label, operation, visual = true) {
   if (visual === false) {
-    await assertTabOwnership(tabId);
+    await assertTabOwnership(tabId, { context });
     return operation();
   }
-  return withWorkingTab(tabId, label, operation);
+  return withWorkingTab(tabId, context, label, operation);
 }
 
 function pageText(maxChars) {
@@ -3596,9 +4127,29 @@ function pageFindAndClick(payload) {
     element.focus({ preventScroll: true });
   }
   const before = location.href;
-  element.click();
+  // This function is serialized into the target frame and cannot reference
+  // extension-worker globals.
+  const eventPlan = payload.doubleClick === true
+    ? ["click", "click", "dblclick"]
+    : ["click"];
+  for (const eventName of eventPlan) {
+    if (eventName === "click") {
+      element.click();
+    } else {
+      element.dispatchEvent(new MouseEvent(eventName, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        detail: 2,
+        view: window
+      }));
+    }
+  }
+  const clickCount = eventPlan.filter((eventName) => eventName === "click").length;
   return {
     ok: true,
+    clickCount,
+    doubleClick: clickCount === 2,
     beforeUrl: before,
     afterUrl: location.href,
     tag: element.tagName.toLowerCase(),
@@ -3853,7 +4404,7 @@ async function verifyActionOutcome(tabId, payload, baseline = null) {
     } catch (error) {
       last = { ok: false, error: toSafeError(error) };
     }
-    await sleep(200, activeCommandSignal);
+    await sleep(200, commandSignal(payload));
   }
   return { ...(last || { ok: false }), timeout: true, waitedMs: Date.now() - startedAt };
 }
@@ -3871,7 +4422,7 @@ async function verifyAutomaticActionOutcome(tabId, payload, baseline, ref) {
     } catch (error) {
       last = { ok: false, error: toSafeError(error) };
     }
-    await sleep(100, activeCommandSignal);
+    await sleep(100, commandSignal(payload));
   }
   return { ...(last || { ok: false, kind: "no-observed-change" }), timeout: true, waitedMs: Date.now() - startedAt };
 }
@@ -3962,21 +4513,21 @@ function pageSelectorState(selector, visibleOnly = false) {
   };
 }
 
-async function waitForText(tabId, text, timeoutMs = 30000) {
+async function waitForText(tabId, text, timeoutMs = 30000, context = null) {
   const deadline = Date.now() + timeoutMs;
   const probeTimeoutMs = Math.min(2000, Math.max(750, timeoutMs));
   while (Date.now() < deadline) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(context);
     const found = await bestEffort(executeInTab(tabId, pageHasText, [text]), probeTimeoutMs, "text probe");
     if (found === true) {
       return { ok: true, found: true };
     }
-    await sleep(500, activeCommandSignal);
+    await sleep(500, commandSignal(context));
   }
   return { ok: false, found: false, timeout: true };
 }
 
-async function waitForSelector(tabId, selector, timeoutMs = 30000, visibleOnly = false) {
+async function waitForSelector(tabId, selector, timeoutMs = 30000, visibleOnly = false, context = null) {
   if (!selector) {
     throw new Error("selector is required");
   }
@@ -3985,7 +4536,7 @@ async function waitForSelector(tabId, selector, timeoutMs = 30000, visibleOnly =
   const probeTimeoutMs = Math.min(5000, Math.max(1500, timeoutMs));
   let last = null;
   while (Date.now() < deadline) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(context);
     try {
       last = await withTimeout(executeInTab(tabId, pageSelectorState, [selector, visibleOnly]), probeTimeoutMs, "selector probe");
     } catch (error) {
@@ -3994,7 +4545,7 @@ async function waitForSelector(tabId, selector, timeoutMs = 30000, visibleOnly =
     if (last && last.found) {
       return { ok: true, waitedMs: Date.now() - startedAt, ...last };
     }
-    await sleep(250, activeCommandSignal);
+    await sleep(250, commandSignal(context));
   }
   return { ok: false, timeout: true, waitedMs: Date.now() - startedAt, selector, visibleOnly, last };
 }
@@ -4394,21 +4945,24 @@ async function commandOpenTab(payload) {
       groupError = toSafeError(error);
     }
   }
-  const ownership = await getOwnership();
-  if (ownership[tab.id]) {
-    ownership[tab.id].groupId = groupId;
-    await setOwnership(ownership);
-  }
-  const loaded = payload.wait === false ? await chrome.tabs.get(tab.id) : await waitForTabComplete(tab.id, payload.timeoutMs || 30000);
+  await mutateOwnership((ownership) => {
+    if (ownership[tab.id]) {
+      ownership[tab.id] = { ...ownership[tab.id], groupId };
+    }
+    return ownership;
+  });
+  const loaded = payload.wait === false
+    ? await chrome.tabs.get(tab.id)
+    : await waitForTabComplete(tab.id, payload.timeoutMs || 30000, payload);
   if (payload.visual !== false) {
     const visualUpdate = (async () => {
-      await markTabWorking(tab.id, "Open", payload.cursor === false ? null : {
+      await markTabWorking(tab.id, payload, "Open", payload.cursor === false ? null : {
         x: 80,
         y: 80,
         label: "TabWard",
         pulse: true
       });
-      await markTabIdle(tab.id);
+      await markTabIdle(tab.id, payload);
     })();
     if (payload.wait === false) {
       visualUpdate.catch(() => {});
@@ -4432,7 +4986,7 @@ async function commandOpenTab(payload) {
 }
 
 async function commandNavigate(payload) {
-  return withWorkingTab(payload.tabId, "Navigate", async () => {
+  return withWorkingTab(payload.tabId, payload, "Navigate", async () => {
     if (payload.cursor !== false) {
       await setAgentCursor(payload.tabId, {
         x: 90,
@@ -4442,13 +4996,15 @@ async function commandNavigate(payload) {
       });
     }
     const tab = await chrome.tabs.update(payload.tabId, { url: payload.url });
-    const loaded = payload.wait === false ? tab : await waitForTabComplete(payload.tabId, payload.timeoutMs || 30000);
+    const loaded = payload.wait === false
+      ? tab
+      : await waitForTabComplete(payload.tabId, payload.timeoutMs || 30000, payload);
     return { tab: slimTab(loaded) };
   });
 }
 
 async function commandNavigateAdvanced(payload) {
-  return withWorkingTab(payload.tabId, "Navigate", async () => {
+  return withWorkingTab(payload.tabId, payload, "Navigate", async () => {
     const waitUntil = String(payload.waitUntil || "load").toLowerCase();
     const timeoutMs = Math.max(100, Number(payload.timeoutMs || 30000));
     if (waitUntil === "networkidle") {
@@ -4458,23 +5014,32 @@ async function commandNavigateAdvanced(payload) {
     if (["none", "commit"].includes(waitUntil)) {
       return { ok: true, tab: slimTab(tab), waitUntil };
     }
-    const loaded = await waitForTabComplete(payload.tabId, timeoutMs);
+    const loaded = await waitForTabComplete(payload.tabId, timeoutMs, payload);
     let networkIdle = null;
     if (waitUntil === "networkidle") {
-      networkIdle = await waitForNetworkIdle(payload.tabId, timeoutMs, Number(payload.idleMs || 500));
+      networkIdle = await waitForNetworkIdle(
+        payload.tabId,
+        timeoutMs,
+        Number(payload.idleMs || 500),
+        payload
+      );
     }
     return { ok: true, tab: slimTab(loaded), waitUntil, networkIdle };
   });
 }
 
 async function commandHistory(payload, direction) {
-  return withWorkingTab(payload.tabId, direction === "back" ? "Back" : "Forward", async () => {
+  return withWorkingTab(payload.tabId, payload, direction === "back" ? "Back" : "Forward", async () => {
     const timeoutMs = Math.max(100, Number(payload.timeoutMs || 30000));
     const tab = direction === "back"
       ? await chrome.tabs.goBack(payload.tabId)
       : await chrome.tabs.goForward(payload.tabId);
     if (payload.wait === false) return { ok: true, tab: slimTab(tab), direction };
-    return { ok: true, tab: slimTab(await waitForTabComplete(payload.tabId, timeoutMs)), direction };
+    return {
+      ok: true,
+      tab: slimTab(await waitForTabComplete(payload.tabId, timeoutMs, payload)),
+      direction
+    };
   });
 }
 
@@ -4539,30 +5104,30 @@ async function commandTabs(payload) {
 }
 
 async function commandGetText(payload) {
-  return withWorkingTab(payload.tabId, "Read text", async () => {
+  return withWorkingTab(payload.tabId, payload, "Read text", async () => {
     if (payload.allFrames === true) {
-      return sanitizeBrowserPayload({
-        frames: await executeInAllFrames(payload.tabId, pageText, [payload.maxChars || MAX_TEXT_CHARS])
-      });
+      return sanitizeBrowserPayload(boundedFrameAggregate(
+        await executeInAllFrames(payload.tabId, pageText, [payload.maxChars || MAX_TEXT_CHARS])
+      ));
     }
     return sanitizeBrowserPayload(await executeInTab(payload.tabId, pageText, [payload.maxChars || MAX_TEXT_CHARS]));
   });
 }
 
 async function commandGetHtml(payload) {
-  return withWorkingTab(payload.tabId, "Read HTML", async () => sanitizeBrowserPayload(
+  return withWorkingTab(payload.tabId, payload, "Read HTML", async () => sanitizeBrowserPayload(
     await executeInTab(payload.tabId, pageHtml, [payload.maxChars || MAX_TEXT_CHARS])
   ));
 }
 
 async function commandGetPageState(payload) {
-  return withWorkingTab(payload.tabId, "Page state", async () => sanitizeBrowserPayload(
+  return withWorkingTab(payload.tabId, payload, "Page state", async () => sanitizeBrowserPayload(
     await executeInTab(payload.tabId, pageState, [], { frameId: payload.frameId })
   ));
 }
 
 async function commandExtractTables(payload) {
-  return withWorkingTab(payload.tabId, "Tables", async () => sanitizeBrowserPayload(
+  return withWorkingTab(payload.tabId, payload, "Tables", async () => sanitizeBrowserPayload(
     await executeInTab(payload.tabId, pageExtractTables, [{
       limit: payload.limit,
       maxCellChars: payload.maxCellChars
@@ -4571,7 +5136,7 @@ async function commandExtractTables(payload) {
 }
 
 async function commandObserve(payload) {
-  return withWorkingTab(payload.tabId, "Observe", async () => {
+  return withWorkingTab(payload.tabId, payload, "Observe", async () => {
     const requestedInclude = new Set(Array.isArray(payload.include)
       ? payload.include
       : ["state", "interactive", "links", "forms"]);
@@ -4602,11 +5167,7 @@ async function commandObserve(payload) {
     if (payload.allFrames === true) {
       const frames = await executeInAllFrames(payload.tabId, pageObserve, [options]);
       const limit = Math.max(1, Math.min(Number(payload.maxFrames || 20), 100));
-      return sanitizeBrowserPayload({
-        frames: frames.slice(0, limit),
-        frameCount: frames.length,
-        truncated: frames.length > limit
-      });
+      return sanitizeBrowserPayload(boundedFrameAggregate(frames, limit));
     }
     return sanitizeBrowserPayload(
       await executeInTab(payload.tabId, pageObserve, [options], { frameId: payload.frameId })
@@ -4615,24 +5176,24 @@ async function commandObserve(payload) {
 }
 
 async function commandSnapshot(payload) {
-  return withWorkingTab(payload.tabId, "Snapshot", async () => {
+  return withWorkingTab(payload.tabId, payload, "Snapshot", async () => {
     if (payload.allFrames === true) {
-      return sanitizeBrowserPayload({
-        frames: await executeInAllFrames(payload.tabId, pageSnapshot, [payload.limit || 120])
-      });
+      return sanitizeBrowserPayload(boundedFrameAggregate(
+        await executeInAllFrames(payload.tabId, pageSnapshot, [payload.limit || 120])
+      ));
     }
     return sanitizeBrowserPayload(await executeInTab(payload.tabId, pageSnapshot, [payload.limit || 120]));
   });
 }
 
 async function commandQuery(payload) {
-  return withWorkingTab(payload.tabId, "Query", async () => sanitizeBrowserPayload(
+  return withWorkingTab(payload.tabId, payload, "Query", async () => sanitizeBrowserPayload(
     await executeInTab(payload.tabId, pageQuery, [payload.selector, payload.limit || 50])
   ));
 }
 
 async function commandQueryRich(payload) {
-  return withWorkingTab(payload.tabId, "Query rich", async () => {
+  return withWorkingTab(payload.tabId, payload, "Query rich", async () => {
     const args = [
       payload.selector,
       {
@@ -4643,14 +5204,16 @@ async function commandQueryRich(payload) {
       }
     ];
     if (payload.allFrames === true) {
-      return sanitizeBrowserPayload({ frames: await executeInAllFrames(payload.tabId, pageQueryRich, args) });
+      return sanitizeBrowserPayload(boundedFrameAggregate(
+        await executeInAllFrames(payload.tabId, pageQueryRich, args)
+      ));
     }
     return sanitizeBrowserPayload(await executeInTab(payload.tabId, pageQueryRich, args, { frameId: payload.frameId }));
   });
 }
 
 async function commandExtractImages(payload) {
-  return withWorkingTab(payload.tabId, "Images", async () => {
+  return withWorkingTab(payload.tabId, payload, "Images", async () => {
     const args = [{
     selector: payload.selector || "img,canvas,[style*='background-image']",
     limit: payload.limit || 50,
@@ -4660,33 +5223,37 @@ async function commandExtractImages(payload) {
     minHeight: payload.minHeight
     }];
     if (payload.allFrames === true) {
-      return sanitizeBrowserPayload({ frames: await executeInAllFrames(payload.tabId, pageExtractImages, args) });
+      return sanitizeBrowserPayload(boundedFrameAggregate(
+        await executeInAllFrames(payload.tabId, pageExtractImages, args)
+      ));
     }
     return sanitizeBrowserPayload(await executeInTab(payload.tabId, pageExtractImages, args, { frameId: payload.frameId }));
   });
 }
 
 async function commandResolveTarget(payload) {
-  return withWorkingTab(payload.tabId, "Resolve target", async () => sanitizeBrowserPayload(
+  return withWorkingTab(payload.tabId, payload, "Resolve target", async () => sanitizeBrowserPayload(
     await executeInTab(payload.tabId, pageResolveActionTarget, [payload], { frameId: payload.frameId })
   ));
 }
 
 async function commandClick(payload) {
-  return withWorkingTab(payload.tabId, "Click", async () => {
+  return withWorkingTab(payload.tabId, payload, "Click", async () => {
     const target = await executeInTab(payload.tabId, pageResolveActionTarget, [payload], { frameId: payload.frameId });
     if (!target || target.ok !== true) {
       return { ok: false, actionAccepted: false, target };
     }
     const actionPayload = { ...payload, ref: target.ref || payload.ref };
-    if (payload.cursor !== false) {
+    const nestedFrame = Number.isInteger(Number(payload.frameId))
+      && Number(payload.frameId) !== 0;
+    if (payload.cursor !== false && !nestedFrame) {
       await setAgentCursor(payload.tabId, {
         x: target.x,
         y: target.y,
         label: "Click",
         pulse: true
       });
-      await sleep(payload.cursorDelayMs || 200, activeCommandSignal);
+      await sleep(payload.cursorDelayMs || 200, commandSignal(payload));
     }
     const hasExplicitExpectation = Boolean(payload.expectUrlContains || payload.expectSelector || payload.expectText);
     const baseline = payload.requireOutcome === true
@@ -4696,7 +5263,7 @@ async function commandClick(payload) {
         text: payload.expectText
       }], { frameId: payload.frameId })
       : null;
-    throwIfCommandAborted();
+    throwIfCommandAborted(payload);
     let native = true;
     let action;
     if (
@@ -4740,7 +5307,7 @@ async function commandClick(payload) {
       action = await executeInTab(payload.tabId, pageFindAndClick, [actionPayload], { frameId: payload.frameId });
     }
     if (payload.waitAfterMs) {
-      await sleep(payload.waitAfterMs, activeCommandSignal);
+      await sleep(payload.waitAfterMs, commandSignal(payload));
     }
     const tab = await chrome.tabs.get(payload.tabId);
     const verification = action?.ok !== true
@@ -4754,6 +5321,7 @@ async function commandClick(payload) {
       actionAccepted: action?.ok === true,
       verified,
       verification,
+      cursorSuppressed: nestedFrame && payload.cursor !== false,
       native,
       target,
       click: action,
@@ -4763,22 +5331,24 @@ async function commandClick(payload) {
 }
 
 async function commandFill(payload) {
-  return withWorkingTab(payload.tabId, "Fill", async () => {
+  return withWorkingTab(payload.tabId, payload, "Fill", async () => {
     const target = await executeInTab(payload.tabId, pageResolveActionTarget, [payload], { frameId: payload.frameId });
     if (!target || target.ok !== true) {
       return { ok: false, actionAccepted: false, target };
     }
     const actionPayload = { ...payload, ref: target.ref || payload.ref || payload.selector };
-    if (payload.cursor !== false) {
+    const nestedFrame = Number.isInteger(Number(payload.frameId))
+      && Number(payload.frameId) !== 0;
+    if (payload.cursor !== false && !nestedFrame) {
       await setAgentCursor(payload.tabId, {
         x: target.x,
         y: target.y,
         label: "Fill",
         pulse: true
       });
-      await sleep(payload.cursorDelayMs || 150, activeCommandSignal);
+      await sleep(payload.cursorDelayMs || 150, commandSignal(payload));
     }
-    throwIfCommandAborted();
+    throwIfCommandAborted(payload);
     let native = true;
     let action;
     if (
@@ -4841,6 +5411,7 @@ async function commandFill(payload) {
       actionAccepted: action?.ok === true,
       verified: verification?.ok === true,
       native,
+      cursorSuppressed: nestedFrame && payload.cursor !== false,
       target,
       valueLength: String(payload.value || "").length,
       verification
@@ -4866,11 +5437,15 @@ async function commandSmartFill(payload) {
 }
 
 async function locatorSnapshot(tabId, locator, frameId) {
+  const targetFrameId = frameId ?? locator?.frameId;
   return sanitizeBrowserPayload(await executeInTab(
     tabId,
     pageLocatorSnapshot,
     [locator || {}],
-    { frameId }
+    {
+      frameId: targetFrameId,
+      documentId: locator?.executionDocumentId
+    }
   ));
 }
 
@@ -4886,8 +5461,12 @@ async function resolveLocator(tabId, locator, options = {}) {
   };
   let latest = null;
   while (Date.now() <= deadline) {
-    throwIfCommandAborted();
-    latest = await locatorSnapshot(tabId, actionableLocator, options.frameId);
+    throwIfCommandAborted(options);
+    latest = await locatorSnapshot(
+      tabId,
+      actionableLocator,
+      options.frameId ?? locator?.frameId
+    );
     let target = latest?.target;
     const identityMismatch = target && (
       locator?.documentId && target.documentId !== locator.documentId
@@ -4905,7 +5484,7 @@ async function resolveLocator(tabId, locator, options = {}) {
           ref: recovered.ref,
           index: 0,
           strict: false
-        }, options.frameId);
+        }, options.frameId ?? locator?.frameId);
         target = latest?.target;
       }
     }
@@ -4950,19 +5529,23 @@ async function resolveLocator(tabId, locator, options = {}) {
     }
     if (stateMatch && strictMatch) {
       if (options.stable !== false) {
-        await sleep(Math.min(100, Math.max(20, timeoutMs)), activeCommandSignal);
-        const followup = await locatorSnapshot(tabId, actionableLocator, options.frameId);
+        await sleep(Math.min(100, Math.max(20, timeoutMs)), commandSignal(options));
+        const followup = await locatorSnapshot(
+          tabId,
+          actionableLocator,
+          options.frameId ?? locator?.frameId
+        );
         const next = followup?.target;
         if (!next || JSON.stringify(next.rect) !== JSON.stringify(target.rect)) {
           latest = followup;
-          await sleep(50, activeCommandSignal);
+          await sleep(50, commandSignal(options));
           continue;
         }
       }
       return target;
     }
     if (Date.now() >= deadline) break;
-    await sleep(100, activeCommandSignal);
+    await sleep(100, commandSignal(options));
   }
   const error = new Error(`Locator did not become actionable within ${timeoutMs}ms`);
   error.name = "TimeoutError";
@@ -5031,42 +5614,103 @@ async function dispatchKey(tabId, value, options = {}) {
   await cdpSend(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...params, timestamp: cdpTimestamp() });
 }
 
-async function cdpSetInputFiles(tabId, ref, files) {
-  const segments = String(ref || "").split(/\s*>>>\s*/).filter(Boolean);
-  const expression = `(() => { let root = document; let element = null; for (const selector of ${JSON.stringify(segments)}) { element = root.querySelector(selector); if (!element) return null; root = element.shadowRoot || root; } return element; })()`;
-  let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    let objectId = null;
-    try {
-      const evaluated = await cdpSend(tabId, "Runtime.evaluate", {
-        expression,
-        returnByValue: false
-      }, 10000);
-      objectId = evaluated.result?.objectId;
-      if (!objectId) throw new Error("Could not resolve file input through CDP");
-      await cdpSend(tabId, "DOM.setFileInputFiles", { objectId, files }, 10000);
-      return { ok: true, retried: attempt > 0 };
-    } catch (error) {
-      lastError = error;
-      await bestEffort(cdpDetach(tabId), 2000, "detach after upload failure");
-      if (attempt === 0) await sleep(250, activeCommandSignal);
-    } finally {
-      if (objectId && cdpTabs.has(tabId)) {
-        await bestEffort(
-          cdpSend(tabId, "Runtime.releaseObject", { objectId }, 2000),
-          2500,
-          "release upload object"
-        );
+async function cdpSetInputFiles(
+  tabId,
+  ref,
+  files,
+  context = null,
+  frameId = undefined,
+  expectedDocumentId = undefined
+) {
+  throwIfCommandAborted(context);
+  const marker = `tabward-upload-${crypto.randomUUID()}`;
+  const marked = await executeInTab(
+    tabId,
+    (segments, markerValue) => {
+      let root = document;
+      let element = null;
+      for (const selector of segments) {
+        element = root.querySelector(selector);
+        if (!element) return { ok: false };
+        root = element.shadowRoot || root;
       }
-    }
+      if (!(element instanceof HTMLInputElement) || element.type !== "file") {
+        return { ok: false };
+      }
+      element.setAttribute("data-tabward-upload-target", markerValue);
+      return { ok: true };
+    },
+    [String(ref || "").split(/\s*>>>\s*/).filter(Boolean), marker],
+    { frameId, documentId: expectedDocumentId }
+  );
+  if (!marked?.ok) {
+    throw new Error("Could not resolve file input in the requested frame");
   }
-  throw lastError || new Error("Could not set input files");
+  let effectAttempted = false;
+  try {
+    await cdpSend(tabId, "DOM.enable", {}, 5000);
+    const document = await cdpSend(tabId, "DOM.getFlattenedDocument", {
+      depth: -1,
+      pierce: true
+    }, 10000);
+    const node = (document.nodes || []).find((candidate) => {
+      const attributes = candidate.attributes || [];
+      for (let index = 0; index < attributes.length; index += 2) {
+        if (attributes[index] === "data-tabward-upload-target"
+          && attributes[index + 1] === marker) {
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!node?.backendNodeId) {
+      throw new Error("Could not map the requested frame file input to CDP");
+    }
+    throwIfCommandAborted(context);
+    effectAttempted = true;
+    await cdpSend(tabId, "DOM.setFileInputFiles", {
+      backendNodeId: node.backendNodeId,
+      files
+    }, 10000);
+    return {
+      ok: true,
+      retried: false,
+      frameId: marked.frameId,
+      documentId: marked.executionDocumentId
+    };
+  } catch (error) {
+    if (effectAttempted) {
+      const unknown = new Error(
+        "File input command was dispatched but completion was not confirmed"
+      );
+      unknown.name = "OutcomeUnknown";
+      unknown.details = {
+        outcome: "effect_unknown",
+        effectPossible: true,
+        retrySafe: false,
+        reason: "upload dispatch failed after effect boundary"
+      };
+      throw unknown;
+    }
+    throw error;
+  } finally {
+    await bestEffort(executeInTab(
+      tabId,
+      (markerValue) => {
+        document
+          .querySelector(`[data-tabward-upload-target="${CSS.escape(markerValue)}"]`)
+          ?.removeAttribute("data-tabward-upload-target");
+      },
+      [marker],
+      { frameId }
+    ), 2000, "remove upload target marker");
+  }
 }
 
 async function commandLocatorAction(payload) {
-  return runOwnedTabOperation(payload.tabId, `Action: ${payload.action}`, async () => {
+  return runOwnedTabOperation(payload.tabId, payload, `Action: ${payload.action}`, async () => {
     const options = payload.options || {};
-    const frameId = options.frameId;
+    const frameId = options.frameId ?? payload.locator?.frameId;
     const action = String(payload.action || "");
     const target = await resolveLocator(payload.tabId, payload.locator, {
       timeoutMs: payload.timeoutMs,
@@ -5076,7 +5720,8 @@ async function commandLocatorAction(payload) {
       includeHidden: action === "upload",
       allowRecovery: options.allowRecovery === true,
       minLocatorScore: options.minLocatorScore,
-      stable: options.stable !== false
+      stable: options.stable !== false,
+      [OPERATION_CONTEXT]: commandContext(payload)
     });
     const elementKind = String(target.tag || "").toLowerCase();
     if (["check", "uncheck"].includes(action) && !(elementKind === "input" && target.type === "checkbox")) {
@@ -5096,7 +5741,8 @@ async function commandLocatorAction(payload) {
     }
     let native = true;
     let fallbackUsed = false;
-    if (payload.cursor !== false) {
+    const nestedFrame = Number.isInteger(Number(frameId)) && Number(frameId) !== 0;
+    if (payload.cursor !== false && !nestedFrame) {
       await setAgentCursor(payload.tabId, {
         x: target.x,
         y: target.y,
@@ -5105,6 +5751,19 @@ async function commandLocatorAction(payload) {
       });
     }
     if (action === "click" || action === "doubleClick") {
+      if (nestedFrame) {
+        const frameClick = await executeInTab(
+          payload.tabId,
+          pageFindAndClick,
+          [{ ref: target.ref, index: 1, doubleClick: action === "doubleClick" }],
+          { frameId, documentId: target.executionDocumentId }
+        );
+        if (!frameClick?.ok) {
+          throw new Error(frameClick?.error || "Frame click was not accepted");
+        }
+        native = false;
+        fallbackUsed = true;
+      } else {
       const probe = await executeInTab(
         payload.tabId,
         pageInstallClickProbe,
@@ -5112,7 +5771,7 @@ async function commandLocatorAction(payload) {
         { frameId }
       );
       await dispatchClick(payload.tabId, target, { ...options, doubleClick: action === "doubleClick" });
-      await sleep(50, activeCommandSignal);
+      await sleep(50, commandSignal(payload));
       const fired = probe
         ? await executeInTab(payload.tabId, pageReadClickProbe, [probe], { frameId })
         : false;
@@ -5129,7 +5788,13 @@ async function commandLocatorAction(payload) {
         native = false;
         fallbackUsed = true;
       }
+      }
     } else if (action === "hover") {
+      if (nestedFrame) {
+        const error = new Error("Native hover in a nested frame requires verified top-viewport coordinates");
+        error.name = "FrameCoordinateError";
+        throw error;
+      }
       await cdpSend(payload.tabId, "Input.dispatchMouseEvent", {
         type: "mouseMoved",
         x: target.x,
@@ -5138,6 +5803,17 @@ async function commandLocatorAction(payload) {
         timestamp: cdpTimestamp()
       });
     } else if (action === "fill") {
+      if (nestedFrame) {
+        const frameFill = await executeInTab(payload.tabId, pageFill, [{
+          ref: target.ref,
+          value: String(payload.value ?? "")
+        }], { frameId, documentId: target.executionDocumentId });
+        if (!frameFill?.ok) {
+          throw new Error(frameFill?.error || "Frame fill was not accepted");
+        }
+        native = false;
+        fallbackUsed = true;
+      } else {
       await dispatchClick(payload.tabId, target, options);
       await cdpSend(payload.tabId, "Input.dispatchKeyEvent", {
         type: "keyDown", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65
@@ -5146,7 +5822,7 @@ async function commandLocatorAction(payload) {
         type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65
       });
       await cdpSend(payload.tabId, "Input.insertText", { text: String(payload.value ?? "") });
-      await sleep(50, activeCommandSignal);
+      await sleep(50, commandSignal(payload));
       const filled = await locatorSnapshot(payload.tabId, payload.locator, frameId);
       if (String(filled?.target?.value ?? "") !== String(payload.value ?? "") && options.domFallback !== false) {
         const fallback = await executeInTab(payload.tabId, pageFill, [{
@@ -5159,23 +5835,53 @@ async function commandLocatorAction(payload) {
         native = false;
         fallbackUsed = true;
       }
+      }
     } else if (action === "type") {
+      if (nestedFrame) {
+        const frameType = await executeInTab(payload.tabId, pageFill, [{
+          ref: target.ref,
+          value: `${String(target.value ?? "")}${String(payload.value ?? "")}`
+        }], { frameId, documentId: target.executionDocumentId });
+        if (!frameType?.ok) {
+          throw new Error(frameType?.error || "Frame type was not accepted");
+        }
+        native = false;
+        fallbackUsed = true;
+      } else {
       await dispatchClick(payload.tabId, target, options);
       const delayMs = Math.max(0, Number(options.delayMs || 0));
       for (const character of String(payload.value ?? "")) {
         await cdpSend(payload.tabId, "Input.insertText", { text: character });
-        if (delayMs) await sleep(delayMs, activeCommandSignal);
+        if (delayMs) await sleep(delayMs, commandSignal(payload));
+      }
       }
     } else if (action === "press") {
+      if (nestedFrame) {
+        const error = new Error("Native key dispatch in a nested frame is not safely targetable");
+        error.name = "FrameCoordinateError";
+        throw error;
+      }
       await dispatchClick(payload.tabId, target, options);
       await dispatchKey(payload.tabId, payload.value, options);
     } else if (action === "check" || action === "uncheck") {
       const desired = action === "check";
       const desiredState = desired ? "true" : "false";
       if (target.checkedState !== desiredState) {
-        await dispatchClick(payload.tabId, target, options);
+        if (nestedFrame) {
+          const frameCheck = await executeInTab(payload.tabId, pageLocatorDomAction, [{
+            ref: target.ref,
+            action
+          }], { frameId, documentId: target.executionDocumentId });
+          if (!frameCheck?.ok) {
+            throw new Error(frameCheck?.error || `${action} was not accepted`);
+          }
+          native = false;
+          fallbackUsed = true;
+        } else {
+          await dispatchClick(payload.tabId, target, options);
+        }
       }
-      await sleep(50, activeCommandSignal);
+      await sleep(50, commandSignal(payload));
       let checked = await locatorSnapshot(payload.tabId, payload.locator, frameId);
       if (checked?.target?.checkedState !== desiredState && options.domFallback !== false) {
         const fallback = await executeInTab(payload.tabId, pageLocatorDomAction, [{
@@ -5205,8 +5911,16 @@ async function commandLocatorAction(payload) {
       const destination = await resolveLocator(payload.tabId, options.targetLocator, {
         timeoutMs: payload.timeoutMs,
         frameId: options.targetFrameId,
-        receivesEvents: true
+        receivesEvents: true,
+        [OPERATION_CONTEXT]: commandContext(payload)
       });
+      if (Number(target.frameId || 0) !== 0 || Number(destination.frameId || 0) !== 0) {
+        const error = new Error(
+          "Native drag across nested frames requires verified top-viewport coordinates"
+        );
+        error.name = "FrameCoordinateError";
+        throw error;
+      }
       const dragData = {
         items: [{
           mimeType: "text/plain",
@@ -5229,13 +5943,20 @@ async function commandLocatorAction(payload) {
       if (!files.every((file) => /^[a-zA-Z]:\\|^\\\\/.test(file))) {
         throw new Error("Upload paths must be absolute Windows paths");
       }
-      const upload = await cdpSetInputFiles(payload.tabId, target.ref, files);
+      const upload = await cdpSetInputFiles(
+        payload.tabId,
+        target.ref,
+        files,
+        payload,
+        frameId ?? target.frameId,
+        target.executionDocumentId
+      );
       fallbackUsed = upload.retried;
     } else {
       throw new Error(`Unsupported locator action: ${action}`);
     }
     if (options.waitAfterMs) {
-      await sleep(Number(options.waitAfterMs), activeCommandSignal);
+      await sleep(Number(options.waitAfterMs), commandSignal(payload));
     }
     const verification = await locatorSnapshot(payload.tabId, payload.locator, frameId);
     return {
@@ -5245,6 +5966,7 @@ async function commandLocatorAction(payload) {
       verification,
       native,
       fallbackUsed,
+      cursorSuppressed: nestedFrame && payload.cursor !== false,
       trace: [
         { step: "found", count: target.candidateCount },
         { step: "scrolled", value: target.scrolled === true },
@@ -5260,7 +5982,7 @@ async function commandForm(payload) {
   for (const [index, field] of (payload.fields || []).entries()) {
     const startedAt = Date.now();
     try {
-      const result = await commandLocatorAction({
+      const result = await commandLocatorAction(scopedPayload(payload, {
         tabId: payload.tabId,
         action: field.action,
         locator: field.locator,
@@ -5269,7 +5991,7 @@ async function commandForm(payload) {
         timeoutMs: payload.timeoutMs,
         cursor: false,
         visual: false
-      });
+      }));
       results.push({
         index, action: field.action, ok: result?.ok !== false,
         elapsedMs: Date.now() - startedAt,
@@ -5286,16 +6008,15 @@ async function commandForm(payload) {
   }
   let submitted = false;
   if (payload.submitLocator) {
-    await commandLocatorAction({
+    await commandLocatorAction(scopedPayload(payload, {
       tabId: payload.tabId,
       action: "click",
       locator: payload.submitLocator,
       options: {},
       timeoutMs: payload.timeoutMs,
-      cursor: false
-      ,
+      cursor: false,
       visual: false
-    });
+    }));
     submitted = true;
   }
   return { ok: true, fields: results, submitted };
@@ -5304,16 +6025,21 @@ async function commandForm(payload) {
 async function commandLocatorWait(payload) {
   const timeoutMs = Math.max(0, Number(payload.timeoutMs || 30000));
   if (payload.state === "networkidle") {
-    return waitForNetworkIdle(payload.tabId, timeoutMs, Number(payload.idleMs || 500));
+    return waitForNetworkIdle(
+      payload.tabId,
+      timeoutMs,
+      Number(payload.idleMs || 500),
+      payload
+    );
   }
   if (["load", "domcontentloaded"].includes(payload.state)) {
-    const tab = await waitForTabComplete(payload.tabId, timeoutMs);
+    const tab = await waitForTabComplete(payload.tabId, timeoutMs, payload);
     return { ok: true, tab: slimTab(tab), state: payload.state };
   }
   const deadline = Date.now() + timeoutMs;
   let snapshot = null;
   while (Date.now() <= deadline) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(payload);
     if (payload.url !== undefined || payload.state === "url") {
       const tab = await chrome.tabs.get(payload.tabId);
       const actual = String(tab.url || "");
@@ -5328,7 +6054,7 @@ async function commandLocatorWait(payload) {
       }
     }
     if (Date.now() >= deadline) break;
-    await sleep(100, activeCommandSignal);
+    await sleep(100, commandSignal(payload));
   }
   const error = new Error(`Wait condition was not met within ${timeoutMs}ms`);
   error.name = "TimeoutError";
@@ -5340,7 +6066,7 @@ async function commandLocatorAssert(payload) {
   const deadline = Date.now() + timeoutMs;
   let actual = null;
   while (Date.now() <= deadline) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(payload);
     const assertion = String(payload.assertion || "");
     if (assertion === "url" || assertion === "title") {
       const tab = await chrome.tabs.get(payload.tabId);
@@ -5386,7 +6112,7 @@ async function commandLocatorAssert(payload) {
       return { ok: true, passed: true, assertion, actual, expected };
     }
     if (Date.now() >= deadline) break;
-    await sleep(100, activeCommandSignal);
+    await sleep(100, commandSignal(payload));
   }
   return {
     ok: true,
@@ -5400,7 +6126,7 @@ async function commandLocatorAssert(payload) {
 
 async function commandDownloadClick(payload) {
   const session = await resolveSessionContext(payload);
-  return withWorkingTab(payload.tabId, "Download", async () => {
+  return withWorkingTab(payload.tabId, payload, "Download", async () => {
     const startedAt = Date.now();
     const timeoutMs = Math.max(100, Math.min(Number(payload.timeoutMs || 30000), 600000));
     const [beforeDownloads, sourceTab] = await Promise.all([
@@ -5427,7 +6153,7 @@ async function commandDownloadClick(payload) {
     }
     let action;
     try {
-      action = await commandClick({ ...payload, waitAfterMs: 0 });
+      action = await commandClick(scopedPayload(payload, { ...payload, waitAfterMs: 0 }));
     } catch (error) {
       downloadPromise.cancel?.();
       newTabPromise.cancel?.();
@@ -5569,7 +6295,7 @@ async function commandDownloadClick(payload) {
 
 async function commandDownloadImage(payload) {
   const session = await resolveSessionContext(payload);
-  return withWorkingTab(payload.tabId, "Download image", async () => {
+  return withWorkingTab(payload.tabId, payload, "Download image", async () => {
     const candidate = await executeInTab(payload.tabId, pageResolveImageForDownload, [{
       selector: payload.selector || "img,canvas,[style*='background-image']",
       index: payload.index || 1,
@@ -5588,9 +6314,9 @@ async function commandDownloadImage(payload) {
         label: "Download",
         pulse: true
       });
-      await sleep(payload.cursorDelayMs || 300, activeCommandSignal);
+      await sleep(payload.cursorDelayMs || 300, commandSignal(payload));
     }
-    throwIfCommandAborted();
+    throwIfCommandAborted(payload);
     const extension = extensionForImage(candidate);
     const fallback = `tabward-image-${candidate.index || payload.index || 1}.${extension}`;
     const filename = sanitizeDownloadFilename(payload.filename, fallback);
@@ -5657,8 +6383,8 @@ async function commandDeleteDownload(payload) {
 }
 
 async function commandCloseTab(payload) {
-  await assertTabOwnership(payload.tabId, { createdOnly: true });
-  await bestEffort(finishTabWork(payload.tabId), 2500, "finish before close");
+  await assertTabOwnership(payload.tabId, { context: payload, createdOnly: true });
+  await bestEffort(finishTabWork(payload.tabId, payload), 2500, "finish before close");
   await withTimeout(chrome.tabs.remove(payload.tabId), 5000, "close tab");
   await forgetTab(payload.tabId);
   return { closed: payload.tabId };
@@ -5702,10 +6428,11 @@ async function commandFinish(payload) {
   if (tabId === undefined || tabId === null) {
     throw new Error("tabId is required");
   }
-  return finishTabWork(tabId);
+  return finishTabWork(tabId, payload);
 }
 
 async function commandCleanup(payload) {
+  const session = await resolveSessionContext(payload);
   const knownTabs = await getKnownTabs();
   const ownership = await getOwnership();
   const cleaned = [];
@@ -5714,7 +6441,10 @@ async function commandCleanup(payload) {
     if (!tab || tab.id === undefined) {
       continue;
     }
-    await bestEffort(finishTabWork(tab.id), 2500, "finish tab during cleanup");
+    if (ownership[tab.id]?.sessionId !== session.id) {
+      continue;
+    }
+    await bestEffort(finishTabWork(tab.id, payload), 2500, "finish tab during cleanup");
     cleaned.push(tab.id);
     if (payload.closeCreatedTabs === true && ["created", "created-child"].includes(ownership[tab.id]?.kind)) {
       await bestEffort(chrome.tabs.remove(tab.id), 5000, "close tab during cleanup");
@@ -5737,23 +6467,33 @@ async function commandReloadExtension(payload) {
 }
 
 async function commandReload(payload) {
-  return withWorkingTab(payload.tabId, "Reload", async () => {
+  return withWorkingTab(payload.tabId, payload, "Reload", async () => {
     await chrome.tabs.reload(payload.tabId);
-    const tab = await waitForTabComplete(payload.tabId, payload.timeoutMs || 30000);
+    const tab = await waitForTabComplete(
+      payload.tabId,
+      payload.timeoutMs || 30000,
+      payload
+    );
     return { tab: slimTab(tab) };
   });
 }
 
 async function commandWaitForText(payload) {
-  return withWorkingTab(payload.tabId, "Wait text", () => waitForText(payload.tabId, payload.text, payload.timeoutMs || 30000));
+  return withWorkingTab(
+    payload.tabId,
+    payload,
+    "Wait text",
+    () => waitForText(payload.tabId, payload.text, payload.timeoutMs || 30000, payload)
+  );
 }
 
 async function commandWaitForSelector(payload) {
-  return withWorkingTab(payload.tabId, "Wait selector", async () => sanitizeBrowserPayload(await waitForSelector(
+  return withWorkingTab(payload.tabId, payload, "Wait selector", async () => sanitizeBrowserPayload(await waitForSelector(
     payload.tabId,
     payload.selector,
     payload.timeoutMs || 30000,
-    payload.visible === true
+    payload.visible === true,
+    payload
   )));
 }
 
@@ -5783,7 +6523,7 @@ async function commandExecuteCdp(payload) {
 }
 
 async function commandCdp(payload) {
-  return commandExecuteCdp({ ...payload, privileged: true });
+  return commandExecuteCdp(scopedPayload(payload, { ...payload, privileged: true }));
 }
 
 async function commandEventsStart(payload) {
@@ -5812,13 +6552,21 @@ async function commandEventsPoll(payload) {
     cursor: events.length ? events[events.length - 1].sequence : cursor,
     latestCursor: broker.sequence,
     hasMore: available.length > events.length,
-    dropped: broker.events.length > 0 && cursor > 0 && cursor < broker.events[0].sequence - 1
+    dropped: broker.events.length > 0 && cursor > 0 && cursor < broker.events[0].sequence - 1,
+    truncated: broker.eventsTruncated,
+    droppedCount: broker.eventsDropped,
+    retainedBytes: broker.eventBytes,
+    partial: broker.eventsTruncated,
+    complete: !broker.eventsTruncated
   };
 }
 
 async function commandEventsClear(payload) {
   const broker = cdpBroker(payload.tabId);
   broker.events = [];
+  broker.eventBytes = 0;
+  broker.eventsTruncated = false;
+  broker.eventsDropped = 0;
   return { ok: true, cursor: broker.sequence };
 }
 
@@ -5845,12 +6593,12 @@ async function commandNetworkBody(payload) {
   const result = await cdpSend(payload.tabId, "Network.getResponseBody", {
     requestId: payload.requestId
   });
-  return {
-    ok: true,
-    requestId: payload.requestId,
-    body: result.body,
-    base64Encoded: result.base64Encoded === true
-  };
+  return TabWardStageTwo.boundedNetworkBody(
+    payload.requestId,
+    result.body,
+    result.base64Encoded === true,
+    NETWORK_BODY_RESULT_MAX_BYTES
+  );
 }
 
 async function commandNetworkHar(payload) {
@@ -6029,7 +6777,7 @@ async function commandEmulation(payload) {
           ? Number(viewport.maxTouchPoints || 1)
           : 1
       });
-      await sleep(50, activeCommandSignal);
+      await sleep(50, commandSignal(payload));
       observed = await executeInTab(payload.tabId, pageViewportState);
       const sizeMatched = Math.abs(Number(observed?.width || 0) - requestedWidth) <= VIEWPORT_TOLERANCE_PX
         && Math.abs(Number(observed?.height || 0) - requestedHeight) <= VIEWPORT_TOLERANCE_PX;
@@ -6218,6 +6966,9 @@ async function commandStorage(payload) {
 async function commandTraceStart(payload) {
   const broker = cdpBroker(payload.tabId);
   broker.traceEvents = [];
+  broker.traceBytes = 0;
+  broker.traceTruncated = false;
+  broker.traceDropped = 0;
   broker.traceComplete = false;
   await cdpSend(payload.tabId, "Tracing.start", {
     categories: payload.categories || "-*,devtools.timeline,v8.execute,blink.user_timing,loading",
@@ -6233,8 +6984,8 @@ async function commandTraceStop(payload) {
   const timeoutMs = Math.max(1000, Number(payload.timeoutMs || 30000));
   const deadline = Date.now() + timeoutMs;
   while (!broker.traceComplete && Date.now() < deadline) {
-    throwIfCommandAborted();
-    await sleep(50, activeCommandSignal);
+    throwIfCommandAborted(payload);
+    await sleep(50, commandSignal(payload));
   }
   if (!broker.traceComplete) {
     const error = new Error(`Trace did not complete within ${timeoutMs}ms`);
@@ -6242,13 +6993,31 @@ async function commandTraceStop(payload) {
     throw error;
   }
   const traceEvents = broker.traceEvents;
+  const truncated = broker.traceTruncated;
+  const droppedCount = broker.traceDropped;
+  const retainedBytes = broker.traceBytes;
   broker.traceEvents = [];
-  return { ok: true, traceEvents, eventCount: traceEvents.length };
+  broker.traceBytes = 0;
+  broker.traceTruncated = false;
+  broker.traceDropped = 0;
+  return {
+    ok: !truncated,
+    traceEvents,
+    eventCount: traceEvents.length,
+    truncated,
+    partial: truncated,
+    droppedCount,
+    retainedBytes,
+    complete: !truncated
+  };
 }
 
 async function commandScreencastStart(payload) {
   const broker = cdpBroker(payload.tabId);
   broker.screencastFrames = [];
+  broker.screencastBytes = 0;
+  broker.screencastTruncated = false;
+  broker.screencastDropped = 0;
   await cdpSend(payload.tabId, "Page.startScreencast", {
     format: payload.format || "jpeg",
     quality: Number(payload.quality || 80),
@@ -6264,8 +7033,8 @@ async function commandScreencastFrame(payload) {
   const timeoutMs = Math.max(100, Number(payload.timeoutMs || 10000));
   const deadline = Date.now() + timeoutMs;
   while (broker.screencastFrames.length === 0 && Date.now() < deadline) {
-    throwIfCommandAborted();
-    await sleep(50, activeCommandSignal);
+    throwIfCommandAborted(payload);
+    await sleep(50, commandSignal(payload));
   }
   const frame = broker.screencastFrames.pop();
   if (!frame) {
@@ -6273,13 +7042,24 @@ async function commandScreencastFrame(payload) {
     error.name = "TimeoutError";
     throw error;
   }
-  return { ok: true, ...frame };
+  return {
+    ok: !broker.screencastTruncated,
+    ...frame,
+    truncated: broker.screencastTruncated,
+    partial: broker.screencastTruncated,
+    droppedCount: broker.screencastDropped,
+    retainedBytes: broker.screencastBytes,
+    complete: !broker.screencastTruncated
+  };
 }
 
 async function commandScreencastStop(payload) {
   await cdpSend(payload.tabId, "Page.stopScreencast", {});
   const broker = cdpBroker(payload.tabId);
   broker.screencastFrames = [];
+  broker.screencastBytes = 0;
+  broker.screencastTruncated = false;
+  broker.screencastDropped = 0;
   return { ok: true, stopped: true };
 }
 
@@ -6300,13 +7080,30 @@ async function commandScreenshot(payload) {
       receivesEvents: false,
       frameId: payload.frameId
     });
+    if (Number(target.frameId || 0) !== 0) {
+      const error = new Error(
+        "Nested-frame element screenshots require a verified frame-to-top coordinate chain"
+      );
+      error.name = "FrameCoordinateError";
+      throw error;
+    }
     const metrics = await cdpSend(payload.tabId, "Page.getLayoutMetrics", {});
     const viewport = metrics.cssVisualViewport || metrics.visualViewport || {};
+    const scaleProbe = await cdpSend(payload.tabId, "Runtime.evaluate", {
+      expression: "({ deviceScaleFactor: window.devicePixelRatio, pageScaleFactor: window.visualViewport?.scale || 1 })",
+      returnByValue: true,
+      awaitPromise: false
+    });
+    const topRect = TabWardStageTwo.topViewportRect(
+      target.rect,
+      [],
+      scaleProbe.result?.value || {}
+    );
     params.clip = {
-      x: Math.max(0, Number(viewport.pageX || 0) + Number(target.rect?.x || 0)),
-      y: Math.max(0, Number(viewport.pageY || 0) + Number(target.rect?.y || 0)),
-      width: Math.max(1, Number(target.rect?.width || 1)),
-      height: Math.max(1, Number(target.rect?.height || 1)),
+      x: Math.max(0, Number(viewport.pageX || 0) + topRect.x),
+      y: Math.max(0, Number(viewport.pageY || 0) + topRect.y),
+      width: Math.max(1, topRect.width),
+      height: Math.max(1, topRect.height),
       scale: 1
     };
     params.captureBeyondViewport = true;
@@ -6359,7 +7156,7 @@ async function commandScreenshot(payload) {
 async function commandEvaluate(payload) {
   const tab = await chrome.tabs.get(payload.tabId);
   if (payload.localOnly === true) {
-    await assertTabOwnership(payload.tabId, { createdOnly: true });
+    await assertTabOwnership(payload.tabId, { context: payload, createdOnly: true });
     let url;
     try {
       url = new URL(String(tab.url || ""));
@@ -6445,42 +7242,45 @@ async function commandQa(payload) {
   try {
     if (payload.preset || payload.viewport) {
       emulationApplied = true;
-      const emulation = await commandEmulation({
+      const emulation = await commandEmulation(scopedPayload(payload, {
         tabId: payload.tabId,
         settings: { preset: payload.preset, viewport: payload.viewport }
-      });
+      }));
       steps.push({ type: "emulation", ok: true, result: emulation });
     }
     if (categories.length) {
-      const started = await commandEventsStart({ tabId: payload.tabId, categories });
+      const started = await commandEventsStart(scopedPayload(payload, {
+        tabId: payload.tabId,
+        categories
+      }));
       eventsStarted = true;
       eventCursor = started.cursor || 0;
       steps.push({ type: "events_start", ok: true, categories });
     }
     for (const probe of payload.probes || []) {
-      const result = await commandProbe({
+      const result = await commandProbe(scopedPayload(payload, {
         tabId: payload.tabId,
         ...probe,
         frameId: probe.frame_id ?? probe.frameId
-      });
+      }));
       steps.push({ type: "probe", operation: probe.operation, ok: result?.ok !== false, result });
       if (result?.ok === false) {
         return { ok: false, steps, screenshots, cleanup };
       }
     }
     for (const assertion of payload.assertions || []) {
-      const result = await commandLocatorAssert({
+      const result = await commandLocatorAssert(scopedPayload(payload, {
         tabId: payload.tabId,
         ...assertion,
         timeoutMs: payload.timeoutMs
-      });
+      }));
       steps.push({ type: "assertion", assertion: assertion.assertion, ok: result.passed === true, result });
       if (!result.passed) {
         return { ok: false, steps, screenshots, cleanup };
       }
     }
     for (const [index, shot] of (payload.screenshots || []).entries()) {
-      const result = await commandScreenshot({
+      const result = await commandScreenshot(scopedPayload(payload, {
         tabId: payload.tabId,
         scope: shot.scope,
         locator: shot.locator,
@@ -6489,18 +7289,29 @@ async function commandQa(payload) {
         format: "png",
         timeoutMs: payload.timeoutMs,
         visual: false
-      });
+      }));
       screenshots.push({ ...result, name: shot.name || `qa-${index + 1}` });
     }
     const events = categories.length
-      ? await commandEventsPoll({ tabId: payload.tabId, cursor: eventCursor, categories, limit: 500 })
+      ? await commandEventsPoll(scopedPayload(payload, {
+        tabId: payload.tabId,
+        cursor: eventCursor,
+        categories,
+        limit: 500
+      }))
       : { events: [] };
     const consoleErrors = (events.events || []).filter((event) =>
       event.category === "console"
       && /exception|error/i.test(`${event.method} ${JSON.stringify(event.params || {})}`)
     );
+    const screenshotsPartial = screenshots.some((shot) =>
+      shot.clipped === true || shot.truncated === true);
+    const capturePartial = events.complete === false || screenshotsPartial;
     result = {
-      ok: consoleErrors.length === 0,
+      ok: consoleErrors.length === 0 && !capturePartial,
+      complete: !capturePartial,
+      partial: capturePartial,
+      truncated: events.truncated === true || screenshotsPartial,
       steps,
       screenshots,
       events: events.events || [],
@@ -6511,16 +7322,16 @@ async function commandQa(payload) {
   } finally {
     const operations = [];
     if (emulationApplied) {
-      const cleared = await bestEffort(commandEmulation({
+      const cleared = await bestEffort(commandEmulation(scopedPayload(payload, {
         tabId: payload.tabId,
         settings: { clear: true }
-      }), 8000, "clear QA emulation");
+      })), 8000, "clear QA emulation");
       let restored = null;
       if (cleared?.ok !== false && priorEmulation) {
-        restored = await bestEffort(commandEmulation({
+        restored = await bestEffort(commandEmulation(scopedPayload(payload, {
           tabId: payload.tabId,
           settings: priorEmulation
-        }), 8000, "restore pre-QA emulation");
+        })), 8000, "restore pre-QA emulation");
       }
       operations.push([
         "emulation",
@@ -6694,7 +7505,7 @@ async function commandWorkflow(payload) {
   const deadline = startedAt + Math.max(1000, Math.min(Number(payload.timeoutMs || 120000), 300000));
   const results = [];
   for (let index = 0; index < steps.length; index += 1) {
-    throwIfCommandAborted();
+    throwIfCommandAborted(payload);
     if (Date.now() >= deadline) {
       results.push({ index, ok: false, error: "Workflow deadline exceeded" });
       return { ok: false, stoppedAt: index, steps: results };
@@ -6714,7 +7525,7 @@ async function commandWorkflow(payload) {
       if ((type === "smartClick" || type === "smartFill") && stepPayload.cursor === undefined) {
         stepPayload.cursor = false;
       }
-      const result = await handler(stepPayload);
+      const result = await handler(scopedPayload(payload, stepPayload));
       const ok = !result || result.ok !== false;
       results.push({
         index,
@@ -6792,15 +7603,28 @@ async function commandAdoptTab(payload) {
       error.name = "OwnershipError";
       throw error;
     }
-    const ownership = await getOwnership();
-    ownership[payload.tabId] = {
-      ...existing,
-      kind: existing.previousKind || "adopted",
-      adoptedAt: new Date().toISOString()
-    };
-    delete ownership[payload.tabId].previousKind;
-    delete ownership[payload.tabId].releasedAt;
-    await setOwnership(ownership);
+    let restored;
+    await mutateOwnership((ownership) => {
+      const current = ownership[payload.tabId];
+      if (
+        !current
+        || current.kind !== "released"
+        || current.sessionId !== session.id
+      ) {
+        const error = new Error(`Tab ${payload.tabId} ownership changed during adoption`);
+        error.name = "OwnershipError";
+        throw error;
+      }
+      restored = {
+        ...current,
+        kind: current.previousKind || "adopted",
+        adoptedAt: new Date().toISOString()
+      };
+      delete restored.previousKind;
+      delete restored.releasedAt;
+      ownership[payload.tabId] = restored;
+      return ownership;
+    });
     if (!(await getUserSettings()).allowExistingTabs) {
       await releaseOwnership(payload.tabId);
       const error = new Error(
@@ -6809,7 +7633,7 @@ async function commandAdoptTab(payload) {
       error.name = "OwnershipError";
       throw error;
     }
-    return { ok: true, adopted: true, restored: true, tab: slimTab(tab), ownership: ownership[payload.tabId] };
+    return { ok: true, adopted: true, restored: true, tab: slimTab(tab), ownership: restored };
   }
   const ownership = await rememberTab(tab, "adopted", session);
   if (!(await getUserSettings()).allowExistingTabs) {
@@ -6824,8 +7648,8 @@ async function commandAdoptTab(payload) {
 }
 
 async function commandReleaseTab(payload) {
-  await assertTabOwnership(payload.tabId);
-  await bestEffort(finishTabWork(payload.tabId), 2500, "finish before release");
+  await assertTabOwnership(payload.tabId, { context: payload });
+  await bestEffort(finishTabWork(payload.tabId, payload), 2500, "finish before release");
   await releaseOwnership(payload.tabId);
   return { ok: true, released: payload.tabId };
 }
@@ -6835,6 +7659,7 @@ async function commandReleaseWorkspace(payload) {
   const ownership = await getOwnership();
   const released = [];
   const closed = [];
+  const failures = [];
   let cleanQa = null;
   if (session.cleanQa === true) {
     cleanQa = await validateCleanQa(session);
@@ -6870,17 +7695,55 @@ async function commandReleaseWorkspace(payload) {
       continue;
     }
     const tabId = Number(rawTabId);
-    await bestEffort(finishTabWork(tabId), 2500, "finish before workspace release");
+    await bestEffort(finishTabWork(tabId, payload), 2500, "finish before workspace release");
     if (
       canCloseCreatedTabs
       && ["created", "created-child"].includes(record.kind)
     ) {
-      await bestEffort(chrome.tabs.remove(tabId), 5000, "close workspace tab");
-      await forgetTab(tabId);
-      closed.push(tabId);
+      const closeResult = await bestEffort(
+        chrome.tabs.remove(tabId),
+        5000,
+        "close workspace tab"
+      );
+      let stillPresent = null;
+      if (closeResult?.ok === false) {
+        stillPresent = classifyMissingTab(await bestEffort(
+          chrome.tabs.get(tabId),
+          2000,
+          "verify workspace tab after close failure"
+        ));
+      }
+      const removed = TabWardStageTwo.tabRemovalConfirmed(
+        closeResult,
+        stillPresent
+      );
+      if (removed) {
+        await forgetTab(tabId);
+        closed.push(tabId);
+      } else {
+        failures.push({
+          resource: "tab",
+          tabId,
+          operation: "close",
+          error: closeResult.error
+        });
+      }
     } else {
-      await bestEffort(releaseOwnership(tabId), 2500, "release workspace tab");
-      released.push(tabId);
+      const releaseResult = await bestEffort(
+        releaseOwnership(tabId),
+        2500,
+        "release workspace tab"
+      );
+      if (releaseResult?.ok === false) {
+        failures.push({
+          resource: "tab",
+          tabId,
+          operation: "release",
+          error: releaseResult.error
+        });
+      } else {
+        released.push(tabId);
+      }
     }
   }
   if (Number.isInteger(cleanWindowId) && cleanTabsVerified && foreignCleanTabs.length === 0) {
@@ -6898,14 +7761,25 @@ async function commandReleaseWorkspace(payload) {
       cleanWindowClosed = Array.isArray(remainingWindows)
         && !remainingWindows.some((window) => window.id === cleanWindowId);
       cleanWindowCloseError = cleanWindowClosed ? null : closeResult.error;
+      if (!cleanWindowClosed) {
+        failures.push({
+          resource: "clean_qa_window",
+          windowId: cleanWindowId,
+          operation: "close",
+          error: closeResult.error
+        });
+      }
     } else {
       cleanWindowClosed = true;
     }
   }
-  await forgetSessionWindow(session.id);
-  await forgetSessionPolicy(session.id);
   await releaseSessionDownloads(session.id);
-  if (cleanWindowClosed || foreignCleanTabs.length > 0) {
+  const partial = failures.length > 0 || !cleanTabsVerified;
+  if (!partial) {
+    await forgetSessionWindow(session.id);
+    await forgetSessionPolicy(session.id);
+  }
+  if (!partial && (cleanWindowClosed || foreignCleanTabs.length > 0)) {
     await forgetCleanQaState(session.id);
   } else {
     const states = await getCleanQaStates();
@@ -6923,9 +7797,11 @@ async function commandReleaseWorkspace(payload) {
     }
   }
   return {
-    ok: true,
+    ok: !partial,
+    outcome: partial ? "cleanup_partial" : "completed",
     released,
     closed,
+    failures,
     workspaceWindowPreserved: session.cleanQa === true
       ? !cleanWindowClosed
       : payload.closeCreatedTabs !== true,
@@ -6956,7 +7832,7 @@ async function commandHandoff(payload) {
   if (payload.tabId === undefined || payload.tabId === null) {
     throw new Error("tabId is required");
   }
-  const result = await handoffTab(payload.tabId, payload.label || "TabWard");
+  const result = await handoffTab(payload.tabId, payload, payload.label || "TabWard");
   await releaseOwnership(payload.tabId, true);
   return { ...result, ownershipReleased: true };
 }
@@ -6965,7 +7841,7 @@ async function commandDeliverable(payload) {
   if (payload.tabId === undefined || payload.tabId === null) {
     throw new Error("tabId is required");
   }
-  return deliverableTab(payload.tabId, payload.summary || "");
+  return deliverableTab(payload.tabId, payload, payload.summary || "");
 }
 
 async function commandGetInfo(payload) {
@@ -7099,51 +7975,36 @@ const handlers = {
   getInfo: commandGetInfo
 };
 
-async function dispatch(command) {
+async function dispatch(command, context) {
   const type = command.type;
   if (!handlers[type]) {
     throw new Error(`Unknown command: ${type}`);
   }
-  const payload = command.payload || {};
-  const previousSessionContext = activeSessionContext;
-  activeSessionContext = payload.sessionId
-    ? {
-      id: String(payload.sessionId),
-      name: String(payload.sessionName || "TabWard MCP"),
-      mode: String(payload.sessionMode || "managed"),
-      cleanQa: payload.cleanQa === true,
-      expiresAt: Number(payload.sessionExpiresAt || 0) || null
-    }
-    : null;
-  try {
-    if (payload.tabId !== undefined && type !== "adoptTab" && type !== "openTab") {
-      await assertTabOwnership(payload.tabId, { context: activeSessionContext || undefined });
-      if (activeSessionContext?.cleanQa === true) {
-        const cleanState = await validateCleanQa(activeSessionContext);
-        if (cleanState?.status === "tainted") {
-          const error = new Error(cleanState.reason || "Clean QA state is tainted");
-          error.name = "CleanQaTainted";
-          throw error;
-        }
+  const payload = { ...(command.payload || {}) };
+  Object.defineProperty(payload, OPERATION_CONTEXT, {
+    value: context,
+    enumerable: true,
+    configurable: false,
+    writable: false
+  });
+  if (payload.tabId !== undefined && type !== "adoptTab" && type !== "openTab") {
+    await assertTabOwnership(payload.tabId, { context: context.session || undefined });
+    if (context.session?.cleanQa === true) {
+      const cleanState = await validateCleanQa(context.session);
+      if (cleanState?.status === "tainted") {
+        const error = new Error(cleanState.reason || "Clean QA state is tainted");
+        error.name = "CleanQaTainted";
+        throw error;
       }
     }
-    const timeoutMs = Number.isFinite(payload.commandTimeoutMs)
-      ? payload.commandTimeoutMs
-      : Number.isFinite(payload.timeoutMs)
-        ? payload.timeoutMs + 20000
-        : 45000;
-    const controller = new AbortController();
-    activeCommandSignal = controller.signal;
-    return await withTimeout(
-      handlers[type](payload),
-      timeoutMs,
-      `command ${type}`,
-      () => controller.abort()
-    );
-  } finally {
-    activeCommandSignal = null;
-    activeSessionContext = previousSessionContext;
   }
+  const timeoutMs = Math.max(1, context.deadlineAt - Date.now());
+  return await withTimeout(
+    handlers[type](payload),
+    timeoutMs,
+    `command ${type}`,
+    () => activeOperations.get(context.operationId)?.controller.abort()
+  );
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -7255,11 +8116,15 @@ chrome.tabs.onCreated.addListener((tab) => {
         false,
         session
       );
-      const updatedOwnership = await getOwnership();
-      if (updatedOwnership[ownedTab.id]) {
-        updatedOwnership[ownedTab.id].groupId = groupId;
-        await setOwnership(updatedOwnership);
-      }
+      await mutateOwnership((ownership) => {
+        if (ownership[ownedTab.id]) {
+          ownership[ownedTab.id] = {
+            ...ownership[ownedTab.id],
+            groupId
+          };
+        }
+        return ownership;
+      });
     } catch (_error) {
     }
   })().catch(() => {});

@@ -177,7 +177,7 @@ test("health restarts a terminated broker", { timeout: 25_000 }, async () => {
     const firstBroker = first.structuredContent.bridge.broker;
     assert.equal(typeof firstBroker.instanceId, "string");
     process.kill(Number(firstBroker.pid));
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+    await waitForProcessExit(Number(firstBroker.pid));
     const second = await client.callTool({
       name: "tabward_health",
       arguments: {}

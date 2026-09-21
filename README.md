@@ -170,6 +170,31 @@ prints p50/p95 queue, execution, total, result-size, and RSS samples, and
 removes only its own temporary resources. It does not use the loaded Chrome
 extension or the standard ports.
 
+Stage Two keeps the same global sequential executor while adding one absolute
+deadline and operation ID across MCP, broker HTTP, WebSocket, extension
+dispatch, durable outbox, and result acknowledgement. Queue time consumes the
+deadline. Expired or queued-cancelled work fails before browser dispatch;
+timeouts or disconnects after dispatch remain `OutcomeUnknown` and are never
+blindly retried for actions.
+
+The broker and extension maintain bounded operation/result ledgers with count
+and byte ceilings. A result is acknowledged only after the broker retains a
+bounded recovery copy; cache pressure keeps the durable extension outbox copy
+for replay. Replayed or late confirmed results can recover a previously unknown
+transport outcome, while a crash between a page effect and durable completion
+remains explicitly unknown rather than being described as exactly-once. Event,
+trace, screencast, and all-frame aggregation report consistent
+`truncated`/`partial`/`complete` metadata. Large artifact handles are deferred;
+existing tool schemas and base64 artifact responses remain compatible.
+`networkBody` retains at most a 7 MiB result inside its 8 MiB durable
+reservation and explicitly marks larger bodies as truncated and partial.
+
+Session cleanup now uses `active` → `closing` → `closed` or
+`cleanup_partial`. A failed tab removal preserves ownership so cleanup can be
+retried. Restart reconciliation invalidates only provably stale temporary
+metadata and never auto-closes adopted, user, created, handoff, or deliverable
+tabs. Full automatic MCP-process death detection is deferred.
+
 Anonymous timing telemetry is disabled by default. Tests and benchmarks can
 enable it per client with `TABWARD_TELEMETRY=1`; each measured operation carries
 its explicit opt-in to an already-running shared broker, so the broker does not

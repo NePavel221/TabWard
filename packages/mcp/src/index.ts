@@ -287,17 +287,37 @@ server.registerTool("tabward_session_close", {
     close_created_tabs: z.boolean().default(false)
   }
 }, async ({ session_id, close_created_tabs }) => {
-  const session = sessions.get(session_id, false);
-  const cleanup = await bridge.send("releaseWorkspace", {
-    ...context(session),
-    closeCreatedTabs: close_created_tabs
-  }, session.cleanQa ? 60_000 : 10_000);
-  sessions.close(session_id);
-  return output({
-    ok: true,
-    session: publicSession(session),
-    cleanup
-  });
+  const session = sessions.beginClose(session_id);
+  try {
+    const cleanup = await bridge.send("releaseWorkspace", {
+      ...context(session),
+      closeCreatedTabs: close_created_tabs
+    }, session.cleanQa ? 60_000 : 10_000) as Record<string, unknown>;
+    if (cleanup.ok === false || cleanup.outcome === "cleanup_partial") {
+      sessions.cleanupPartial(session_id, cleanup);
+      return output({
+        ok: false,
+        outcome: "cleanup_partial",
+        session: publicSession(session),
+        cleanup
+      });
+    }
+    sessions.close(session_id);
+    return output({
+      ok: true,
+      outcome: "completed",
+      session: { ...publicSession(session), state: "closed" },
+      cleanup
+    });
+  } catch (error) {
+    sessions.cleanupPartial(session_id, {
+      outcome: "cleanup_partial",
+      error: error instanceof Error
+        ? { name: error.name, message: error.message }
+        : { name: "Error", message: "Session cleanup failed" }
+    });
+    throw error;
+  }
 });
 
 server.registerTool("tabward_tabs", {

@@ -25,6 +25,7 @@ export const FULL_PROFILE_CAPABILITIES = [
 export type Capability = typeof FULL_PROFILE_CAPABILITIES[number];
 export type SessionMode = "managed" | "full_profile";
 export type WorkspaceMode = "isolated" | "current";
+const CLOSING_TTL_SECONDS = 5 * 60;
 
 export interface Session {
   id: string;
@@ -41,6 +42,8 @@ export interface Session {
   workspaceWindowId: number | null;
   cleanQa: boolean;
   cleanQaTainted: boolean;
+  state: "active" | "closing" | "cleanup_partial";
+  cleanup?: unknown;
 }
 
 function isCapability(value: string): value is Capability {
@@ -102,13 +105,14 @@ export class SessionPolicy {
       adoptedTabIds: new Set(),
       workspaceWindowId: null,
       cleanQa,
-      cleanQaTainted: false
+      cleanQaTainted: false,
+      state: "active"
     };
     this.#sessions.set(session.id, session);
     return session;
   }
 
-  get(id: string, touch = true): Session {
+  get(id: string, touch = true, allowClosing = false): Session {
     const session = this.#sessions.get(id);
     if (!session) {
       throw new Error("Unknown TabWard session");
@@ -117,6 +121,9 @@ export class SessionPolicy {
     if (session.expiresAt <= now) {
       this.#sessions.delete(id);
       throw new Error("TabWard session expired");
+    }
+    if (!allowClosing && session.state !== "active") {
+      throw new Error(`TabWard session is ${session.state}; new commands are rejected`);
     }
     if (touch) {
       session.expiresAt = now + session.ttlSeconds;
@@ -173,8 +180,32 @@ export class SessionPolicy {
   }
 
   close(id: string): Session {
-    const session = this.get(id, false);
+    const session = this.get(id, false, true);
     this.#sessions.delete(id);
+    return session;
+  }
+
+  beginClose(id: string): Session {
+    const session = this.get(id, false, true);
+    if (session.state === "active" || session.state === "cleanup_partial") {
+      session.state = "closing";
+      session.expiresAt = Math.max(
+        session.expiresAt,
+        Date.now() / 1000 + CLOSING_TTL_SECONDS
+      );
+      return session;
+    }
+    throw new Error("TabWard session is already closing");
+  }
+
+  cleanupPartial(id: string, cleanup: unknown): Session {
+    const session = this.get(id, false, true);
+    session.state = "cleanup_partial";
+    session.cleanup = cleanup;
+    session.expiresAt = Math.max(
+      session.expiresAt,
+      Date.now() / 1000 + CLOSING_TTL_SECONDS
+    );
     return session;
   }
 
@@ -208,6 +239,8 @@ export function publicSession(session: Session): Record<string, unknown> {
     createdTabIds: [...session.createdTabIds].sort((a, b) => a - b),
     adoptedTabIds: [...session.adoptedTabIds].sort((a, b) => a - b),
     cleanQa: session.cleanQa,
-    cleanQaTainted: session.cleanQaTainted
+    cleanQaTainted: session.cleanQaTainted,
+    state: session.state,
+    cleanup: session.cleanup ?? null
   };
 }

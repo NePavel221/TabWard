@@ -16,6 +16,16 @@ async function stageOneHelpers() {
   return context.TabWardStageOne;
 }
 
+async function stageTwoHelpers() {
+  const source = await readFile(
+    resolve(root, "apps", "extension", "stage-two.js"),
+    "utf8"
+  );
+  const context = vm.createContext({ structuredClone, TextEncoder });
+  vm.runInContext(source, context);
+  return context.TabWardStageTwo;
+}
+
 test("extension uses paired WebSocket transport without native messaging", async () => {
   const background = await readFile(
     resolve(root, "apps", "extension", "background.js"),
@@ -31,7 +41,11 @@ test("extension uses paired WebSocket transport without native messaging", async
   assert.match(background, /pairing_required/);
   assert.match(background, /result_ack/);
   assert.match(background, /resultOutbox/);
+  assert.match(background, /importScripts\("stage-one\.js", "stage-two\.js"\)/);
   assert.match(background, /indexedDB\.open/);
+  assert.match(background, /deadlineAt/);
+  assert.match(background, /activeOperations/);
+  assert.doesNotMatch(background, /activeSessionContext|activeCommandSignal/);
   assert.doesNotMatch(background, /message\.code.*pairingCode/);
   assert.doesNotMatch(background, /connectNative|nativeKeepalive|bridgeFetch|pollLoop/);
   assert.match(
@@ -82,7 +96,10 @@ test("managed QA is ownership-scoped and Clean QA is fail-closed", async () => {
   );
 
   assert.match(background, /MANAGED_QA|evaluateLocal|evaluate_local|localOnly|LocalEvaluateOnly/i);
-  assert.match(background, /assertTabOwnership\(payload\.tabId, \{ createdOnly: true \}\)/);
+  assert.match(
+    background,
+    /assertTabOwnership\(payload\.tabId, \{ context: payload, createdOnly: true \}\)/
+  );
   assert.match(background, /\["localhost", "127\.0\.0\.1", "\[::1\]"\]/);
   assert.match(background, /isAllowedIncognitoAccess/);
   assert.match(background, /incognito: true/);
@@ -241,6 +258,429 @@ test("download reservation rollback and release affect only the owning session",
       .some((entry) => entry.reservationId === "reservation-a"),
     false
   );
+});
+
+test("Stage Two StateStore serializes four logical session mutations", async () => {
+  const helpers = await stageTwoHelpers();
+  let state = {
+    ownership: {},
+    downloads: {},
+    cdp: {}
+  };
+  const store = helpers.createStateStore({
+    get: async () => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
+      return structuredClone(state);
+    },
+    set: async (next) => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
+      state = structuredClone(next);
+    }
+  });
+  await Promise.all(Array.from({ length: 4 }, (_, index) =>
+    store.mutate({ ownership: {}, downloads: {}, cdp: {} }, (current) => {
+      const sessionId = `session-${index}`;
+      current.ownership[index] = sessionId;
+      current.downloads[index] = sessionId;
+      current.cdp[index] = sessionId;
+      return current;
+    })
+  ));
+  assert.deepEqual(Object.values(state.ownership).sort(), [
+    "session-0", "session-1", "session-2", "session-3"
+  ]);
+  assert.deepEqual(state.downloads, state.ownership);
+  assert.deepEqual(state.cdp, state.ownership);
+});
+
+test("Stage Two operation context preserves immutable identity and deadline", async () => {
+  const helpers = await stageTwoHelpers();
+  const context = helpers.operationContext({
+    operationId: "70000000-0000-4000-8000-000000000001",
+    fingerprint: "a".repeat(64),
+    deadlineAt: 123456,
+    payload: {
+      sessionId: "session-a",
+      sessionName: "A",
+      sessionMode: "managed"
+    }
+  });
+  assert.equal(Object.isFrozen(context), true);
+  assert.equal(Object.isFrozen(context.session), true);
+  assert.equal(context.operationId, "70000000-0000-4000-8000-000000000001");
+  assert.equal(context.deadlineAt, 123456);
+  assert.equal(context.session.id, "session-a");
+});
+
+test("managed nested ownership uses immutable operation context without legacy session fields", async () => {
+  const helpers = await stageTwoHelpers();
+  const context = helpers.operationContext({
+    operationId: "71000000-0000-4000-8000-000000000001",
+    fingerprint: "b".repeat(64),
+    deadlineAt: Date.now() + 10_000,
+    payload: {
+      sessionId: "managed-a",
+      sessionName: "Managed A",
+      sessionMode: "managed"
+    }
+  });
+  const nestedPayload = { tabId: 42 };
+  assert.equal("sessionId" in nestedPayload, false);
+  const owned = { tabId: 42, sessionId: "managed-a", kind: "created" };
+  for (const command of [
+    "navigate", "getText", "locatorAction", "downloadClick", "closeTab", "releaseTab"
+  ]) {
+    assert.equal(
+      helpers.assertOwnedRecord(
+        owned,
+        context,
+        { createdOnly: command === "closeTab" }
+      ),
+      owned,
+      command
+    );
+  }
+  assert.throws(
+    () => helpers.assertOwnedRecord(
+      owned,
+      { ...context, session: { ...context.session, id: "managed-b" } }
+    ),
+    (error) => error?.name === "OwnershipError"
+  );
+});
+
+test("all ownership helper callers pass explicit scoped context", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+  const ownershipCallLines = background.split(/\r?\n/)
+    .filter((line) =>
+      line.includes("assertTabOwnership(")
+      && !line.includes("async function assertTabOwnership"));
+  assert.equal(ownershipCallLines.length > 0, true);
+  assert.equal(
+    ownershipCallLines.every((line) => line.includes("context")),
+    true,
+    ownershipCallLines.join("\n")
+  );
+  assert.doesNotMatch(background, /withWorkingTab\(payload\.tabId,\s*["'`]/);
+  assert.doesNotMatch(background, /finishTabWork\(payload\.tabId\)(?!\s*,)/);
+  assert.doesNotMatch(background, /async function setOwnership/);
+  assert.doesNotMatch(background, /rememberTab\([^,\n]+,\s*[^,\n]+\)/);
+  assert.match(background, /commandNavigate\(payload\)[\s\S]*withWorkingTab\(payload\.tabId, payload/);
+  assert.match(background, /commandGetText\(payload\)[\s\S]*withWorkingTab\(payload\.tabId, payload/);
+  assert.match(background, /commandLocatorAction\(payload\)[\s\S]*runOwnedTabOperation\(payload\.tabId, payload/);
+  assert.match(background, /commandDownloadClick\(payload\)[\s\S]*withWorkingTab\(payload\.tabId, payload/);
+  assert.match(background, /commandCloseTab[\s\S]*context: payload, createdOnly: true/);
+  assert.match(background, /commandReleaseTab[\s\S]*context: payload/);
+  assert.match(background, /commandDownloadClick[\s\S]*commandClick\(scopedPayload\(payload/);
+});
+
+test("serialized ownership mutations preserve interleaved open, child, remember, and forget", async () => {
+  const helpers = await stageTwoHelpers();
+  let state = { tabOwnership: {} };
+  const store = helpers.createStateStore({
+    get: async () => structuredClone(state),
+    set: async (next) => {
+      state = structuredClone(next);
+    }
+  });
+  let resumeOpen;
+  const browserWork = new Promise((resolveWork) => {
+    resumeOpen = resolveWork;
+  });
+  const openTab = (async () => {
+    await store.read({ tabOwnership: {} });
+    await browserWork;
+    await store.mutate({ tabOwnership: {} }, (current) => {
+      current.tabOwnership[1] = {
+        tabId: 1,
+        sessionId: "managed-a",
+        kind: "created",
+        groupId: 9
+      };
+      return current;
+    });
+  })();
+  await store.mutate({ tabOwnership: {} }, (current) => {
+    current.tabOwnership[2] = {
+      tabId: 2,
+      sessionId: "managed-a",
+      kind: "created-child"
+    };
+    return current;
+  });
+  resumeOpen();
+  await openTab;
+  await Promise.all([
+    store.mutate({ tabOwnership: {} }, (current) => {
+      current.tabOwnership[3] = {
+        tabId: 3,
+        sessionId: "managed-a",
+        kind: "created"
+      };
+      return current;
+    }),
+    store.mutate({ tabOwnership: {} }, (current) => {
+      delete current.tabOwnership[1];
+      return current;
+    })
+  ]);
+  assert.deepEqual(Object.keys(state.tabOwnership).sort(), ["2", "3"]);
+  assert.equal(state.tabOwnership[2].kind, "created-child");
+  assert.equal(state.tabOwnership[3].sessionId, "managed-a");
+});
+
+test("Stage Two byte budgets expose truncation instead of false completeness", async () => {
+  const helpers = await stageTwoHelpers();
+  let state = { entries: [], truncated: false, droppedCount: 0 };
+  for (const value of ["a".repeat(700), "b".repeat(700), "c".repeat(700)]) {
+    const next = helpers.boundedAppend(state.entries, { value }, {
+      maxCount: 10,
+      maxBytes: 1600
+    });
+    state = {
+      entries: next.entries,
+      truncated: state.truncated || next.truncated,
+      droppedCount: state.droppedCount + next.droppedCount
+    };
+  }
+  assert.equal(state.entries.length, 2);
+  assert.equal(state.truncated, true);
+  assert.equal(state.droppedCount, 1);
+});
+
+test("Stage Two frame identity rejects collisions and stale documents", async () => {
+  const helpers = await stageTwoHelpers();
+  const parent = { frameId: 0, documentId: "parent", result: { selector: "#same" } };
+  const child = { frameId: 7, documentId: "child", result: { selector: "#same" } };
+  assert.throws(() => helpers.frameTarget(parent, 7, "child"), /identity changed/);
+  assert.equal(helpers.frameTarget(child, 7, "child").documentId, "child");
+  assert.throws(
+    () => helpers.frameTarget({ ...child, documentId: "replaced" }, 7, "child"),
+    (error) => error?.name === "StaleLocatorError"
+  );
+});
+
+test("Stage Two frame coordinates stay in CSS pixels across zoom and DPR", async () => {
+  const helpers = await stageTwoHelpers();
+  const rect = helpers.topViewportRect(
+    { x: 10, y: 20, width: 100, height: 40 },
+    [{ x: 30, y: 40 }, { x: 5, y: 6 }],
+    { deviceScaleFactor: 2.5, pageScaleFactor: 1.25 }
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(rect)),
+    {
+      x: 45,
+      y: 66,
+      width: 100,
+      height: 40,
+      deviceScaleFactor: 2.5,
+      pageScaleFactor: 1.25
+    }
+  );
+  assert.throws(
+    () => helpers.topViewportRect(
+      { x: 0, y: 0, width: 10, height: 10 },
+      [{ x: Number.NaN, y: 0 }],
+      { deviceScaleFactor: 2, pageScaleFactor: 1 }
+    ),
+    /incomplete/
+  );
+});
+
+test("orphan reconciliation preserves all tabs and releases only temporary leases", async () => {
+  const helpers = await stageTwoHelpers();
+  const plan = helpers.orphanReconciliationPlan([
+    { type: "tab", id: 1, kind: "created", leaseExpiresAt: 1 },
+    { type: "tab", id: 2, kind: "adopted", leaseExpiresAt: 1 },
+    { type: "tab", id: 3, kind: "deliverable", leaseExpiresAt: 1 },
+    { type: "debugger", id: 1, leaseExpiresAt: 1 },
+    { type: "clean_qa_lease", id: "qa", leaseExpiresAt: 1 }
+  ], 2);
+  assert.deepEqual([...plan.preservedTabs], [1, 2, 3]);
+  assert.deepEqual(
+    [...plan.releasable].map((item) => item.type).sort(),
+    ["clean_qa_lease", "debugger"]
+  );
+});
+
+test("failed tab removal preserves ownership and reports cleanup_partial", async () => {
+  const helpers = await stageTwoHelpers();
+  const ownership = { 42: { tabId: 42, sessionId: "session-a" } };
+  const removed = helpers.tabRemovalConfirmed(
+    { ok: false, error: { name: "Error" } },
+    { id: 42 }
+  );
+  const cleanup = removed
+    ? { ok: true, outcome: "completed" }
+    : {
+      ok: false,
+      outcome: "cleanup_partial",
+      failures: [{ resource: "tab", tabId: 42 }]
+    };
+  if (removed) delete ownership[42];
+  assert.equal(cleanup.outcome, "cleanup_partial");
+  assert.equal(ownership[42].sessionId, "session-a");
+});
+
+test("tab removal requires explicit missing-tab evidence", async () => {
+  const helpers = await stageTwoHelpers();
+  const failedClose = { ok: false, error: { name: "TimeoutError" } };
+  assert.equal(helpers.tabRemovalConfirmed(
+    failedClose,
+    { ok: false, error: { name: "TimeoutError" } }
+  ), false);
+  assert.equal(helpers.tabRemovalConfirmed(
+    failedClose,
+    { ok: false, error: { name: "NoSuchTabError" } }
+  ), true);
+});
+
+test("expired orphan reservations recover capacity without removing active reservations", async () => {
+  const helpers = await stageTwoHelpers();
+  const now = 1_000_000;
+  const ttl = 10_000;
+  const entries = [
+    { id: "stale-a", operationId: "a", status: "reserved", createdAt: now - ttl },
+    { id: "stale-b", operationId: "b", status: "reserved", createdAt: now - ttl - 1 },
+    { id: "active", operationId: "c", status: "reserved", createdAt: now - ttl - 1 },
+    { id: "fresh", operationId: "d", status: "reserved", createdAt: now - 1 },
+    { id: "done", operationId: "e", status: "completed", createdAt: now - ttl - 1 }
+  ];
+  assert.deepEqual(
+    [...helpers.expiredReservationIds(entries, ["c"], now, ttl)],
+    ["stale-a", "stale-b"]
+  );
+});
+
+test("multi-megabyte result commands reserve enough outbox capacity", async () => {
+  const helpers = await stageTwoHelpers();
+  assert.equal(helpers.outboxReservationBytes("eventsPoll"), 8 * 1024 * 1024);
+  assert.equal(helpers.outboxReservationBytes("networkBody"), 8 * 1024 * 1024);
+  assert.equal(helpers.outboxReservationBytes("networkHar"), 8 * 1024 * 1024);
+  assert.equal(helpers.outboxReservationBytes("screenshot"), 16 * 1024 * 1024);
+});
+
+test("network body result stays within its durable reservation at boundary", async () => {
+  const helpers = await stageTwoHelpers();
+  const resultLimit = 7 * 1024 * 1024;
+  const reservation = helpers.outboxReservationBytes("networkBody");
+  const complete = helpers.boundedNetworkBody(
+    "request-small",
+    "a".repeat(6 * 1024 * 1024),
+    false,
+    resultLimit
+  );
+  assert.equal(complete.truncated, false);
+  assert.equal(complete.partial, false);
+  assert.equal(complete.complete, true);
+
+  const bounded = helpers.boundedNetworkBody(
+    "request-boundary",
+    "b".repeat(8 * 1024 * 1024),
+    false,
+    resultLimit
+  );
+  assert.equal(bounded.truncated, true);
+  assert.equal(bounded.outputTruncated, true);
+  assert.equal(bounded.partial, true);
+  assert.equal(bounded.complete, false);
+  assert.equal(helpers.byteLength(bounded) <= resultLimit, true);
+  assert.equal(helpers.byteLength({
+    kind: "result",
+    operationId: "operation",
+    fingerprint: "f".repeat(64),
+    payload: bounded
+  }) < reservation, true);
+});
+
+test("deadline abort after dispatch is classified as effect unknown", async () => {
+  const helpers = await stageTwoHelpers();
+  assert.equal(helpers.abortIsEffectUnknown(true, "TimeoutError"), true);
+  assert.equal(helpers.abortIsEffectUnknown(true, "AbortError"), true);
+  assert.equal(helpers.abortIsEffectUnknown(true, "NotStarted"), false);
+  assert.equal(helpers.abortIsEffectUnknown(false, "TimeoutError"), false);
+});
+
+test("late completion targets the current authenticated transport socket", async () => {
+  const helpers = await stageTwoHelpers();
+  const original = { readyState: 1, id: "original" };
+  const current = { readyState: 1, id: "current" };
+  assert.equal(
+    helpers.resultTransportSocket(current, "connected", 1),
+    current
+  );
+  original.readyState = 3;
+  assert.equal(
+    helpers.resultTransportSocket(original, "connected", 1),
+    null
+  );
+});
+
+test("nested-frame double click emits two clicks and one dblclick", async () => {
+  const helpers = await stageTwoHelpers();
+  assert.deepEqual(
+    [...helpers.clickEventPlan(true)],
+    ["click", "click", "dblclick"]
+  );
+  assert.deepEqual([...helpers.clickEventPlan(false)], ["click"]);
+});
+
+test("retained truncated frame makes the aggregate partial", async () => {
+  const helpers = await stageTwoHelpers();
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(helpers.aggregateCompleteness([
+      { frameId: 0, result: { truncated: false, complete: true } },
+      { frameId: 7, result: { truncated: true, complete: false } }
+    ], false))),
+    { truncated: true, partial: true, complete: false }
+  );
+});
+
+test("allFrames observe structured and nested truncation makes aggregate partial", async () => {
+  const helpers = await stageTwoHelpers();
+  const allFramesObserveFixture = [
+    {
+      frameId: 0,
+      result: {
+        truncated: { interactive: true },
+        outputTruncated: false
+      }
+    },
+    {
+      frameId: 7,
+      result: {
+        outputTruncated: true
+      }
+    },
+    {
+      frameId: 8,
+      result: {
+        outputTruncated: false,
+        metadata: { complete: false }
+      }
+    }
+  ];
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      helpers.aggregateCompleteness(allFramesObserveFixture, false)
+    )),
+    { truncated: true, partial: true, complete: false }
+  );
+});
+
+test("bounded event, trace, and screencast results expose additive partial metadata", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+  assert.match(background, /commandEventsPoll[\s\S]*partial: broker\.eventsTruncated/);
+  assert.match(background, /commandTraceStop[\s\S]*partial: truncated/);
+  assert.match(background, /commandScreencastFrame[\s\S]*partial: broker\.screencastTruncated/);
+  assert.match(background, /boundedFrameAggregate[\s\S]*partial: completeness\.partial/);
 });
 
 test("download click and image paths reserve before browser side effects", async () => {

@@ -8,6 +8,11 @@ import {
   tryAcquireStartupLock,
   type BrokerRuntime
 } from "./runtime.js";
+import {
+  commandFingerprint,
+  outcomeUnknown,
+  remainingMs
+} from "./operation.js";
 import { newTelemetry, sanitizeTelemetry, telemetryEnabled, type OperationTelemetry } from "./telemetry.js";
 
 type Health = Record<string, unknown> & {
@@ -34,6 +39,27 @@ const READ_ONLY_COMMANDS = new Set([
   "locatorAssert", "eventsPoll", "networkBody", "networkHar",
   "downloads", "getUserSettings", "getInfo", "working"
 ]);
+
+export function operationRequest(
+  command: string,
+  payload: Record<string, unknown>,
+  timeoutMs: number,
+  operationId: string = randomUUID(),
+  requestId: string = randomUUID(),
+  deadlineAt = Date.now() + timeoutMs,
+  telemetry = false
+): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    requestId,
+    command,
+    payload,
+    timeoutMs,
+    operationId,
+    fingerprint: commandFingerprint(command, payload),
+    deadlineAt,
+    ...(telemetry ? { telemetry: true } : {})
+  });
+}
 
 function endpoint(runtime: BrokerRuntime, path: string): string {
   return `http://${runtime.host}:${runtime.port}${path}`;
@@ -187,7 +213,17 @@ export class BrokerClient {
     if (!this.#runtime) await this.start();
     const metrics = telemetryEnabled() ? newTelemetry(command) : undefined;
     const startedAt = performance.now();
-    let requestId = randomUUID();
+    const operationId = metrics?.operationId ?? randomUUID();
+    const deadlineAt = Date.now() + timeoutMs;
+    const operation = operationRequest(
+      command,
+      payload,
+      timeoutMs,
+      operationId,
+      randomUUID(),
+      deadlineAt,
+      Boolean(metrics)
+    );
     const record = (value: unknown) => {
       if (!metrics) return;
       const sample = sanitizeTelemetry(value);
@@ -200,14 +236,17 @@ export class BrokerClient {
       ].slice(-128);
     };
     const execute = async () => {
+      const budget = remainingMs(deadlineAt);
+      if (budget === 0) {
+        const error = new Error(`NotStarted: deadline expired before ${command} dispatch`);
+        error.name = "NotStarted";
+        throw error;
+      }
       try {
         const value = await request(this.#runtime!, "/command", {
           method: "POST",
-          body: JSON.stringify({
-            requestId, command, payload, timeoutMs,
-            ...(metrics ? { operationId: metrics.operationId, telemetry: true } : {})
-          })
-        }, timeoutMs + 5_000);
+          body: JSON.stringify(operation)
+        }, budget + 5_000);
         record(value.telemetry);
         return value;
       } catch (error) {
@@ -220,18 +259,7 @@ export class BrokerClient {
       return value.result;
     } catch (error) {
       if (error instanceof BrokerRequestError) {
-        if (error.status < 500) throw error;
-        if (!READ_ONLY_COMMANDS.has(command)) {
-          const unknown = new Error(
-            `OutcomeUnknown: TabWard could not confirm whether ${command} completed; observe the page before deciding whether to retry`
-          );
-          unknown.name = "OutcomeUnknown";
-          throw unknown;
-        }
-        await this.waitForExtension();
-        requestId = randomUUID();
-        const value = await execute();
-        return value.result;
+        throw error;
       }
       const previousInstance = this.#runtime?.instanceId;
       try {
@@ -241,26 +269,33 @@ export class BrokerClient {
           await this.start();
           await this.waitForExtension();
         } else {
-          const unknown = new Error(
-            `OutcomeUnknown: TabWard lost the broker while ${command} was running; observe the page before deciding whether to retry`
-          );
-          unknown.name = "OutcomeUnknown";
-          throw unknown;
+          throw outcomeUnknown(`broker connection was lost while ${command} was running`);
         }
       }
-      if (READ_ONLY_COMMANDS.has(command)) {
+      if (this.#runtime?.instanceId !== previousInstance) {
+        if (!READ_ONLY_COMMANDS.has(command)) {
+          throw outcomeUnknown(`broker restarted while ${command} was running`);
+        }
         await this.waitForExtension();
+        const value = await execute();
+        return value.result;
       }
-      if (!READ_ONLY_COMMANDS.has(command) && this.#runtime?.instanceId !== previousInstance) {
-        const unknown = new Error(
-          `OutcomeUnknown: TabWard broker restarted while ${command} was running; observe the page before deciding whether to retry`
-        );
-        unknown.name = "OutcomeUnknown";
-        throw unknown;
+      // Repeating the same operationId against the same broker only joins its
+      // ledger promise or returns its confirmed cached result.
+      if (remainingMs(deadlineAt) === 0) {
+        throw outcomeUnknown(`deadline expired after ${command} may have reached the broker`);
       }
       const value = await execute();
       return value.result;
     }
+  }
+
+  async cancel(operationId: string): Promise<Record<string, unknown>> {
+    if (!this.#runtime) await this.start();
+    return request(this.#runtime!, "/cancel", {
+      method: "POST",
+      body: JSON.stringify({ operationId })
+    }, 5_000);
   }
 
   async stop(): Promise<void> {

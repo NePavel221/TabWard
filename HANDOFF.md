@@ -2,8 +2,8 @@
 
 ## Current Goal
 
-Review isolated Stage One performance/safety changes. Do not begin Stage Two
-concurrency work without separate approval.
+Stage Two reliability is complete in the isolated worktree. Do not begin Stage
+Three concurrency or Canvas work without explicit approval.
 
 ## Current State
 
@@ -29,40 +29,70 @@ The Factory skill now performs a silent post-task review after real TabWard
 use. It proposes at most one evidence-backed, high-leverage TabWard improvement
 and stays silent when the task revealed no strong reusable opportunity.
 
-The isolated `perf/tabward-stage1-20260921` worktree now has opt-in anonymous
-operation telemetry, a reproducible 1/2/4-client synthetic benchmark, unique
-exclusive-create QA artifact defaults, strict `unchecked` waits, and
-session-owned download list/delete behavior. The bridge remains globally
-sequential. No live Chrome, global MCP installation, standard port, commit, or
-push was used.
+The isolated `perf/tabward-stage2-20260921` worktree now carries one absolute
+deadline and operation ID through MCP, broker HTTP, the retained global bridge
+queue, WebSocket, extension operation context, durable outbox, and result
+acknowledgement. Queue expiry and cancellation fail before browser dispatch;
+post-dispatch loss remains typed `OutcomeUnknown`. Duplicate operation IDs join
+the same in-flight/cached result, while fingerprint conflicts fail closed.
 
-Confirmed review fixes make telemetry opt-in per operation without restarting
-the persistent broker, preserve foreign-session download records at the
-bounded limit, require genuine checkable locator semantics for `unchecked`,
-and clean benchmark child/temp resources on startup failure.
+Extension handlers no longer depend on shared active-session or active-signal
+globals. A serialized StateStore protects short session-state mutations.
+Sessions transition through `active` → `closing` → `closed` or
+`cleanup_partial`; cleanup receives a TTL pin, and failed or unverified tab
+removal preserves ownership for retry. Bounded byte/count budgets cover the
+broker ledger, extension outbox, events, traces, screencast frames, and
+all-frame aggregates. Expired orphan reservations become replayable
+`OutcomeUnknown` tombstones. Partial QA cannot report green.
 
-Final validation adds pre-side-effect download ownership reservations with
-session-release cleanup and failure compensation. Checkable snapshots are now
-tri-state, preserving native indeterminate and ARIA mixed rather than treating
-them as unchecked.
+Review hardening now treats WebSocket send callback failures and deadline
+aborts after dispatch as effect-unknown, keeps extension results until the
+broker has bounded recovery capacity, and replays completion to the current
+authenticated socket after reconnect. Late confirmed results replace matching
+settled unknown ledger outcomes. Read-only broker restart recovery reuses the
+original request/operation identity and absolute deadline. Nested-frame double
+click now emits two clicks plus `dblclick`; retained partial child frames make
+their aggregate partial. The privacy draft now discloses bounded local
+full-result retention in extension IndexedDB and broker memory.
 
-An accepted download click that reaches the observation timeout now returns a
-typed `OutcomeUnknown` with non-sensitive retry metadata while retaining its
-reservation; the MCP client does not retry the click automatically.
+Revalidation hardening now passes immutable operation/session context through
+every nested ownership helper. Managed navigate, read, action, download, close,
+release, cleanup, handoff, deliverable, and visual-state paths no longer fall
+back to the legacy browser session. Ownership updates after asynchronous
+Chrome work use fresh serialized key-level mutations, so open-tab, child-tab,
+remember, forget, grouping, and adoption interleavings do not replace the
+whole ownership map. `networkBody` is bounded to a 7 MiB result inside its
+8 MiB durable reservation and marks larger bodies truncated/partial.
+All-frame completeness now recognizes structured `truncated`,
+`outputTruncated`, and nested incomplete evidence.
 
-## Last 6 Tasks
+Frame/document identity is preserved for targeted scripting. Nested-frame
+uploads use a unique frame marker mapped to a CDP backend node; nested native
+actions use frame-local DOM paths or fail closed. Nested-frame element
+screenshot coordinates and full OOPIF coordinate-chain capture remain
+explicitly deferred. Automatic MCP-death detection and handle-based large
+artifact transfer are also deferred.
 
-1. 2026-08-23: Implemented lease-backed fail-closed Clean QA and passed its 5/5 incognito gate.
-2. 2026-08-23: Passed enhanced frontend QA 12/12, full verify, release audit, and 50/50 endurance without leaks.
-3. 2026-08-24: Added evidence-gated post-task TabWard improvement proposals to the Factory skill.
-4. 2026-09-14: Added `tabward_upload`, hidden file-input support, local path validation, and passed live frontend QA 12/12.
-5. 2026-09-16: Synchronized the verified 0.3.1 source into the canonical checkout and private GitHub repository.
-6. 2026-09-21: Implemented isolated Stage One telemetry, benchmark, QA artifact, unchecked-wait, and download-ownership changes with synthetic regressions.
+Validation passes: all targeted Stage Two regressions, full `npm run verify`
+including release audit, and the isolated 1/2/4 benchmark. Benchmark p95 total
+was 93.19/186.19/371.37 ms; max queue depth remained 0/1/3 and execution stayed
+globally sequential. No live Chrome, global MCP install, standard ports,
+pairing/config changes, commit, push, or publish was used.
+
+## Last 7 Tasks
+
+1. 2026-08-23: Passed enhanced frontend QA 12/12, full verify, release audit, and 50/50 endurance without leaks.
+2. 2026-08-24: Added evidence-gated post-task TabWard improvement proposals to the Factory skill.
+3. 2026-09-14: Added `tabward_upload`, hidden file-input support, local path validation, and passed live frontend QA 12/12.
+4. 2026-09-16: Synchronized the verified 0.3.1 source into the canonical checkout and private GitHub repository.
+5. 2026-09-21: Implemented isolated Stage One telemetry, benchmark, QA artifact, unchecked-wait, and download-ownership changes with synthetic regressions.
+6. 2026-09-21: Implemented Stage Two deadlines, cancellation/outcomes, operation ledger/outbox recovery, serialized state lifecycle, byte budgets, and frame-safe foundations.
+7. 2026-09-21: Resolved Stage Two review and revalidation findings with deterministic ownership, interleaving, budget, and completeness regressions.
 
 ## Next Step
 
-Review the uncommitted Stage One diff and benchmark. Stage Two (removing global
-head-of-line blocking or enabling concurrency) requires separate approval.
+Review the uncommitted Stage Two diff. Stage Three concurrency and Canvas work
+await explicit permission.
 
 ## Risks / Do Not Forget
 
@@ -73,8 +103,14 @@ head-of-line blocking or enabling concurrency) requires separate approval.
 - The npm package and Chrome Web Store extension are not publicly published.
 - GitHub Actions is intentionally absent during the private beta. Local
   `npm run verify` is mandatory before every push.
-- Keep `#commandTail` and sequential execution until Stage Two is explicitly
+- Keep `#commandTail` and sequential execution until Stage Three is explicitly
   approved.
+- Do not claim exactly-once execution across a crash between browser effect and
+  durable completion; the supported outcome is `OutcomeUnknown`.
+- Do not auto-close tabs during orphan reconciliation or claim an unproven
+  debugger attachment after an MV3 restart.
+- Nested-frame element screenshots fail closed until a verified OOPIF
+  frame-to-top coordinate chain is implemented.
 - Pairing tokens under `%LOCALAPPDATA%\TabWard` are sensitive.
 - Broker runtime credentials under `%LOCALAPPDATA%\TabWard` are also sensitive.
 - Existing user tabs must remain inaccessible in managed mode.
