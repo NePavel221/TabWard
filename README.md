@@ -158,6 +158,25 @@ npm run gate:clean-qa
 
 The Clean QA gate requires **Allow in incognito** for TabWard.
 
+Run the isolated synthetic Stage One performance baseline:
+
+```powershell
+npm run benchmark:stage1
+```
+
+It starts its own broker and synthetic WebSocket extension on dynamic loopback
+ports, uses a temporary state directory, measures 1/2/4 simultaneous clients,
+prints p50/p95 queue, execution, total, result-size, and RSS samples, and
+removes only its own temporary resources. It does not use the loaded Chrome
+extension or the standard ports.
+
+Anonymous timing telemetry is disabled by default. Tests and benchmarks can
+enable it per client with `TABWARD_TELEMETRY=1`; each measured operation carries
+its explicit opt-in to an already-running shared broker, so the broker does not
+need a restart. Samples are available only as MCP `_meta["tabward/telemetry"]`
+on `tabward_health`, so ordinary tool content and structured responses remain
+unchanged.
+
 The private beta intentionally uses this local command as its required
 pre-push gate instead of GitHub Actions.
 

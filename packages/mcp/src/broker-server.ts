@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { ExtensionBridge, ExtensionCommandError } from "./bridge.js";
 import { writeRuntime } from "./runtime.js";
+import { newTelemetry, sanitizeTelemetry, validOperationId, type OperationTelemetry } from "./telemetry.js";
 
 const HOST = "127.0.0.1";
 const IPC_PORT = Number(process.env.TABWARD_BROKER_PORT || 18767);
@@ -18,6 +19,7 @@ const requests = new Map<string, {
   fingerprint: string;
   promise: Promise<unknown>;
   settled: boolean;
+  telemetry?: OperationTelemetry;
 }>();
 const REQUEST_TTL_MS = 60 * 60_000;
 const MAX_CACHED_REQUESTS = 256;
@@ -91,12 +93,15 @@ const server = createServer((request, response) => {
   request.on("end", async () => {
     if (oversized) return;
     clients += 1;
+    let metrics: OperationTelemetry | undefined;
     try {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
         requestId?: string;
         command?: string;
         payload?: Record<string, unknown>;
         timeoutMs?: number;
+        operationId?: string;
+        telemetry?: boolean;
       };
       if (!body.command || typeof body.command !== "string") {
         json(response, 400, { ok: false, error: "command is required" });
@@ -106,6 +111,9 @@ const server = createServer((request, response) => {
         json(response, 400, { ok: false, error: "valid requestId is required" });
         return;
       }
+      // The authenticated MCP client opts in per operation. The persistent
+      // broker must not inherit the environment of whichever client started it.
+      const measure = body.telemetry === true && validOperationId(body.operationId);
       const now = Date.now();
       for (const [id, record] of requests) {
         if (now - record.createdAt > REQUEST_TTL_MS) requests.delete(id);
@@ -139,30 +147,47 @@ const server = createServer((request, response) => {
           settled: false,
           promise: Promise.resolve()
         };
+        if (measure) {
+          record.telemetry = newTelemetry(body.command, body.operationId);
+          record.telemetry.brokerActiveRequests = clients;
+          const queue = bridge.queueStatus();
+          // Commands already active or waiting are ahead of this operation.
+          record.telemetry.brokerQueueDepth = queue.active + queue.queued;
+        }
+        const startedAt = performance.now();
+        const current = record;
         record.promise = bridge.send(
             body.command,
             body.payload ?? {},
-            Math.min(Math.max(Number(body.timeoutMs || 60_000), 100), 600_000)
+            Math.min(Math.max(Number(body.timeoutMs || 60_000), 100), 600_000),
+            record.telemetry
           ).finally(() => {
-            if (record) record.settled = true;
+            current.settled = true;
+            if (current.telemetry) {
+              current.telemetry.brokerTotalMs = performance.now() - startedAt;
+              current.telemetry.brokerRssBytes = process.memoryUsage().rss;
+            }
           });
         requests.set(body.requestId, record);
       }
+      metrics = measure && record.telemetry?.operationId === body.operationId ? record.telemetry : undefined;
       const result = await record.promise;
-      json(response, 200, { ok: true, result });
+      json(response, 200, { ok: true, result, ...(metrics ? { telemetry: sanitizeTelemetry(metrics) } : {}) });
     } catch (error) {
       if (error instanceof ExtensionCommandError) {
         json(response, 422, {
           ok: false,
           error: error.message,
           name: error.name,
-          details: error.details
+          details: error.details,
+          ...(metrics ? { telemetry: sanitizeTelemetry(metrics) } : {})
         });
         return;
       }
       json(response, 502, {
         ok: false,
-        error: error instanceof Error ? error.message : "broker command failed"
+        error: error instanceof Error ? error.message : "broker command failed",
+        ...(metrics ? { telemetry: sanitizeTelemetry(metrics) } : {})
       });
     } finally {
       clients = Math.max(0, clients - 1);

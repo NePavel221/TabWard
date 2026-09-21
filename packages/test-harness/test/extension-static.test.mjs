@@ -2,8 +2,19 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { resolve } from "node:path";
+import vm from "node:vm";
 
 const root = resolve(import.meta.dirname, "..", "..", "..");
+
+async function stageOneHelpers() {
+  const source = await readFile(
+    resolve(root, "apps", "extension", "stage-one.js"),
+    "utf8"
+  );
+  const context = vm.createContext({});
+  vm.runInContext(source, context);
+  return context.TabWardStageOne;
+}
 
 test("extension uses paired WebSocket transport without native messaging", async () => {
   const background = await readFile(
@@ -105,8 +116,147 @@ test("frontend QA handlers expose forms, probes, history, and scoped screenshots
   assert.match(background, /const snapshot = await locatorSnapshot\(payload\.tabId, payload\.locator/);
   assert.match(background, /element\.checked = payload\.action === "check"/);
   assert.match(background, /did not reach the requested checkbox state/);
+  assert.match(background, /const nativeCheckable = tag === "input"/);
+  assert.match(background, /const ariaCheckable = \["checkbox", "radio", "switch"/);
+  assert.match(background, /checkable,/);
+  assert.match(background, /element\.indeterminate[\s\S]*\? "mixed"/);
+  assert.match(background, /checkedState !== desiredState/);
   assert.match(background, /includeHidden: action === "upload"/);
   assert.match(background, /payload\.includeHidden === true \|\| visible\(element\)/);
+});
+
+test("unchecked waits match present false state, including a delayed transition", async () => {
+  const helpers = await stageOneHelpers();
+  const checked = { count: 1, target: { checkable: true, checkedState: "true" } };
+  const unchecked = { count: 1, target: { checkable: true, checkedState: "false" } };
+  assert.equal(helpers.locatorWaitMatches("checked", checked), true);
+  assert.equal(helpers.locatorWaitMatches("checked", unchecked), false);
+  assert.equal(helpers.locatorWaitMatches("unchecked", unchecked), true);
+  assert.equal(helpers.locatorWaitMatches("unchecked", checked), false);
+  const delayed = [checked, checked, unchecked]
+    .findIndex((snapshot) => helpers.locatorWaitMatches("unchecked", snapshot));
+  assert.equal(delayed, 2);
+});
+
+test("locator wait matching preserves detached and timeout boundaries", async () => {
+  const helpers = await stageOneHelpers();
+  assert.equal(helpers.locatorWaitMatches("detached", { count: 0, target: null }), true);
+  assert.equal(helpers.locatorWaitMatches("unchecked", { count: 0, target: null }), false);
+  assert.equal(helpers.locatorWaitMatches("unchecked", {
+    count: 1,
+    target: { tag: "button", type: "", role: "button", checkable: false, checkedState: "false" }
+  }), false);
+  assert.equal(helpers.locatorWaitMatches("unchecked", {
+    count: 1,
+    target: { tag: "input", type: "text", role: "textbox", checkable: false, checkedState: "false" }
+  }), false);
+  const mixed = { count: 1, target: { checkable: true, checkedState: "mixed" } };
+  assert.equal(helpers.locatorWaitMatches("checked", mixed), false);
+  assert.equal(helpers.locatorWaitMatches("unchecked", mixed), false);
+  assert.equal(
+    [
+      { count: 1, target: { checkable: true, checkedState: "true" } },
+      { count: 1, target: { checkable: true, checkedState: "mixed" } },
+      { count: 1, target: { checkable: false, checkedState: "false" } }
+    ]
+      .some((snapshot) => helpers.locatorWaitMatches("unchecked", snapshot)),
+    false
+  );
+});
+
+test("download ownership is isolated by session and legacy records fail closed", async () => {
+  const helpers = await stageOneHelpers();
+  const records = [
+    { downloadId: 10, sessionId: "session-a" },
+    { downloadId: 20, sessionId: "session-b" },
+    30
+  ];
+  assert.deepEqual([...helpers.downloadIdsForSession(records, "session-a")], [10]);
+  assert.deepEqual([...helpers.downloadIdsForSession(records, "session-b")], [20]);
+  assert.deepEqual([...helpers.downloadIdsForSession(records, "session-c")], []);
+  const reserved = helpers.reserveDownload(records, "reservation-a", "session-a");
+  const claimed = helpers.fulfillDownloadReservation(
+    reserved, "reservation-a", 40, "session-a");
+  assert.deepEqual([...helpers.downloadIdsForSession(claimed, "session-a")], [10, 40]);
+  assert.throws(
+    () => helpers.fulfillDownloadReservation(
+      reserved, "reservation-a", 20, "session-a"),
+    (error) => error?.name === "OwnershipError"
+  );
+  assert.throws(
+    () => helpers.fulfillDownloadReservation(
+      reserved, "reservation-a", 30, "session-a"),
+    (error) => error?.name === "OwnershipError"
+  );
+  const afterForeignDelete = helpers.forgetDownloadForSession(records, 20, "session-a");
+  assert.equal(afterForeignDelete.some((entry) =>
+    entry.downloadId === 20 && entry.sessionId === "session-b"), true);
+});
+
+test("download ownership capacity reserves before side effects and closed sessions release their records", async () => {
+  const helpers = await stageOneHelpers();
+  const oldSessionFull = Array.from({ length: 200 }, (_, index) => ({
+    downloadId: index,
+    sessionId: "closed-session"
+  }));
+  let sideEffects = 0;
+  assert.throws(
+    () => {
+      const reserved = helpers.reserveDownload(
+        oldSessionFull, "new-reservation", "new-session");
+      sideEffects += 1;
+      return reserved;
+    },
+    (error) => error?.name === "OwnershipError"
+  );
+  assert.equal(sideEffects, 0);
+
+  const released = helpers.releaseSessionDownloads(oldSessionFull, "closed-session");
+  const reserved = helpers.reserveDownload(released, "new-reservation", "new-session");
+  sideEffects += 1;
+  const claimed = helpers.fulfillDownloadReservation(
+    reserved, "new-reservation", 1000, "new-session");
+  assert.equal(sideEffects, 1);
+  assert.deepEqual([...helpers.downloadIdsForSession(claimed, "new-session")], [1000]);
+});
+
+test("download reservation rollback and release affect only the owning session", async () => {
+  const helpers = await stageOneHelpers();
+  const records = [
+    { downloadId: 10, sessionId: "session-a" },
+    { downloadId: 20, sessionId: "session-b" }
+  ];
+  const reserved = helpers.reserveDownload(records, "reservation-a", "session-a");
+  const rolledBack = helpers.rollbackDownloadReservation(
+    reserved, "reservation-a", "session-a");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(rolledBack)),
+    JSON.parse(JSON.stringify(records))
+  );
+  const released = helpers.releaseSessionDownloads(reserved, "session-a");
+  assert.deepEqual([...helpers.downloadIdsForSession(released, "session-a")], []);
+  assert.deepEqual([...helpers.downloadIdsForSession(released, "session-b")], [20]);
+  assert.equal(
+    helpers.ownedDownloadRecords(released)
+      .some((entry) => entry.reservationId === "reservation-a"),
+    false
+  );
+});
+
+test("download click and image paths reserve before browser side effects", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+  assert.match(background, /async function commandDownloadClick[\s\S]*reserveDownloadOwnership\(session\.id\)[\s\S]*commandClick/);
+  assert.match(background, /signal\?\.item[\s\S]*fulfillDownloadOwnership\(reservationId, signal\.item\.id, session\.id\)/);
+  assert.match(background, /async function commandDownloadImage[\s\S]*reserveDownloadOwnership\(session\.id\)[\s\S]*chrome\.downloads\.download/);
+  assert.match(background, /chrome\.downloads\.download[\s\S]*catch \(error\)[\s\S]*rollbackDownloadOwnership\(reservationId, session\.id\)/);
+  assert.match(background, /action\.actionAccepted !== true[\s\S]*rollbackDownloadOwnership\(reservationId, session\.id\)/);
+  assert.match(background, /throw downloadOutcomeUnknown\(\s*"post_click_timeout"/);
+  assert.match(background, /phase,[\s\S]*reservationHeld: true,[\s\S]*retrySafe: false/);
+  assert.doesNotMatch(background, /kind: "timeout"[\s\S]*ownershipReservationHeld/);
+  assert.match(background, /commandReleaseWorkspace[\s\S]*releaseSessionDownloads\(session\.id\)/);
 });
 
 test("popup persists a Chrome-derived English or Russian language", async () => {

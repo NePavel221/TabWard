@@ -8,6 +8,7 @@ import {
   tryAcquireStartupLock,
   type BrokerRuntime
 } from "./runtime.js";
+import { newTelemetry, sanitizeTelemetry, telemetryEnabled, type OperationTelemetry } from "./telemetry.js";
 
 type Health = Record<string, unknown> & {
   instanceId?: unknown;
@@ -18,7 +19,9 @@ class BrokerRequestError extends Error {
   constructor(
     readonly status: number,
     message: string,
-    readonly remoteName?: string
+    readonly remoteName?: string,
+    readonly telemetry?: unknown,
+    readonly details?: unknown
   ) {
     super(message);
     this.name = remoteName || "BrokerRequestError";
@@ -56,7 +59,9 @@ async function request(
     throw new BrokerRequestError(
       response.status,
       String(value.error || `TabWard broker HTTP ${response.status}`),
-      typeof value.name === "string" ? value.name : undefined
+      typeof value.name === "string" ? value.name : undefined,
+      value.telemetry,
+      value.details
     );
   }
   return value;
@@ -76,6 +81,11 @@ export class BrokerClient {
   readonly host = "127.0.0.1";
   #runtime: BrokerRuntime | null = null;
   #health: Health | null = null;
+  #telemetry: OperationTelemetry[] = [];
+
+  telemetry(): OperationTelemetry[] {
+    return telemetryEnabled() ? this.#telemetry.map((sample) => ({ ...sample })) : [];
+  }
 
   get port(): number {
     const extension = this.#health?.extension;
@@ -175,11 +185,36 @@ export class BrokerClient {
     timeoutMs = 60_000
   ): Promise<unknown> {
     if (!this.#runtime) await this.start();
+    const metrics = telemetryEnabled() ? newTelemetry(command) : undefined;
+    const startedAt = performance.now();
     let requestId = randomUUID();
-    const execute = () => request(this.#runtime!, "/command", {
-      method: "POST",
-      body: JSON.stringify({ requestId, command, payload, timeoutMs })
-    }, timeoutMs + 5_000);
+    const record = (value: unknown) => {
+      if (!metrics) return;
+      const sample = sanitizeTelemetry(value);
+      if (!sample || sample.operationId !== metrics.operationId) return;
+      sample.operationType = metrics.operationType;
+      sample.clientTotalMs = performance.now() - startedAt;
+      this.#telemetry = [
+        ...this.#telemetry.filter((entry) => entry.operationId !== sample.operationId),
+        sample
+      ].slice(-128);
+    };
+    const execute = async () => {
+      try {
+        const value = await request(this.#runtime!, "/command", {
+          method: "POST",
+          body: JSON.stringify({
+            requestId, command, payload, timeoutMs,
+            ...(metrics ? { operationId: metrics.operationId, telemetry: true } : {})
+          })
+        }, timeoutMs + 5_000);
+        record(value.telemetry);
+        return value;
+      } catch (error) {
+        if (error instanceof BrokerRequestError) record(error.telemetry);
+        throw error;
+      }
+    };
     try {
       const value = await execute();
       return value.result;

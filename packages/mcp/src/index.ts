@@ -4,8 +4,9 @@ import { basename, isAbsolute } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { saveBase64Artifact, saveJsonArtifact } from "./artifacts.js";
+import { saveBase64Artifact, saveJsonArtifact, saveQaScreenshots } from "./artifacts.js";
 import { BrokerClient } from "./broker-client.js";
+import { telemetryEnabled } from "./telemetry.js";
 import {
   publicSession,
   SessionPolicy,
@@ -116,10 +117,11 @@ const server = new McpServer({
   ].join(" ")
 });
 
-function output(value: Record<string, unknown>) {
+function output(value: Record<string, unknown>, metadata?: Record<string, unknown>) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value) }],
-    structuredContent: value
+    structuredContent: value,
+    ...(metadata ? { _meta: metadata } : {})
   };
 }
 
@@ -225,7 +227,7 @@ server.registerTool("tabward_health", {
   serverVersion: VERSION,
   bridge: { host: bridge.host, port: bridge.port, ...bridge.status() },
   activeSessions: sessions.active().length
-}));
+}, telemetryEnabled() ? { "tabward/telemetry": bridge.telemetry() } : undefined));
 
 server.registerTool("tabward_session_start", {
   description: "Start a managed or explicitly privileged full-profile browser session. The extension chooses the user-approved workspace.",
@@ -813,16 +815,7 @@ server.registerTool("tabward_qa", {
     tabId: tab_id,
     timeoutMs: Math.min(600_000, timeout_ms + 30_000)
   }) as Record<string, unknown>;
-  if (Array.isArray(result.screenshots)) {
-    for (const [index, item] of result.screenshots.entries()) {
-      if (typeof item === "object" && item !== null && typeof (item as { data?: unknown }).data === "string") {
-        const shot = item as Record<string, unknown>;
-        const data = String(shot.data);
-        delete shot.data;
-        shot.artifact = await saveBase64Artifact(data, String(shot.name || `qa-${index + 1}`), ".png");
-      }
-    }
-  }
+  await saveQaScreenshots(result, screenshots, session_id);
   return output(result);
 });
 

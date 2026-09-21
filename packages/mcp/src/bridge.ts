@@ -6,6 +6,7 @@ import {
 } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import { createPairingToken, readPairingToken } from "./state.js";
+import { sanitizeTelemetry, type OperationTelemetry } from "./telemetry.js";
 
 const PROTOCOL_VERSION = 2;
 const DEFAULT_WS_PORT = 18766;
@@ -18,6 +19,8 @@ interface CommandEnvelope {
   protocolVersion: number;
   type: string;
   payload: Record<string, unknown>;
+  operationId?: string;
+  telemetry?: boolean;
 }
 
 interface ResultEnvelope {
@@ -26,6 +29,8 @@ interface ResultEnvelope {
   protocolVersion: number;
   ok: boolean;
   payload: unknown;
+  operationId?: string;
+  telemetry?: unknown;
 }
 
 interface HelloEnvelope {
@@ -45,6 +50,8 @@ interface PendingCommand {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
+  telemetry?: OperationTelemetry;
+  sentAt: number;
 }
 
 interface BridgeStatus {
@@ -88,6 +95,8 @@ export class ExtensionBridge extends EventEmitter {
   #state: BridgeStatus["state"] = "not_running";
   #pending = new Map<string, PendingCommand>();
   #commandTail: Promise<void> = Promise.resolve();
+  #queued = 0;
+  #active = 0;
 
   constructor(port = Number(process.env.TABWARD_PORT || DEFAULT_WS_PORT)) {
     super();
@@ -143,20 +152,31 @@ export class ExtensionBridge extends EventEmitter {
     };
   }
 
+  queueStatus(): { active: number; queued: number } {
+    return { active: this.#active, queued: this.#queued };
+  }
+
   async send(
     type: string,
     payload: Record<string, unknown> = {},
-    timeoutMs = COMMAND_TIMEOUT_MS
+    timeoutMs = COMMAND_TIMEOUT_MS,
+    telemetry?: OperationTelemetry
   ): Promise<unknown> {
+    const queuedAt = performance.now();
+    this.#queued += 1;
     const previous = this.#commandTail;
     let release!: () => void;
     this.#commandTail = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous.catch(() => {});
+    this.#queued -= 1;
+    this.#active += 1;
+    if (telemetry) telemetry.bridgeQueueWaitMs = performance.now() - queuedAt;
     try {
-      return await this.#sendNow(type, payload, timeoutMs);
+      return await this.#sendNow(type, payload, timeoutMs, telemetry);
     } finally {
+      this.#active -= 1;
       release();
     }
   }
@@ -164,7 +184,8 @@ export class ExtensionBridge extends EventEmitter {
   async #sendNow(
     type: string,
     payload: Record<string, unknown>,
-    timeoutMs: number
+    timeoutMs: number,
+    telemetry?: OperationTelemetry
   ): Promise<unknown> {
     const socket = this.#socket;
     if (!socket || socket.readyState !== WebSocket.OPEN || this.#state !== "connected") {
@@ -180,14 +201,15 @@ export class ExtensionBridge extends EventEmitter {
       id,
       protocolVersion: PROTOCOL_VERSION,
       type,
-      payload
+      payload,
+      ...(telemetry ? { operationId: telemetry.operationId, telemetry: true } : {})
     };
     return await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#pending.delete(id);
         reject(new Error(`TabWard command timed out: ${type}`));
       }, timeoutMs);
-      this.#pending.set(id, { resolve, reject, timeout });
+      this.#pending.set(id, { resolve, reject, timeout, telemetry, sentAt: performance.now() });
       socket.send(JSON.stringify(message), (error) => {
         if (!error) {
           return;
@@ -344,6 +366,27 @@ export class ExtensionBridge extends EventEmitter {
     }
     clearTimeout(pending.timeout);
     this.#pending.delete(result.id);
+    if (pending.telemetry) {
+      const metrics = pending.telemetry;
+      metrics.bridgeRoundTripMs = performance.now() - pending.sentAt;
+      metrics.resultBytes = Buffer.byteLength(JSON.stringify(result.payload) ?? "null");
+      const extension = result.operationId === metrics.operationId
+        ? sanitizeTelemetry({
+          ...(typeof result.telemetry === "object" ? result.telemetry : {}),
+          operationId: result.operationId,
+          operationType: metrics.operationType
+        })
+        : undefined;
+      // Only extension-owned durations; do not trust echoed broker/client fields.
+      if (extension?.extensionExecutionMs !== undefined) {
+        metrics.extensionExecutionMs = extension.extensionExecutionMs;
+      }
+      if (extension?.outboxCommitMs !== undefined) metrics.outboxCommitMs = extension.outboxCommitMs;
+      if (metrics.extensionExecutionMs !== undefined && metrics.outboxCommitMs !== undefined) {
+        metrics.transferResidualMs = Math.max(0,
+          metrics.bridgeRoundTripMs - metrics.extensionExecutionMs - metrics.outboxCommitMs);
+      }
+    }
     if (result.ok) {
       pending.resolve(result.payload);
       return;
@@ -365,7 +408,7 @@ export class ExtensionBridge extends EventEmitter {
     pending.reject(new ExtensionCommandError(
       message,
       typeof payload?.name === "string" ? payload.name : "ExtensionCommandError",
-      result.payload
+      payload && "details" in payload ? payload.details : result.payload
     ));
   }
 }

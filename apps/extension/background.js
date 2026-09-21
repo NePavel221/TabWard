@@ -1,3 +1,5 @@
+importScripts("stage-one.js");
+
 const PROTOCOL_VERSION = 2;
 const WS_URL = "ws://127.0.0.1:18766";
 const PAIRING_TOKEN_KEY = "pairingToken";
@@ -299,22 +301,30 @@ async function handleTransportMessage(socket, raw) {
   }
   let ok = false;
   let payload;
+  const measured = message.telemetry === true
+    && typeof message.operationId === "string"
+    && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(message.operationId);
+  const executionStarted = measured ? performance.now() : 0;
   try {
     payload = await dispatch(message);
     ok = payload?.ok !== false;
   } catch (error) {
     payload = toSafeError(error);
   }
-  const envelope = {
+  let envelope = {
     kind: "result",
     id: message.id,
     protocolVersion: PROTOCOL_VERSION,
     ok,
-    payload
+    payload,
+    ...(measured ? {
+      operationId: message.operationId,
+      telemetry: { extensionExecutionMs: performance.now() - executionStarted }
+    } : {})
   };
   const serialized = JSON.stringify(envelope);
   if (new TextEncoder().encode(serialized).length > MAX_RESULT_BYTES) {
-    const tooLarge = {
+    envelope = {
       kind: "result",
       id: message.id,
       protocolVersion: PROTOCOL_VERSION,
@@ -322,14 +332,16 @@ async function handleTransportMessage(socket, raw) {
       payload: {
         name: "ResultTooLarge",
         message: "Command result exceeded 64 MiB"
-      }
+      },
+      ...(measured ? { operationId: envelope.operationId, telemetry: envelope.telemetry } : {})
     };
-    await outboxPut(tooLarge);
-    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(tooLarge));
-    return;
   }
+  const commitStarted = measured ? performance.now() : 0;
   await outboxPut(envelope);
-  if (socket.readyState === WebSocket.OPEN) socket.send(serialized);
+  // A replay contains execution timing only: the commit duration is known after
+  // the durable write. Do not introduce a second write just to persist metrics.
+  if (measured) envelope.telemetry.outboxCommitMs = performance.now() - commitStarted;
+  if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(envelope));
 }
 
 function approvePairing(code) {
@@ -505,7 +517,34 @@ function toSafeError(error) {
       enabled: candidate?.enabled === true
     }));
   }
+  if (
+    error?.name === "OutcomeUnknown"
+    && error?.details?.kind === "download"
+    && ["post_click_error", "post_click_timeout", "post_download_commit"].includes(error.details.phase)
+  ) {
+    safe.details = {
+      kind: "download",
+      phase: error.details.phase,
+      actionAccepted: error.details.actionAccepted === true,
+      reservationHeld: error.details.reservationHeld === true,
+      retrySafe: false
+    };
+  }
   return safe;
+}
+
+function downloadOutcomeUnknown(phase, message, cause = null) {
+  const error = new Error(message);
+  error.name = "OutcomeUnknown";
+  error.details = {
+    kind: "download",
+    phase,
+    actionAccepted: true,
+    reservationHeld: true,
+    retrySafe: false
+  };
+  if (cause) error.cause = cause;
+  return error;
 }
 
 function looksSensitiveField(record) {
@@ -1130,21 +1169,68 @@ async function setOwnership(ownership) {
   await sessionSet({ [OWNERSHIP_KEY]: ownership });
 }
 
-async function rememberDownload(downloadId) {
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  const ids = Array.from(new Set([...(state[DOWNLOAD_IDS_KEY] || []), downloadId])).slice(-200);
-  await sessionSet({ [DOWNLOAD_IDS_KEY]: ids });
-}
-
-async function getKnownDownloadIds() {
-  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
-  return new Set(state[DOWNLOAD_IDS_KEY] || []);
-}
-
-async function forgetDownload(downloadId) {
+async function reserveDownloadOwnership(sessionId) {
+  const reservationId = crypto.randomUUID();
   const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
   await sessionSet({
-    [DOWNLOAD_IDS_KEY]: (state[DOWNLOAD_IDS_KEY] || []).filter((id) => id !== downloadId)
+    [DOWNLOAD_IDS_KEY]: TabWardStageOne.reserveDownload(
+      state[DOWNLOAD_IDS_KEY],
+      reservationId,
+      sessionId
+    )
+  });
+  return reservationId;
+}
+
+async function fulfillDownloadOwnership(reservationId, downloadId, sessionId) {
+  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
+  await sessionSet({
+    [DOWNLOAD_IDS_KEY]: TabWardStageOne.fulfillDownloadReservation(
+      state[DOWNLOAD_IDS_KEY],
+      reservationId,
+      downloadId,
+      sessionId
+    )
+  });
+}
+
+async function rollbackDownloadOwnership(reservationId, sessionId) {
+  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
+  await sessionSet({
+    [DOWNLOAD_IDS_KEY]: TabWardStageOne.rollbackDownloadReservation(
+      state[DOWNLOAD_IDS_KEY],
+      reservationId,
+      sessionId
+    )
+  });
+}
+
+async function releaseSessionDownloads(sessionId) {
+  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
+  await sessionSet({
+    [DOWNLOAD_IDS_KEY]: TabWardStageOne.releaseSessionDownloads(
+      state[DOWNLOAD_IDS_KEY],
+      sessionId
+    )
+  });
+}
+
+async function getKnownDownloadIds(sessionId) {
+  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
+  return new Set(TabWardStageOne.downloadIdsForSession(
+    state[DOWNLOAD_IDS_KEY],
+    sessionId
+  ));
+}
+
+async function forgetDownload(downloadId, sessionId) {
+  const state = await sessionGet({ [DOWNLOAD_IDS_KEY]: [] });
+  await sessionSet({
+    [DOWNLOAD_IDS_KEY]: TabWardStageOne.forgetDownloadForSession(
+      state[DOWNLOAD_IDS_KEY],
+      downloadId,
+      sessionId
+    )
   });
 }
 
@@ -3012,6 +3098,20 @@ function pageLocatorSnapshot(locator = {}) {
   }
   const summaries = candidates.map((element) => {
     const visible = isVisible(element);
+    const tag = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") || "").toLowerCase();
+    const role = implicitRole(element).toLowerCase();
+    const nativeCheckable = tag === "input" && ["checkbox", "radio"].includes(type);
+    const ariaCheckable = ["checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"].includes(role);
+    const checkable = nativeCheckable || ariaCheckable;
+    const ariaChecked = String(element.getAttribute("aria-checked") || "").toLowerCase();
+    const checkedState = nativeCheckable
+      ? (type === "checkbox" && element.indeterminate
+        ? "mixed"
+        : (element.checked ? "true" : "false"))
+      : (ariaCheckable && ["true", "false", "mixed"].includes(ariaChecked)
+        ? ariaChecked
+        : null);
     let rect = element.getBoundingClientRect();
     let scrolled = false;
     if (locator.actionable === true && visible) {
@@ -3040,16 +3140,18 @@ function pageLocatorSnapshot(locator = {}) {
       ref: cssPath(element),
       documentId: globalThis.__TABWARD_OBSERVE_DOCUMENT_ID__ || "",
       fingerprint,
-      tag: element.tagName.toLowerCase(),
-      type: element.getAttribute("type") || "",
-      role: implicitRole(element),
+      tag,
+      type,
+      role,
       name: accessibleName(element).slice(0, 500),
       text: (element.type === "password" ? "[REDACTED]" : normalize(element.innerText || element.textContent || element.value)).slice(0, 500),
       value: element.type === "password" ? "[REDACTED]" : String(element.value ?? ""),
       visible,
       enabled: isEnabled(element),
       editable: isEditable(element),
-      checked: Boolean(element.checked),
+      checkable,
+      checkedState,
+      checked: checkedState === "true",
       selected: Boolean(element.selected),
       receivesEvents: visible && receivesEvents(element, rect),
       scrolled,
@@ -5069,12 +5171,13 @@ async function commandLocatorAction(payload) {
       await dispatchKey(payload.tabId, payload.value, options);
     } else if (action === "check" || action === "uncheck") {
       const desired = action === "check";
-      if (target.checked !== desired) {
+      const desiredState = desired ? "true" : "false";
+      if (target.checkedState !== desiredState) {
         await dispatchClick(payload.tabId, target, options);
       }
       await sleep(50, activeCommandSignal);
       let checked = await locatorSnapshot(payload.tabId, payload.locator, frameId);
-      if (checked?.target?.checked !== desired && options.domFallback !== false) {
+      if (checked?.target?.checkedState !== desiredState && options.domFallback !== false) {
         const fallback = await executeInTab(payload.tabId, pageLocatorDomAction, [{
           ref: target.ref,
           action
@@ -5086,7 +5189,7 @@ async function commandLocatorAction(payload) {
         fallbackUsed = true;
         checked = await locatorSnapshot(payload.tabId, payload.locator, frameId);
       }
-      if (checked?.target?.checked !== desired) {
+      if (checked?.target?.checkedState !== desiredState) {
         throw new Error(`${action} did not reach the requested checkbox state`);
       }
     } else if (["select", "focus", "blur"].includes(action)) {
@@ -5219,20 +5322,8 @@ async function commandLocatorWait(payload) {
       }
     } else {
       snapshot = await locatorSnapshot(payload.tabId, payload.locator, payload.frameId);
-      const target = snapshot?.target;
       const state = payload.state || "visible";
-      const textMatches = payload.text === undefined
-        || String(target?.text || target?.name || "").includes(String(payload.text));
-      const matched = (
-        (state === "attached" && snapshot.count > 0)
-        || (state === "detached" && snapshot.count === 0)
-        || (state === "visible" && target?.visible)
-        || (state === "hidden" && (!target || !target.visible))
-        || (state === "enabled" && target?.enabled)
-        || (state === "editable" && target?.editable)
-        || (state === "checked" && target?.checked)
-      ) && textMatches;
-      if (matched) {
+      if (TabWardStageOne.locatorWaitMatches(state, snapshot, payload.text)) {
         return { ok: true, state, snapshot };
       }
     }
@@ -5264,7 +5355,8 @@ async function commandLocatorAssert(payload) {
         visible: Boolean(target?.visible),
         enabled: Boolean(target?.enabled),
         editable: Boolean(target?.editable),
-        checked: Boolean(target?.checked)
+        checked: target?.checkedState === "true",
+        checkedState: target?.checkedState ?? null
       };
     }
     const expected = payload.expected;
@@ -5281,7 +5373,9 @@ async function commandLocatorAssert(payload) {
       passed = String(actual.value ?? "") === String(expected ?? "");
     } else if (assertion === "count") {
       passed = actual.count === Number(expected);
-    } else if (["visible", "enabled", "editable", "checked"].includes(assertion)) {
+    } else if (assertion === "checked") {
+      passed = actual.checkedState === ((expected === undefined || Boolean(expected)) ? "true" : "false");
+    } else if (["visible", "enabled", "editable"].includes(assertion)) {
       passed = actual[assertion] === (expected === undefined ? true : Boolean(expected));
     } else if (assertion === "hidden") {
       passed = actual.visible === false;
@@ -5305,6 +5399,7 @@ async function commandLocatorAssert(payload) {
 }
 
 async function commandDownloadClick(payload) {
+  const session = await resolveSessionContext(payload);
   return withWorkingTab(payload.tabId, "Download", async () => {
     const startedAt = Date.now();
     const timeoutMs = Math.max(100, Math.min(Number(payload.timeoutMs || 30000), 600000));
@@ -5316,23 +5411,36 @@ async function commandDownloadClick(payload) {
     if (!target || target.ok !== true) {
       return { ok: false, actionAccepted: false, target };
     }
-    const downloadPromise = waitForDownloadCreated(startedAt, timeoutMs, {
-      beforeIds: new Set(beforeDownloads.map((item) => item.id)),
-      expectedUrl: target.href,
-      sourceUrl: sourceTab.url
-    });
-    const newTabPromise = waitForNewTab(payload.tabId, startedAt, timeoutMs);
+    const reservationId = await reserveDownloadOwnership(session.id);
+    let downloadPromise;
+    let newTabPromise;
+    try {
+      downloadPromise = waitForDownloadCreated(startedAt, timeoutMs, {
+        beforeIds: new Set(beforeDownloads.map((item) => item.id)),
+        expectedUrl: target.href,
+        sourceUrl: sourceTab.url
+      });
+      newTabPromise = waitForNewTab(payload.tabId, startedAt, timeoutMs);
+    } catch (error) {
+      await rollbackDownloadOwnership(reservationId, session.id);
+      throw error;
+    }
     let action;
     try {
       action = await commandClick({ ...payload, waitAfterMs: 0 });
     } catch (error) {
       downloadPromise.cancel?.();
       newTabPromise.cancel?.();
-      throw error;
+      throw downloadOutcomeUnknown(
+        "post_click_error",
+        "Download click outcome is unknown; observe downloads before deciding whether to retry",
+        error
+      );
     }
     if (action.actionAccepted !== true) {
       downloadPromise.cancel?.();
       newTabPromise.cancel?.();
+      await rollbackDownloadOwnership(reservationId, session.id);
       return {
         ok: false,
         kind: "no_effect",
@@ -5345,10 +5453,18 @@ async function commandDownloadClick(payload) {
     const signal = await Promise.race([downloadPromise, newTabPromise]);
     if (signal?.item) {
       newTabPromise.cancel?.();
+      try {
+        await fulfillDownloadOwnership(reservationId, signal.item.id, session.id);
+      } catch (error) {
+        throw downloadOutcomeUnknown(
+          "post_download_commit",
+          "A download started but its ownership reservation could not be committed",
+          error
+        );
+      }
       const remainingMs = Math.max(100, timeoutMs - (Date.now() - startedAt));
       const completed = await waitForDownloadComplete(signal.item.id, remainingMs);
       const download = completed || signal.item;
-      await rememberDownload(download.id);
       return {
         ok: download.state === "complete",
         kind: "download_started",
@@ -5377,6 +5493,7 @@ async function commandDownloadClick(payload) {
     }
     if (signal?.tab) {
       downloadPromise.cancel?.();
+      await rollbackDownloadOwnership(reservationId, session.id);
       return {
         ok: false,
         kind: "new_tab",
@@ -5401,9 +5518,17 @@ async function commandDownloadClick(payload) {
         sourceUrl: sourceTab.url
       });
       if (reconciled?.item) {
+        try {
+          await fulfillDownloadOwnership(reservationId, reconciled.item.id, session.id);
+        } catch (error) {
+          throw downloadOutcomeUnknown(
+            "post_download_commit",
+            "A reconciled download could not be committed to its ownership reservation",
+            error
+          );
+        }
         const completed = await waitForDownloadComplete(reconciled.item.id, 5000);
         const download = completed || reconciled.item;
-        await rememberDownload(download.id);
         return {
           ok: download.state === "complete",
           kind: "download_started",
@@ -5424,6 +5549,7 @@ async function commandDownloadClick(payload) {
       }
       const newTab = await newTabPromise;
       if (newTab?.tab) {
+        await rollbackDownloadOwnership(reservationId, session.id);
         return {
           ok: false,
           kind: "new_tab",
@@ -5434,29 +5560,15 @@ async function commandDownloadClick(payload) {
         };
       }
     }
-    return {
-      ok: false,
-      kind: "timeout",
-      actionAccepted: true,
-      verified: false,
-      click: action,
-      trace: [
-        { step: "found", count: target.candidateCount },
-        { step: "scrolled", value: target.scrolled === true },
-        { step: "clicked", value: true },
-        { step: "timeout", value: true },
-        { step: "next_action", value: payload.nextAction || null }
-      ],
-      diagnostic: "click was accepted but no download or new tab was observed",
-      correlation: {
-        ambiguous: signal?.ambiguous === true,
-        candidates: signal?.candidates
-      }
-    };
+    throw downloadOutcomeUnknown(
+      "post_click_timeout",
+      "Download click was accepted but no download or new tab was confirmed before timeout"
+    );
   });
 }
 
 async function commandDownloadImage(payload) {
+  const session = await resolveSessionContext(payload);
   return withWorkingTab(payload.tabId, "Download image", async () => {
     const candidate = await executeInTab(payload.tabId, pageResolveImageForDownload, [{
       selector: payload.selector || "img,canvas,[style*='background-image']",
@@ -5482,14 +5594,29 @@ async function commandDownloadImage(payload) {
     const extension = extensionForImage(candidate);
     const fallback = `tabward-image-${candidate.index || payload.index || 1}.${extension}`;
     const filename = sanitizeDownloadFilename(payload.filename, fallback);
-    const downloadId = await chrome.downloads.download({
-      url: candidate.url,
-      filename,
-      saveAs: payload.saveAs === true,
-      conflictAction: payload.conflictAction || "uniquify"
-    });
+    const reservationId = await reserveDownloadOwnership(session.id);
+    let downloadId;
+    try {
+      downloadId = await chrome.downloads.download({
+        url: candidate.url,
+        filename,
+        saveAs: payload.saveAs === true,
+        conflictAction: payload.conflictAction || "uniquify"
+      });
+    } catch (error) {
+      await rollbackDownloadOwnership(reservationId, session.id);
+      throw error;
+    }
+    try {
+      await fulfillDownloadOwnership(reservationId, downloadId, session.id);
+    } catch (error) {
+      throw downloadOutcomeUnknown(
+        "post_download_commit",
+        "Image download started but its ownership reservation could not be committed",
+        error
+      );
+    }
     const download = await waitForDownloadComplete(downloadId, payload.timeoutMs || 30000);
-    await rememberDownload(downloadId);
     return {
       ok: download?.state === "complete",
       image: publicImageSummary(candidate),
@@ -5501,10 +5628,10 @@ async function commandDownloadImage(payload) {
 }
 
 async function commandDownloads(payload) {
-  const knownIds = await getKnownDownloadIds();
-  const items = await chrome.downloads.search({
-    orderBy: ["-startTime"]
-  });
+  const session = await resolveSessionContext(payload);
+  const knownIds = await getKnownDownloadIds(session.id);
+  const items = (await Promise.all([...knownIds].map((id) => chrome.downloads.search({ id })))).flat();
+  items.sort((left, right) => String(right.startTime || "").localeCompare(String(left.startTime || "")));
   return {
     downloads: items
       .filter((item) => knownIds.has(item.id))
@@ -5514,7 +5641,8 @@ async function commandDownloads(payload) {
 }
 
 async function commandDeleteDownload(payload) {
-  const knownIds = await getKnownDownloadIds();
+  const session = await resolveSessionContext(payload);
+  const knownIds = await getKnownDownloadIds(session.id);
   if (!knownIds.has(payload.downloadId)) {
     const error = new Error(`Download ${payload.downloadId} is not owned by the active TabWard session`);
     error.name = "OwnershipError";
@@ -5524,7 +5652,7 @@ async function commandDeleteDownload(payload) {
   if (payload.erase !== false) {
     await chrome.downloads.erase({ id: payload.downloadId });
   }
-  await forgetDownload(payload.downloadId);
+  await forgetDownload(payload.downloadId, session.id);
   return { ok: true, deleted: payload.downloadId, erased: payload.erase !== false };
 }
 
@@ -6776,6 +6904,7 @@ async function commandReleaseWorkspace(payload) {
   }
   await forgetSessionWindow(session.id);
   await forgetSessionPolicy(session.id);
+  await releaseSessionDownloads(session.id);
   if (cleanWindowClosed || foreignCleanTabs.length > 0) {
     await forgetCleanQaState(session.id);
   } else {
