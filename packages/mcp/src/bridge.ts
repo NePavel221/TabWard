@@ -16,6 +16,11 @@ import {
 } from "./operation.js";
 import { createPairingToken, readPairingToken } from "./state.js";
 import { sanitizeTelemetry, type OperationTelemetry } from "./telemetry.js";
+import {
+  classifyCommand,
+  FairScheduler,
+  schedulerOptionsFromEnv
+} from "./scheduler.js";
 
 const PROTOCOL_VERSION = 2;
 const DEFAULT_WS_PORT = 18766;
@@ -135,9 +140,7 @@ export class ExtensionBridge extends EventEmitter {
     Number(process.env.TABWARD_CONFIRMED_CACHE_BYTES || 32 * 1024 * 1024)
   );
   readonly #maxConfirmedResults = 128;
-  #commandTail: Promise<void> = Promise.resolve();
-  #queued = 0;
-  #active = 0;
+  readonly #scheduler = new FairScheduler(schedulerOptionsFromEnv());
 
   constructor(port = Number(process.env.TABWARD_PORT || DEFAULT_WS_PORT)) {
     super();
@@ -193,8 +196,13 @@ export class ExtensionBridge extends EventEmitter {
     };
   }
 
-  queueStatus(): { active: number; queued: number } {
-    return { active: this.#active, queued: this.#queued };
+  queueStatus(): {
+    active: number;
+    queued: number;
+    configuredMax: number;
+    maxObservedActive: number;
+  } {
+    return this.#scheduler.metrics();
   }
 
   confirmedResult(
@@ -225,32 +233,25 @@ export class ExtensionBridge extends EventEmitter {
       || [...this.#pending.values()].some((entry) => entry.operationId === operation.operationId)) {
       throw new Error(`Operation ${operation.operationId} is already queued`);
     }
-    const queuedAt = performance.now();
     const queued = { cancelled: false, active: false };
     this.#queuedOperations.set(operation.operationId, queued);
-    this.#queued += 1;
-    const previous = this.#commandTail;
-    let release!: () => void;
-    this.#commandTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous.catch(() => {});
-    this.#queued -= 1;
-    this.#active += 1;
-    queued.active = true;
-    if (telemetry) telemetry.bridgeQueueWaitMs = performance.now() - queuedAt;
     try {
-      if (queued.cancelled) {
-        throw cancelledBeforeEffect("cancelled while waiting in the broker queue");
-      }
-      if (remainingMs(operation.deadlineAt) === 0) {
-        throw notStarted("deadline expired while waiting in the broker queue");
-      }
-      return await this.#sendNow(type, payload, operation, telemetry);
+      return await this.#scheduler.schedule(
+        operation,
+        classifyCommand(type, payload),
+        async () => {
+          queued.active = true;
+          if (queued.cancelled) {
+            throw cancelledBeforeEffect("cancelled before WebSocket dispatch");
+          }
+          return await this.#sendNow(type, payload, operation, telemetry);
+        },
+        (waitMs) => {
+          if (telemetry) telemetry.bridgeQueueWaitMs = waitMs;
+        }
+      );
     } finally {
       this.#queuedOperations.delete(operation.operationId);
-      this.#active -= 1;
-      release();
     }
   }
 
@@ -317,11 +318,12 @@ export class ExtensionBridge extends EventEmitter {
     const queued = this.#queuedOperations.get(operationId);
     if (queued && !queued.active) {
       queued.cancelled = true;
+      const state = this.#scheduler.cancel(operationId);
       return {
         kind: "cancel_ack",
         protocolVersion: PROTOCOL_VERSION,
         operationId,
-        state: "queued"
+        state
       };
     }
     const pending = this.#pending.get(operationId);
@@ -359,6 +361,7 @@ export class ExtensionBridge extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.#scheduler.stop();
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timeout);
       pending.reject(pending.dispatched

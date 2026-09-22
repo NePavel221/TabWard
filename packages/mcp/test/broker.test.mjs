@@ -334,6 +334,7 @@ test("telemetry correlates broker, bridge, and extension without sensitive paylo
     assert.equal(value.telemetry.operationType, "fill");
     for (const key of [
       "brokerActiveRequests", "brokerQueueDepth", "bridgeQueueWaitMs",
+      "schedulerActiveCount", "schedulerConfiguredMax", "schedulerMaxObservedActive",
       "bridgeRoundTripMs", "extensionExecutionMs", "outboxCommitMs",
       "transferResidualMs", "brokerTotalMs", "resultBytes", "brokerRssBytes"
     ]) {
@@ -465,6 +466,71 @@ for (const clients of [2, 4]) {
     }
   });
 }
+
+test("different sessions overlap at scheduler max 2 while each session stays FIFO", { timeout: 20_000 }, async () => {
+  const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-broker-stage3-overlap-"));
+  let fixture;
+  try {
+    fixture = await startPairedBroker(stateDir, {
+      TABWARD_TELEMETRY: "1",
+      TABWARD_SCHEDULER_MAX_CONCURRENCY: "2"
+    });
+    const started = [];
+    const completed = [];
+    let active = 0;
+    let maxActive = 0;
+    fixture.socket.on("message", async (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.kind !== "command") return;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      started.push(`${message.payload.sessionId}-${message.payload.sequence}`);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 35));
+      completed.push(`${message.payload.sessionId}-${message.payload.sequence}`);
+      active -= 1;
+      fixture.socket.send(JSON.stringify({
+        kind: "result",
+        id: message.id,
+        protocolVersion: 2,
+        ok: true,
+        operationId: message.operationId,
+        fingerprint: message.fingerprint,
+        telemetry: { extensionExecutionMs: 35, outboxCommitMs: 0 },
+        payload: message.payload
+      }));
+    });
+    const inputs = [
+      ["a", 1],
+      ["a", 2],
+      ["b", 1],
+      ["c", 1]
+    ];
+    const responses = await Promise.all(inputs.map(([sessionId, sequence], index) =>
+      fetch(`${fixture.base}/command`, {
+        method: "POST",
+        headers: fixture.headers,
+        body: JSON.stringify({
+          requestId: `${String(index + 40).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+          command: "ping",
+          payload: { sessionId, sequence },
+          operationId: `${String(index + 40).padStart(8, "0")}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`,
+          telemetry: true
+        })
+      }).then(async (response) => {
+        assert.equal(response.status, 200);
+        return await response.json();
+      })
+    ));
+    assert.equal(maxActive, 2);
+    assert.equal(started.indexOf("a-1") < started.indexOf("a-2"), true);
+    assert.equal(completed.indexOf("a-1") < started.indexOf("a-2"), true);
+    assert.equal(responses.every((value) =>
+      value.telemetry.schedulerConfiguredMax === 2), true);
+  } finally {
+    await fixture?.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
 
 test("queued expiry is not dispatched to the extension", { timeout: 20_000 }, async () => {
   const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-broker-expiry-"));
@@ -767,6 +833,66 @@ test("disconnect after effect is unknown and never blindly redispatched", { time
   }
 });
 
+test("concurrent disconnect makes both effects unknown without duplicate dispatch", { timeout: 20_000 }, async () => {
+  const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-broker-concurrent-loss-"));
+  let fixture;
+  try {
+    fixture = await startPairedBroker(stateDir, {
+      TABWARD_SCHEDULER_MAX_CONCURRENCY: "2"
+    });
+    let dispatches = 0;
+    fixture.socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.kind !== "command") return;
+      dispatches += 1;
+      if (dispatches === 2) fixture.socket.terminate();
+    });
+    const deadlineAt = Date.now() + 5_000;
+    const requests = [
+      {
+        requestId: "40500000-0000-4000-8000-000000000011",
+        operationId: "40500000-0000-4000-8000-000000000001",
+        command: "click",
+        payload: { sessionId: "session-a", tabId: 1 },
+        deadlineAt
+      },
+      {
+        requestId: "40500000-0000-4000-8000-000000000012",
+        operationId: "40500000-0000-4000-8000-000000000002",
+        command: "click",
+        payload: { sessionId: "session-b", tabId: 2 },
+        deadlineAt
+      }
+    ];
+    const first = await Promise.all(requests.map((body) =>
+      fetch(`${fixture.base}/command`, {
+        method: "POST",
+        headers: fixture.headers,
+        body: JSON.stringify(body)
+      })
+    ));
+    assert.deepEqual(first.map((response) => response.status), [502, 502]);
+    for (const response of first) {
+      assert.equal((await response.json()).details.outcome, "effect_unknown");
+    }
+    const replay = await Promise.all(requests.map((body, index) =>
+      fetch(`${fixture.base}/command`, {
+        method: "POST",
+        headers: fixture.headers,
+        body: JSON.stringify({
+          ...body,
+          requestId: `40500000-0000-4000-8000-00000000002${index + 1}`
+        })
+      })
+    ));
+    assert.deepEqual(replay.map((response) => response.status), [502, 502]);
+    assert.equal(dispatches, 2);
+  } finally {
+    await fixture?.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("a late confirmed result replaces a settled effect-unknown ledger entry", { timeout: 20_000 }, async () => {
   const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-broker-late-confirm-"));
   let fixture;
@@ -905,6 +1031,57 @@ test("acknowledged pending results release confirmation-cache capacity", { timeo
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
     }
     assert.deepEqual(acknowledgements, ["result_ack", "result_ack"]);
+  } finally {
+    await fixture?.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent completions are acknowledged without lost cache updates", { timeout: 30_000 }, async () => {
+  const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-broker-result-concurrent-"));
+  let fixture;
+  try {
+    fixture = await startPairedBroker(stateDir, {
+      TABWARD_CONFIRMED_CACHE_BYTES: String(8 * 1024 * 1024),
+      TABWARD_SCHEDULER_MAX_CONCURRENCY: "4"
+    });
+    const acknowledgements = new Set();
+    fixture.socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.kind === "command") {
+        fixture.socket.send(JSON.stringify({
+          kind: "result",
+          id: message.id,
+          operationId: message.operationId,
+          fingerprint: message.fingerprint,
+          protocolVersion: 2,
+          ok: true,
+          payload: { index: message.payload.index, value: "x".repeat(512 * 1024) }
+        }));
+      } else if (message.kind === "result_ack") {
+        acknowledgements.add(message.id);
+      }
+    });
+    const responses = await Promise.all(Array.from({ length: 4 }, (_, index) =>
+      fetch(`${fixture.base}/command`, {
+        method: "POST",
+        headers: fixture.headers,
+        body: JSON.stringify({
+          requestId: `4260000${index}-0000-4000-8000-000000000011`,
+          operationId: `4260000${index}-0000-4000-8000-000000000001`,
+          command: "ping",
+          payload: { sessionId: `session-${index}`, index },
+          deadlineAt: Date.now() + 5_000
+        })
+      })
+    ));
+    assert.deepEqual(responses.map((response) => response.status), [200, 200, 200, 200]);
+    await Promise.all(responses.map((response) => response.arrayBuffer()));
+    const deadline = Date.now() + 2_000;
+    while (acknowledgements.size < 4 && Date.now() < deadline) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    }
+    assert.equal(acknowledgements.size, 4);
   } finally {
     await fixture?.close();
     await rm(stateDir, { recursive: true, force: true });

@@ -67,6 +67,22 @@ Do not configure the npm `.cmd` wrapper as the subprocess on Windows; some MCP
 clients cannot terminate its child Node process cleanly. Multiple TabWard MCP
 processes are supported: they discover and reuse one on-demand local broker.
 
+## Scheduler configuration
+
+Stage Three defaults to two concurrent commands across independent sessions.
+The broker validates the following environment variables at startup:
+
+```powershell
+$env:TABWARD_SCHEDULER_MAX_CONCURRENCY = '1' # compatibility, or 2/4
+$env:TABWARD_SCHEDULER_MAX_QUEUE_PER_SESSION = '64'
+$env:TABWARD_SCHEDULER_MAX_QUEUE_TOTAL = '256'
+```
+
+`TABWARD_SCHEDULER_MAX_CONCURRENCY` accepts only integers from `1` through `4`;
+invalid values use the conservative default `2`. Queue values also have bounded
+validation and never expose session names, URLs, or browser content. Restart
+the local broker after changing startup configuration.
+
 ## Update
 
 ```powershell

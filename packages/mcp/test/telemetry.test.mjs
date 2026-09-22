@@ -17,6 +17,9 @@ test("telemetry is opt-in and uses a closed non-sensitive schema", () => {
     const clean = sanitizeTelemetry({
       ...newTelemetry("fill", operationId),
       bridgeQueueWaitMs: 12.5,
+      schedulerActiveCount: 2,
+      schedulerConfiguredMax: 2,
+      schedulerMaxObservedActive: 2,
       resultBytes: 42,
       url: "https://secret.example/private",
       selector: "#password",
@@ -29,6 +32,9 @@ test("telemetry is opt-in and uses a closed non-sensitive schema", () => {
       operationId,
       operationType: "fill",
       bridgeQueueWaitMs: 12.5,
+      schedulerActiveCount: 2,
+      schedulerConfiguredMax: 2,
+      schedulerMaxObservedActive: 2,
       resultBytes: 42
     });
     assert.doesNotMatch(JSON.stringify(clean), /secret|password|hunter2|private|cookie/i);

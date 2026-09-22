@@ -28,6 +28,29 @@
 - Operation IDs and fingerprints deduplicate reconnects. A conflicting
   fingerprint is rejected, and an unknown post-dispatch outcome is never
   treated as proof of cancellation or completion.
+- The broker scheduler is bounded to `1..4` active commands, defaults to `2`,
+  preserves FIFO per session, and applies count backpressure before extension
+  dispatch. Global-exclusive work retains its origin session, and queued plus
+  active work share the same per-session bound. Compatibility maximum `1`
+  preserves Stage Two ordering.
+- Same-tab reads and mutations serialize. Clean QA, cleanup, profile storage,
+  unknown command scope, expert CDP without a proven safe classification, and
+  ambiguous child/download correlation are globally exclusive.
+- Legacy `executeCdp` and unknown aliases default to global-exclusive rather
+  than receiving an optimistic tab/session classification.
+- Global round-robin validates the exact selected item's barrier. It cannot
+  use an older item's eligibility to skip earlier session work or a prior
+  global from the same origin, and it scans other origins when one is blocked.
+- CDP resource claims are operation-exact. Duplicate starts from another
+  operation, including the same session, fail busy and cannot release the
+  original claim. Trace stop retains a fail-closed `stopping` claim until
+  Chrome confirms completion.
+- Cleanup detaches only CDP resources attributable to the closing session and
+  preserves event, trace, interception, screencast, or emulation ownership
+  belonging to another session.
+- A closing session rejects new work, waits for work already accepted by that
+  MCP process, and then cleans up. Cleanup still closes only proven
+  session-created tabs; adopted and user tabs are preserved.
 - The outbox and broker ledger reserve count and byte capacity before browser
   dispatch. Event, trace, screencast, and aggregate evidence expose partial or
   truncated status instead of silently dropping data.
@@ -38,7 +61,8 @@
   explicitly. Ownership changes after browser I/O use fresh serialized
   key-level mutations so concurrent tab additions are not overwritten.
 - Session cleanup preserves ownership after a failed tab close and reports
-  `cleanup_partial`; a closing session cannot accept new browser commands.
+  `cleanup_partial`; a closing session cannot accept new browser commands, and
+  accepted ownership mutations cannot shorten its cleanup TTL pin.
 - Restart reconciliation never adopts an unproven debugger attachment and
   never auto-closes user, adopted, handoff, deliverable, or other tabs.
 - Frame-targeted handles include frame/document identity. Nested-frame native

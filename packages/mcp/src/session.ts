@@ -125,7 +125,7 @@ export class SessionPolicy {
     if (!allowClosing && session.state !== "active") {
       throw new Error(`TabWard session is ${session.state}; new commands are rejected`);
     }
-    if (touch) {
+    if (touch && session.state === "active") {
       session.expiresAt = now + session.ttlSeconds;
     }
     return session;
@@ -156,7 +156,7 @@ export class SessionPolicy {
     tabId: number,
     options: { created?: boolean; adopted?: boolean } = {}
   ): Session {
-    const session = this.get(sessionId);
+    const session = this.get(sessionId, true, true);
     const owner = this.owner(tabId, sessionId);
     if (owner) {
       throw new Error(`Tab ${tabId} is already owned by session ${owner.name}`);
@@ -172,7 +172,7 @@ export class SessionPolicy {
   }
 
   releaseTab(sessionId: string, tabId: number): Session {
-    const session = this.get(sessionId);
+    const session = this.get(sessionId, true, true);
     session.tabIds.delete(tabId);
     session.createdTabIds.delete(tabId);
     session.adoptedTabIds.delete(tabId);

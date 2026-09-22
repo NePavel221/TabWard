@@ -7,7 +7,7 @@ import test from "node:test";
 
 async function benchmarkTempDirs() {
   return new Set((await readdir(tmpdir()))
-    .filter((name) => name.startsWith("tabward-stage1-benchmark-")));
+    .filter((name) => name.startsWith("tabward-stage3-benchmark-")));
 }
 
 test("benchmark cleans its child and temp directory when fixture startup fails", { timeout: 15_000 }, async () => {

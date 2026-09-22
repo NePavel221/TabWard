@@ -1,4 +1,4 @@
-importScripts("stage-one.js", "stage-two.js");
+importScripts("stage-one.js", "stage-two.js", "stage-three.js");
 
 const PROTOCOL_VERSION = 2;
 const WS_URL = "ws://127.0.0.1:18766";
@@ -64,6 +64,7 @@ let connectedAt = null;
 let outboxFlushPromise = null;
 let outboxMutationTail = Promise.resolve();
 const activeOperations = new Map();
+const extensionResourceGate = TabWardStageThree.createResourceGate();
 
 function openOutbox() {
   return new Promise((resolve, reject) => {
@@ -553,7 +554,21 @@ async function handleTransportMessage(socket, raw) {
       };
       throw error;
     }
-    payload = await dispatch(message, context);
+    const scope = TabWardStageThree.classifyCommand(message);
+    payload = await extensionResourceGate.run(scope, async () => {
+      throwIfCommandAborted(context);
+      if (Date.now() >= context.deadlineAt) {
+        const error = new Error("Operation deadline expired before extension resource dispatch");
+        error.name = "NotStarted";
+        error.details = {
+          outcome: "not_started",
+          effectPossible: false,
+          retrySafe: true
+        };
+        throw error;
+      }
+      return await dispatch(message, context);
+    });
     ok = payload?.ok !== false;
   } catch (error) {
     if (TabWardStageTwo.abortIsEffectUnknown(controller.signal.aborted, error?.name)) {
@@ -568,10 +583,9 @@ async function handleTransportMessage(socket, raw) {
       });
     }
     payload = toSafeError(error);
-  } finally {
-    activeOperations.delete(operation.operationId);
   }
-  let envelope = {
+  try {
+    let envelope = {
     kind: "result",
     id: operation.operationId,
     protocolVersion: PROTOCOL_VERSION,
@@ -583,9 +597,9 @@ async function handleTransportMessage(socket, raw) {
       telemetry: { extensionExecutionMs: performance.now() - executionStarted }
     } : {})
   };
-  const serialized = JSON.stringify(envelope);
-  if (new TextEncoder().encode(serialized).length > MAX_RESULT_BYTES) {
-    envelope = {
+    const serialized = JSON.stringify(envelope);
+    if (new TextEncoder().encode(serialized).length > MAX_RESULT_BYTES) {
+      envelope = {
       kind: "result",
       id: operation.operationId,
       protocolVersion: PROTOCOL_VERSION,
@@ -604,12 +618,12 @@ async function handleTransportMessage(socket, raw) {
       fingerprint: operation.fingerprint,
       ...(measured ? { telemetry: envelope.telemetry } : {})
     };
-  }
-  const commitStarted = measured ? performance.now() : 0;
-  try {
-    await outboxPut(envelope);
-  } catch (error) {
-    envelope = {
+    }
+    const commitStarted = measured ? performance.now() : 0;
+    try {
+      await outboxPut(envelope);
+    } catch (error) {
+      envelope = {
       kind: "result",
       id: operation.operationId,
       protocolVersion: PROTOCOL_VERSION,
@@ -628,21 +642,24 @@ async function handleTransportMessage(socket, raw) {
         }
       },
       ...(measured ? { telemetry: envelope.telemetry } : {})
-    };
-    await outboxPut(envelope);
-  }
-  // A replay contains execution timing only: the commit duration is known after
-  // the durable write. Do not introduce a second write just to persist metrics.
-  if (measured) envelope.telemetry.outboxCommitMs = performance.now() - commitStarted;
-  const resultSocket = TabWardStageTwo.resultTransportSocket(
-    transportSocket,
-    transportState,
-    WebSocket.OPEN
-  );
-  if (resultSocket) {
-    resultSocket.send(JSON.stringify(envelope));
-  } else {
-    await flushOutbox();
+      };
+      await outboxPut(envelope);
+    }
+    // A replay contains execution timing only: the commit duration is known after
+    // the durable write. Do not introduce a second write just to persist metrics.
+    if (measured) envelope.telemetry.outboxCommitMs = performance.now() - commitStarted;
+    const resultSocket = TabWardStageTwo.resultTransportSocket(
+      transportSocket,
+      transportState,
+      WebSocket.OPEN
+    );
+    if (resultSocket) {
+      resultSocket.send(JSON.stringify(envelope));
+    } else {
+      await flushOutbox();
+    }
+  } finally {
+    activeOperations.delete(operation.operationId);
   }
 }
 
@@ -990,10 +1007,91 @@ function cdpBroker(tabId) {
       screencastBytes: 0,
       screencastTruncated: false,
       screencastDropped: 0,
-      interception: false
+      interception: false,
+      resourceOwners: new Map()
     });
   }
   return cdpEventBrokers.get(tabId);
+}
+
+function cdpResourceOwner(payload) {
+  const context = commandContext(payload);
+  return {
+    operationId: String(context?.operationId || ""),
+    sessionId: String(context?.session?.id || "")
+  };
+}
+
+function claimCdpResource(payload, resource) {
+  const broker = cdpBroker(payload.tabId);
+  const owner = cdpResourceOwner(payload);
+  return TabWardStageThree.claimResource(
+    broker.resourceOwners,
+    resource,
+    owner
+  );
+}
+
+function releaseCdpResource(payload, resource) {
+  const broker = cdpBroker(payload.tabId);
+  const owner = cdpResourceOwner(payload);
+  return TabWardStageThree.releaseResource(
+    broker.resourceOwners,
+    resource,
+    owner
+  );
+}
+
+function transitionCdpResource(payload, resource, state) {
+  const broker = cdpBroker(payload.tabId);
+  return TabWardStageThree.transitionResource(
+    broker.resourceOwners,
+    resource,
+    cdpResourceOwner(payload),
+    state
+  );
+}
+
+function assertExpertCdpResourceSafe(payload) {
+  const method = String(payload.method || "");
+  const resources = [];
+  if (/^(?:Network|Runtime|Log)\./.test(method)
+    || /^Page\.(?:enable|disable|handleJavaScriptDialog)/.test(method)) {
+    resources.push("events");
+  }
+  if (/^Fetch\./.test(method)) resources.push("interception");
+  if (/^(?:Emulation\.)/.test(method) || method === "Network.emulateNetworkConditions") {
+    resources.push("emulation");
+  }
+  if (/^Tracing\./.test(method)) resources.push("tracing");
+  if (/^Page\.(?:startScreencast|stopScreencast)/.test(method)) {
+    resources.push("screencast");
+  }
+  const owner = cdpResourceOwner(payload);
+  const broker = cdpEventBrokers.get(payload.tabId);
+  for (const resource of resources) {
+    const existing = broker?.resourceOwners?.get(resource);
+    if (existing && existing.operationId !== owner.operationId) {
+      const error = new Error(
+        `Expert CDP method ${method} would mutate owned ${resource} state`
+      );
+      error.name = "CdpResourceInUse";
+      throw error;
+    }
+  }
+}
+
+async function cdpDetachIfIdle(tabId) {
+  const broker = cdpEventBrokers.get(tabId);
+  if (broker?.resourceOwners?.size > 0) {
+    return {
+      ok: true,
+      detached: false,
+      preservedResourceOwners: broker.resourceOwners.size
+    };
+  }
+  await cdpDetach(tabId);
+  return { ok: true, detached: true };
 }
 
 function cdpEventCategory(method) {
@@ -1041,6 +1139,10 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     }
   } else if (method === "Tracing.tracingComplete") {
     broker.traceComplete = true;
+    TabWardStageThree.completeStoppingResource(
+      broker.resourceOwners,
+      "tracing"
+    );
   } else if (method === "Page.screencastFrame") {
     const bounded = TabWardStageTwo.boundedAppend(broker.screencastFrames, {
       data: params.data,
@@ -1110,9 +1212,27 @@ async function cdpAttach(tabId) {
   });
 }
 
-async function cdpDetach(tabId) {
+async function cdpDetach(tabId, options = {}) {
+  const broker = cdpEventBrokers.get(tabId);
+  const owners = Array.from(broker?.resourceOwners?.values() || []);
+  if (owners.length > 0) {
+    const forceSessionId = String(options.forceSessionId || "");
+    const foreign = owners.filter((owner) => owner.sessionId !== forceSessionId);
+    if (!forceSessionId || foreign.length > 0) {
+      if (options.preserveForeign === true && forceSessionId && foreign.length > 0) {
+        return {
+          detached: false,
+          reason: "foreign_resource_owner",
+          preservedResourceOwners: foreign.length
+        };
+      }
+      const error = new Error("CDP resources are still owned by another operation");
+      error.name = "CdpResourceInUse";
+      throw error;
+    }
+  }
   if (!cdpTabs.has(tabId)) {
-    return;
+    return { detached: false, reason: "not_attached" };
   }
   try {
     await withTimeout(
@@ -1122,11 +1242,13 @@ async function cdpDetach(tabId) {
     );
   } finally {
     cdpTabs.delete(tabId);
+    cdpEventBrokers.delete(tabId);
     await stateStore.mutate({ [CDP_OWNERSHIP_KEY]: {} }, (state) => {
       delete state[CDP_OWNERSHIP_KEY][tabId];
       return state;
     });
   }
+  return { detached: true };
 }
 
 async function cdpSend(tabId, method, params = {}, timeoutMs = 30000) {
@@ -1141,7 +1263,7 @@ async function cdpSend(tabId, method, params = {}, timeoutMs = 30000) {
     );
   } catch (error) {
     if (String(error?.message || "").includes("timed out")) {
-      await bestEffort(cdpDetach(tabId), 2000, `detach after ${method} timeout`);
+      await bestEffort(cdpDetachIfIdle(tabId), 2000, `detach after ${method} timeout`);
     }
     throw error;
   }
@@ -1151,17 +1273,45 @@ function cdpTimestamp() {
   return Date.now() / 1000;
 }
 
-async function cdpDetachAll() {
-  const tabIds = Array.from(cdpTabs);
-  cdpTabs.clear();
-  for (const tabId of tabIds) {
-    try {
-      await chrome.debugger.detach({ tabId });
-    } catch (_error) {
+async function cdpDetachSession(sessionId) {
+  const state = await stateStore.read({
+    [CDP_OWNERSHIP_KEY]: {},
+    [OWNERSHIP_KEY]: {}
+  });
+  const detached = [];
+  const preserved = [];
+  for (const tabId of Array.from(cdpTabs)) {
+    const broker = cdpEventBrokers.get(tabId);
+    const owners = Array.from(broker?.resourceOwners?.values() || []);
+    const decision = TabWardStageThree.sessionDetachDecision({
+      attachmentSessionId: state[CDP_OWNERSHIP_KEY][tabId]?.sessionId,
+      tabSessionId: state[OWNERSHIP_KEY][tabId]?.sessionId,
+      owners
+    }, sessionId);
+    if (!decision.belongs) continue;
+    if (!decision.detach) {
+      preserved.push({
+        tabId,
+        reason: "foreign_resource_owner",
+        preservedResourceOwners: decision.foreignOwners
+      });
+      continue;
     }
+    const result = await cdpDetach(tabId, {
+      forceSessionId: sessionId,
+      preserveForeign: true
+    });
+    if (result.detached) {
+      await setEmulationState(tabId, null);
+      detached.push(tabId);
+    }
+    else preserved.push({
+      tabId,
+      reason: result.reason,
+      preservedResourceOwners: result.preservedResourceOwners || 0
+    });
   }
-  cdpEventBrokers.clear();
-  await sessionSet({ [CDP_OWNERSHIP_KEY]: {} });
+  return { detached, preserved };
 }
 
 async function enableCdpEvents(tabId, categories) {
@@ -1737,10 +1887,31 @@ async function assertTabOwnership(tabId, options = {}) {
   return record;
 }
 
-async function forgetTab(tabId) {
-  await bestEffort(cdpDetach(tabId), 2000, "cdp detach on forget");
+async function detachOwnedTabResources(tabId, sessionId, label) {
+  const result = await bestEffort(
+    cdpDetach(tabId, {
+      forceSessionId: sessionId,
+      preserveForeign: true
+    }),
+    2000,
+    label
+  );
+  if (result?.ok === false || result?.detached === false
+    && result?.reason === "foreign_resource_owner") {
+    return result;
+  }
   cdpEventBrokers.delete(tabId);
   await setEmulationState(tabId, null);
+  return result;
+}
+
+async function forgetTab(tabId) {
+  const ownership = await getOwnership();
+  await detachOwnedTabResources(
+    tabId,
+    ownership[tabId]?.sessionId || "",
+    "cdp detach on forget"
+  );
   await stateStore.mutate({
     [OWNERSHIP_KEY]: {},
     [WORK_TABS_KEY]: {}
@@ -1752,9 +1923,12 @@ async function forgetTab(tabId) {
 }
 
 async function releaseOwnership(tabId, keepWorkState = false) {
-  await bestEffort(cdpDetach(tabId), 2000, "cdp detach on release");
-  cdpEventBrokers.delete(tabId);
-  await setEmulationState(tabId, null);
+  const ownershipBefore = await getOwnership();
+  await detachOwnedTabResources(
+    tabId,
+    ownershipBefore[tabId]?.sessionId || "",
+    "cdp detach on release"
+  );
   await stateStore.mutate({
     [OWNERSHIP_KEY]: {},
     [WORK_TABS_KEY]: {}
@@ -2130,7 +2304,11 @@ async function finishTabWork(tabId, context) {
     await chrome.action.setBadgeText({ tabId, text: "" });
   } catch (_error) {
   }
-  await bestEffort(cdpDetach(tabId), 2000, "cdp detach on finish");
+  await detachOwnedTabResources(
+    tabId,
+    ownership.sessionId,
+    "cdp detach on finish"
+  );
   return sendContentState(tabId, "TABWARD_PAGE_CLEANUP", {});
 }
 
@@ -2156,7 +2334,11 @@ async function handoffTab(tabId, context, label = "TabWard") {
   } catch (_error) {
   }
   await sendContentState(tabId, "TABWARD_PAGE_MARK_HANDOFF", { label });
-  await bestEffort(cdpDetach(tabId), 2000, "cdp detach on handoff");
+  await detachOwnedTabResources(
+    tabId,
+    ownership.sessionId,
+    "cdp detach on handoff"
+  );
   return { ok: true, tabId, status: "handoff" };
 }
 
@@ -2182,7 +2364,11 @@ async function deliverableTab(tabId, context, summary = "") {
   } catch (_error) {
   }
   await sendContentState(tabId, "TABWARD_PAGE_MARK_DELIVERABLE", { summary });
-  await bestEffort(cdpDetach(tabId), 2000, "cdp detach on deliverable");
+  await detachOwnedTabResources(
+    tabId,
+    ownership.sessionId,
+    "cdp detach on deliverable"
+  );
   return { ok: true, tabId, status: "deliverable", summary };
 }
 
@@ -6453,8 +6639,12 @@ async function commandCleanup(payload) {
     }
   }
   await bestEffort(updateWorkspaceVisual(), 2500, "update workspace during cleanup");
-  await bestEffort(cdpDetachAll(), 3000, "cdp detach all during cleanup");
-  return { cleaned, closed };
+  const cdp = await bestEffort(
+    cdpDetachSession(session.id),
+    3000,
+    "session CDP detach during cleanup"
+  );
+  return { cleaned, closed, cdp };
 }
 
 async function commandReloadExtension(payload) {
@@ -6523,12 +6713,20 @@ async function commandExecuteCdp(payload) {
 }
 
 async function commandCdp(payload) {
+  assertExpertCdpResourceSafe(payload);
   return commandExecuteCdp(scopedPayload(payload, { ...payload, privileged: true }));
 }
 
 async function commandEventsStart(payload) {
   const categories = Array.from(new Set(payload.categories || ["console", "network", "dialog", "navigation"]));
-  const broker = await enableCdpEvents(payload.tabId, categories);
+  const claim = claimCdpResource(payload, "events");
+  let broker;
+  try {
+    broker = await enableCdpEvents(payload.tabId, categories);
+  } catch (error) {
+    if (claim.created) releaseCdpResource(payload, "events");
+    throw error;
+  }
   return {
     ok: true,
     tabId: payload.tabId,
@@ -6571,9 +6769,14 @@ async function commandEventsClear(payload) {
 }
 
 async function commandEventsStop(payload) {
+  const transition = transitionCdpResource(payload, "events", "stopping");
+  if (!transition.owner) {
+    return { ok: true, tabId: payload.tabId, alreadyStopped: true };
+  }
   const broker = cdpBroker(payload.tabId);
   broker.categories.clear();
   broker.started = false;
+  releaseCdpResource(payload, "events");
   return { ok: true, tabId: payload.tabId };
 }
 
@@ -6659,11 +6862,18 @@ async function commandNetworkHar(payload) {
 }
 
 async function commandInterceptionStart(payload) {
-  const broker = await enableCdpEvents(payload.tabId, ["network"]);
-  await cdpSend(payload.tabId, "Fetch.enable", {
-    patterns: payload.patterns?.length ? payload.patterns : [{ urlPattern: "*" }],
-    handleAuthRequests: payload.handleAuthRequests === true
-  });
+  const claim = claimCdpResource(payload, "interception");
+  let broker;
+  try {
+    broker = await enableCdpEvents(payload.tabId, ["network"]);
+    await cdpSend(payload.tabId, "Fetch.enable", {
+      patterns: payload.patterns?.length ? payload.patterns : [{ urlPattern: "*" }],
+      handleAuthRequests: payload.handleAuthRequests === true
+    });
+  } catch (error) {
+    if (claim.created) releaseCdpResource(payload, "interception");
+    throw error;
+  }
   broker.interception = true;
   return { ok: true, patterns: payload.patterns || [{ urlPattern: "*" }] };
 }
@@ -6708,9 +6918,12 @@ async function commandInterceptionFulfill(payload) {
 }
 
 async function commandInterceptionStop(payload) {
+  const transition = transitionCdpResource(payload, "interception", "stopping");
+  if (!transition.owner) return { ok: true, alreadyStopped: true };
   await cdpSend(payload.tabId, "Fetch.disable", {});
   const broker = cdpBroker(payload.tabId);
   broker.interception = false;
+  releaseCdpResource(payload, "interception");
   return { ok: true };
 }
 
@@ -6733,6 +6946,7 @@ async function commandEmulation(payload) {
     settings.viewport = presets[settings.preset];
   }
   if (settings.clear === true) {
+    const transition = transitionCdpResource(payload, "emulation", "stopping");
     const cleanup = {
       metrics: await bestEffort(cdpSend(payload.tabId, "Emulation.clearDeviceMetricsOverride", {}), 3000, "clear metrics"),
       touch: await bestEffort(cdpSend(payload.tabId, "Emulation.setTouchEmulationEnabled", { enabled: false }), 3000, "clear touch"),
@@ -6752,9 +6966,11 @@ async function commandEmulation(payload) {
       .map(([operation, result]) => ({ operation, error: result.error }));
     if (failures.length === 0) {
       await setEmulationState(payload.tabId, null);
+      if (transition.owner) releaseCdpResource(payload, "emulation");
     }
     return { ok: failures.length === 0, cleared: true, cleanup, failures };
   }
+  claimCdpResource(payload, "emulation");
   const applied = [];
   if (settings.viewport) {
     const viewport = settings.viewport;
@@ -6964,23 +7180,37 @@ async function commandStorage(payload) {
 }
 
 async function commandTraceStart(payload) {
+  const claim = claimCdpResource(payload, "tracing");
   const broker = cdpBroker(payload.tabId);
   broker.traceEvents = [];
   broker.traceBytes = 0;
   broker.traceTruncated = false;
   broker.traceDropped = 0;
   broker.traceComplete = false;
-  await cdpSend(payload.tabId, "Tracing.start", {
-    categories: payload.categories || "-*,devtools.timeline,v8.execute,blink.user_timing,loading",
-    options: payload.options || "record-as-much-as-possible",
-    transferMode: "ReportEvents"
-  });
+  try {
+    await cdpSend(payload.tabId, "Tracing.start", {
+      categories: payload.categories || "-*,devtools.timeline,v8.execute,blink.user_timing,loading",
+      options: payload.options || "record-as-much-as-possible",
+      transferMode: "ReportEvents"
+    });
+  } catch (error) {
+    if (claim.created) releaseCdpResource(payload, "tracing");
+    throw error;
+  }
   return { ok: true, started: true };
 }
 
 async function commandTraceStop(payload) {
   const broker = cdpBroker(payload.tabId);
-  await cdpSend(payload.tabId, "Tracing.end", {});
+  const transition = transitionCdpResource(payload, "tracing", "stopping");
+  if (!transition.owner && !broker.traceComplete) {
+    const error = new Error("Tracing is not owned by this session");
+    error.name = "CdpResourceNotOwned";
+    throw error;
+  }
+  if (transition.previousState === "active") {
+    await cdpSend(payload.tabId, "Tracing.end", {});
+  }
   const timeoutMs = Math.max(1000, Number(payload.timeoutMs || 30000));
   const deadline = Date.now() + timeoutMs;
   while (!broker.traceComplete && Date.now() < deadline) {
@@ -7000,6 +7230,10 @@ async function commandTraceStop(payload) {
   broker.traceBytes = 0;
   broker.traceTruncated = false;
   broker.traceDropped = 0;
+  TabWardStageThree.completeStoppingResource(
+    broker.resourceOwners,
+    "tracing"
+  );
   return {
     ok: !truncated,
     traceEvents,
@@ -7013,18 +7247,24 @@ async function commandTraceStop(payload) {
 }
 
 async function commandScreencastStart(payload) {
+  const claim = claimCdpResource(payload, "screencast");
   const broker = cdpBroker(payload.tabId);
   broker.screencastFrames = [];
   broker.screencastBytes = 0;
   broker.screencastTruncated = false;
   broker.screencastDropped = 0;
-  await cdpSend(payload.tabId, "Page.startScreencast", {
-    format: payload.format || "jpeg",
-    quality: Number(payload.quality || 80),
-    maxWidth: payload.maxWidth,
-    maxHeight: payload.maxHeight,
-    everyNthFrame: Number(payload.everyNthFrame || 1)
-  });
+  try {
+    await cdpSend(payload.tabId, "Page.startScreencast", {
+      format: payload.format || "jpeg",
+      quality: Number(payload.quality || 80),
+      maxWidth: payload.maxWidth,
+      maxHeight: payload.maxHeight,
+      everyNthFrame: Number(payload.everyNthFrame || 1)
+    });
+  } catch (error) {
+    if (claim.created) releaseCdpResource(payload, "screencast");
+    throw error;
+  }
   return { ok: true, started: true };
 }
 
@@ -7054,12 +7294,15 @@ async function commandScreencastFrame(payload) {
 }
 
 async function commandScreencastStop(payload) {
+  const transition = transitionCdpResource(payload, "screencast", "stopping");
+  if (!transition.owner) return { ok: true, stopped: true, alreadyStopped: true };
   await cdpSend(payload.tabId, "Page.stopScreencast", {});
   const broker = cdpBroker(payload.tabId);
   broker.screencastFrames = [];
   broker.screencastBytes = 0;
   broker.screencastTruncated = false;
   broker.screencastDropped = 0;
+  releaseCdpResource(payload, "screencast");
   return { ok: true, stopped: true };
 }
 
@@ -7139,7 +7382,7 @@ async function commandScreenshot(payload) {
     if (!String(error?.message || "").includes("timed out")) {
       throw error;
     }
-    await cdpDetach(payload.tabId);
+    await cdpDetachIfIdle(payload.tabId);
     result = await cdpSend(payload.tabId, "Page.captureScreenshot", params, 15000);
   }
   return {
@@ -7229,7 +7472,8 @@ async function commandQa(payload) {
   const priorBroker = cdpEventBrokers.get(payload.tabId);
   const priorBrokerState = priorBroker ? {
     categories: new Set(priorBroker.categories),
-    started: priorBroker.started
+    started: priorBroker.started,
+    resourceOwners: new Map(priorBroker.resourceOwners)
   } : null;
   const priorEmulationState = (await getEmulationStates())[payload.tabId];
   const priorEmulation = priorEmulationState
@@ -7356,6 +7600,12 @@ async function commandQa(payload) {
         ok: true,
         previousStateRestored: Boolean(priorBrokerState)
       }]);
+    }
+    const restoredBroker = cdpEventBrokers.get(payload.tabId);
+    if (restoredBroker && priorBrokerState) {
+      restoredBroker.resourceOwners = priorBrokerState.resourceOwners;
+    } else if (restoredBroker) {
+      restoredBroker.resourceOwners.clear();
     }
     if (!hadCdpAttachment && cdpTabs.has(payload.tabId)) {
       operations.push([
@@ -7823,7 +8073,10 @@ async function commandTurnEnded(payload) {
     .filter((record) => record.sessionId === session.id && record.kind !== "released")
     .map((record) => record.tabId);
   for (const tabId of tabIds) {
-    await bestEffort(cdpDetach(tabId), 2000, "cdp detach on turn end");
+    await bestEffort(cdpDetach(tabId, {
+      forceSessionId: session.id,
+      preserveForeign: true
+    }), 2000, "cdp detach on turn end");
   }
   return { ok: true, session, detachedTabIds: tabIds };
 }

@@ -2,8 +2,9 @@
 
 ## Current Goal
 
-Stage Two reliability is complete in the isolated worktree. Do not begin Stage
-Three concurrency or Canvas work without explicit approval.
+Stage Three controlled concurrency is complete in the isolated
+`perf/tabward-stage3-20260921` worktree. Preserve Stage Two reliability and do
+not begin Canvas work without explicit approval.
 
 ## Current State
 
@@ -29,70 +30,63 @@ The Factory skill now performs a silent post-task review after real TabWard
 use. It proposes at most one evidence-backed, high-leverage TabWard improvement
 and stays silent when the task revealed no strong reusable opportunity.
 
-The isolated `perf/tabward-stage2-20260921` worktree now carries one absolute
-deadline and operation ID through MCP, broker HTTP, the retained global bridge
-queue, WebSocket, extension operation context, durable outbox, and result
-acknowledgement. Queue expiry and cancellation fail before browser dispatch;
-post-dispatch loss remains typed `OutcomeUnknown`. Duplicate operation IDs join
-the same in-flight/cached result, while fingerprint conflicts fail closed.
+The broker now uses a bounded fair per-session scheduler with FIFO inside each
+session, round-robin service across sessions, same-tab serialization, and a
+global-exclusive lane for Clean QA, cleanup, profile storage, unknown scope,
+expert CDP, and ambiguous download correlation. Queue cancellation, expiry,
+and per-session/total backpressure remain typed pre-dispatch outcomes. Maximum
+concurrency is validated to `1..4`; production defaults to `2`, while maximum
+`1` reproduces Stage Two global ordering. Global work retains its origin
+session and active plus queued work shares the per-session admission bound.
+Legacy `executeCdp` and unknown aliases are global-exclusive. Global
+round-robin now checks the exact selected item's sequence barrier, preserves
+same-origin FIFO across ordinary/global lanes, and scans for another eligible
+origin instead of starting a blocked later item.
 
-Extension handlers no longer depend on shared active-session or active-signal
-globals. A serialized StateStore protects short session-state mutations.
-Sessions transition through `active` → `closing` → `closed` or
-`cleanup_partial`; cleanup receives a TTL pin, and failed or unverified tab
-removal preserves ownership for retry. Bounded byte/count budgets cover the
-broker ledger, extension outbox, events, traces, screencast frames, and
-all-frame aggregates. Expired orphan reservations become replayable
-`OutcomeUnknown` tombstones. Partial QA cannot report green.
+The extension accepts concurrent dispatch with immutable operation context and
+a session/tab/global resource gate. CDP events, interception, emulation,
+tracing, and screencast ownership prevent expert commands or timeout cleanup
+from disabling resources still owned by another operation. Claims are exact to
+one operation; duplicate same-session starts fail busy. Cleanup preserves
+resources owned by another session. Trace stop retains a `stopping` owner
+across timeout or cancellation and releases it only after confirmed
+completion. Concurrent outbox
+completion/ACK, reconnect recovery, four-session correlation isolation,
+disconnect/cancel/deadline/late-result faults, and 50-cycle scheduler endurance
+have deterministic regression coverage.
 
-Review hardening now treats WebSocket send callback failures and deadline
-aborts after dispatch as effect-unknown, keeps extension results until the
-broker has bounded recovery capacity, and replays completion to the current
-authenticated socket after reconnect. Late confirmed results replace matching
-settled unknown ledger outcomes. Read-only broker restart recovery reuses the
-original request/operation identity and absolute deadline. Nested-frame double
-click now emits two clicks plus `dblclick`; retained partial child frames make
-their aggregate partial. The privacy draft now discloses bounded local
-full-result retention in extension IndexedDB and broker memory.
+Session close enters `closing`, rejects new commands, drains work already
+accepted by that MCP process, and then performs global-exclusive cleanup.
+Accepted ownership mutations cannot shorten the closing TTL pin. Adopted and
+user tabs remain protected. Stage Two operation identity,
+deadlines, durable outbox, ledger recovery, byte budgets, and
+`OutcomeUnknown` behavior remain intact.
 
-Revalidation hardening now passes immutable operation/session context through
-every nested ownership helper. Managed navigate, read, action, download, close,
-release, cleanup, handoff, deliverable, and visual-state paths no longer fall
-back to the legacy browser session. Ownership updates after asynchronous
-Chrome work use fresh serialized key-level mutations, so open-tab, child-tab,
-remember, forget, grouping, and adoption interleavings do not replace the
-whole ownership map. `networkBody` is bounded to a 7 MiB result inside its
-8 MiB durable reservation and marks larger bodies truncated/partial.
-All-frame completeness now recognizes structured `truncated`,
-`outputTruncated`, and nested incomplete evidence.
-
-Frame/document identity is preserved for targeted scripting. Nested-frame
-uploads use a unique frame marker mapped to a CDP backend node; nested native
-actions use frame-local DOM paths or fail closed. Nested-frame element
-screenshot coordinates and full OOPIF coordinate-chain capture remain
-explicitly deferred. Automatic MCP-death detection and handle-based large
-artifact transfer are also deferred.
-
-Validation passes: all targeted Stage Two regressions, full `npm run verify`
-including release audit, and the isolated 1/2/4 benchmark. Benchmark p95 total
-was 93.19/186.19/371.37 ms; max queue depth remained 0/1/3 and execution stayed
-globally sequential. No live Chrome, global MCP install, standard ports,
-pairing/config changes, commit, push, or publish was used.
+Validation passes: targeted Stage Three tests, full `npm run verify` including
+release audit, and the isolated 1/2/4 scheduler/client benchmark. Three
+repeated post-review runs confirmed maximum `2`: median p95 total was about
+`94.8 ms` for one client and `186.9 ms` for four clients, versus Stage Two
+`93.19/371.37 ms`. That is about a 1.7% one-client regression and a 49.7%
+four-client improvement. Maximum `4` remains benchmark/test-only. No live
+Chrome, global MCP install, standard ports, pairing/config changes, push, or
+publish was used.
 
 ## Last 7 Tasks
 
-1. 2026-08-23: Passed enhanced frontend QA 12/12, full verify, release audit, and 50/50 endurance without leaks.
-2. 2026-08-24: Added evidence-gated post-task TabWard improvement proposals to the Factory skill.
-3. 2026-09-14: Added `tabward_upload`, hidden file-input support, local path validation, and passed live frontend QA 12/12.
-4. 2026-09-16: Synchronized the verified 0.3.1 source into the canonical checkout and private GitHub repository.
-5. 2026-09-21: Implemented isolated Stage One telemetry, benchmark, QA artifact, unchecked-wait, and download-ownership changes with synthetic regressions.
-6. 2026-09-21: Implemented Stage Two deadlines, cancellation/outcomes, operation ledger/outbox recovery, serialized state lifecycle, byte budgets, and frame-safe foundations.
-7. 2026-09-21: Resolved Stage Two review and revalidation findings with deterministic ownership, interleaving, budget, and completeness regressions.
+1. 2026-08-24: Added evidence-gated post-task TabWard improvement proposals to the Factory skill.
+2. 2026-09-14: Added `tabward_upload`, hidden file-input support, local path validation, and passed live frontend QA 12/12.
+3. 2026-09-16: Synchronized the verified 0.3.1 source into the canonical checkout and private GitHub repository.
+4. 2026-09-21: Implemented isolated Stage One telemetry, benchmark, QA artifact, unchecked-wait, and download-ownership changes with synthetic regressions.
+5. 2026-09-21: Implemented Stage Two deadlines, cancellation/outcomes, operation ledger/outbox recovery, serialized state lifecycle, byte budgets, and frame-safe foundations.
+6. 2026-09-21: Resolved Stage Two review and revalidation findings with deterministic ownership, interleaving, budget, and completeness regressions.
+7. 2026-09-21: Implemented and review-hardened Stage Three bounded fair concurrency, resource isolation, close draining, deterministic faults/endurance, and the 1/2/4 benchmark matrix.
 
 ## Next Step
 
-Review the uncommitted Stage Two diff. Stage Three concurrency and Canvas work
-await explicit permission.
+With explicit approval, run the live Chrome frontend QA, Clean QA,
+upload/download, multi-session concurrency, and cleanup/endurance gates in a
+TabWard-owned test profile before any installation or rollout. Canvas remains
+deferred.
 
 ## Risks / Do Not Forget
 
@@ -103,8 +97,8 @@ await explicit permission.
 - The npm package and Chrome Web Store extension are not publicly published.
 - GitHub Actions is intentionally absent during the private beta. Local
   `npm run verify` is mandatory before every push.
-- Keep `#commandTail` and sequential execution until Stage Three is explicitly
-  approved.
+- Keep the production scheduler default at `2` unless later live evidence
+  justifies another value; maximum `4` is benchmark/test coverage only.
 - Do not claim exactly-once execution across a crash between browser effect and
   durable completion; the supported outcome is `OutcomeUnknown`.
 - Do not auto-close tabs during orphan reconciliation or claim an unproven

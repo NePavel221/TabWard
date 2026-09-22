@@ -158,24 +158,48 @@ npm run gate:clean-qa
 
 The Clean QA gate requires **Allow in incognito** for TabWard.
 
-Run the isolated synthetic Stage One performance baseline:
+Run the isolated synthetic Stage Three scheduler matrix:
 
 ```powershell
-npm run benchmark:stage1
+npm run benchmark:stage3
 ```
 
 It starts its own broker and synthetic WebSocket extension on dynamic loopback
-ports, uses a temporary state directory, measures 1/2/4 simultaneous clients,
-prints p50/p95 queue, execution, total, result-size, and RSS samples, and
-removes only its own temporary resources. It does not use the loaded Chrome
-extension or the standard ports.
+ports, uses a temporary state directory, compares scheduler maxima 1/2/4
+against 1/2/4 simultaneous clients with 80 ms synthetic work, prints p50/p95
+queue, execution, total, result-size, RSS, maximum active work, and fairness,
+and removes only its own temporary resources. It does not use the loaded
+Chrome extension or the standard ports. `benchmark:stage1` remains as a
+compatibility alias.
 
-Stage Two keeps the same global sequential executor while adding one absolute
-deadline and operation ID across MCP, broker HTTP, WebSocket, extension
-dispatch, durable outbox, and result acknowledgement. Queue time consumes the
-deadline. Expired or queued-cancelled work fails before browser dispatch;
-timeouts or disconnects after dispatch remain `OutcomeUnknown` and are never
-blindly retried for actions.
+Stage Three replaces the global sequential executor with a bounded fair
+per-session scheduler. Commands remain FIFO inside one session, while proven
+independent sessions can overlap. Same-tab work is serialized across sessions.
+Clean QA, session cleanup, profile storage, commands without proven isolation,
+unknown expert CDP, and correlation-sensitive download workflows use one
+global-exclusive lane. Queue cancellation, expiry, and bounded backpressure
+occur before extension dispatch and preserve Stage Two typed outcomes. Global
+work retains its origin session for admission accounting, so active plus queued
+Clean QA, storage, cleanup, CDP, and download-correlation work cannot bypass
+the per-session limit. Legacy `executeCdp` and unknown command scopes also fail
+into the global-exclusive lane. Round-robin chooses only a global item whose
+own sequence barrier is eligible, so it cannot skip earlier work from the same
+origin session; if that item is blocked, another eligible origin can proceed.
+
+The production scheduler maximum defaults conservatively to `2`. Set
+`TABWARD_SCHEDULER_MAX_CONCURRENCY=1` for Stage Two ordering compatibility or
+to `2`/`4` for controlled testing. Values outside `1..4` fall back to the safe
+default. Queue admission is also bounded by
+`TABWARD_SCHEDULER_MAX_QUEUE_PER_SESSION` (default `64`) and
+`TABWARD_SCHEDULER_MAX_QUEUE_TOTAL` (default `256`). The per-session limit
+counts both queued and active work.
+
+Stage Two reliability remains underneath the scheduler: one absolute deadline
+and operation ID cross MCP, broker HTTP, WebSocket, extension dispatch,
+durable outbox, and result acknowledgement. Queue time consumes the deadline.
+Expired or queued-cancelled work fails before browser dispatch; timeouts or
+disconnects after dispatch remain `OutcomeUnknown` and are never blindly
+retried for actions.
 
 The broker and extension maintain bounded operation/result ledgers with count
 and byte ceilings. A result is acknowledged only after the broker retains a
@@ -191,7 +215,12 @@ reservation and explicitly marks larger bodies as truncated and partial.
 
 Session cleanup now uses `active` → `closing` → `closed` or
 `cleanup_partial`. A failed tab removal preserves ownership so cleanup can be
-retried. Restart reconciliation invalidates only provably stale temporary
+retried. Accepted tab ownership updates cannot shorten the five-minute closing
+TTL pin. Cleanup detaches only CDP resources belonging to that session and
+preserves resources owned by other sessions. Exact operation ownership guards
+events, interception, emulation, tracing, and screencast state; trace stop
+remains `stopping` after timeout/cancellation until Chrome confirms completion.
+Restart reconciliation invalidates only provably stale temporary
 metadata and never auto-closes adopted, user, created, handoff, or deliverable
 tabs. Full automatic MCP-process death detection is deferred.
 
@@ -200,7 +229,8 @@ enable it per client with `TABWARD_TELEMETRY=1`; each measured operation carries
 its explicit opt-in to an already-running shared broker, so the broker does not
 need a restart. Samples are available only as MCP `_meta["tabward/telemetry"]`
 on `tabward_health`, so ordinary tool content and structured responses remain
-unchanged.
+unchanged. Scheduler telemetry is numeric only: active count, queue depth,
+configured maximum, maximum observed active work, and queue wait.
 
 The private beta intentionally uses this local command as its required
 pre-push gate instead of GitHub Actions.

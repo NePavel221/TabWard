@@ -15,7 +15,7 @@ credential; the pairing credential is never returned to MCP clients.
 
 Protocol v2 assigns every operation one correlation ID, content fingerprint,
 and absolute deadline. The same ID crosses MCP, authenticated broker HTTP,
-the global bridge queue, WebSocket dispatch, the extension operation context,
+the fair bridge scheduler, WebSocket dispatch, the extension operation context,
 IndexedDB outbox, result, and acknowledgement. Queue wait consumes the same
 deadline. Work that expires or is cancelled before dispatch returns a typed
 `not_started`/`cancelled_before_effect` outcome and cannot touch Chrome.
@@ -46,10 +46,53 @@ paths, payload/result content, cookies, or arbitrary operation names. Opt-in
 samples are exposed only in `tabward_health` MCP metadata, not ordinary
 response content. Locator/CDP sub-stage timing is not implemented in Stage One.
 
-The bridge intentionally retains one global `#commandTail`; concurrent clients
-therefore execute extension commands sequentially. `npm run benchmark:stage1`
-reproduces this head-of-line behavior with a synthetic WebSocket extension,
-dynamic loopback ports, and a temporary state directory.
+Stage Three uses a bounded fair scheduler instead of one global command tail.
+Each session has a FIFO queue, and round-robin dispatch prevents a flooded
+session from starving a sparse one. The configured maximum is bounded to
+`1..4` and defaults to `2`; maximum `1` reproduces Stage Two ordering and
+outcomes. Admission is bounded per session and in total, returning typed
+pre-dispatch backpressure without browser effects. Global-exclusive work keeps
+its origin session key, and the per-session bound counts queued plus active
+work across both ordinary and global lanes.
+
+Every command is classified before dispatch. Proven session-scoped commands
+can overlap across sessions. All operations on the same tab serialize,
+including reads whose document, locator, or CDP state could be invalidated by
+navigation or mutation. Clean QA, session cleanup, profile-wide storage,
+unknown scope, unknown expert CDP, and ambiguous download correlation run
+globally exclusive: they wait for active work to drain and block later work
+until completion. Legacy `executeCdp` and any command alias without a proven
+resource classification are global-exclusive as well. Round-robin global
+selection validates the exact candidate's sequence barrier: earlier ordinary
+work and earlier globals from the same origin must run first, while a blocked
+origin does not prevent another eligible origin from using the exclusive lane.
+Session close marks the session closing synchronously,
+rejects new commands, waits for already accepted session work, and then enters
+global-exclusive cleanup.
+
+The extension accepts concurrent WebSocket dispatches with immutable
+operation-scoped contexts and a resource gate mirroring session/tab/global
+isolation. IndexedDB transactions, serialized reservations, fingerprinted
+ACKs, and the operation ledger prevent lost concurrent completion state and
+duplicate browser dispatch. CDP mutation and cleanup are same-tab serialized.
+Long-lived event, interception, emulation, trace, and screencast claims belong
+to an exact operation; another operation in the same session receives
+`CdpResourceBusy` rather than replacing the owner. Session cleanup detaches
+only resources it owns and preserves foreign-session claims. A trace moves to
+`stopping` after `Tracing.end`; timeout or cancellation retains that state,
+retries can wait without restarting the trace, and the eventual
+`Tracing.tracingComplete` event releases the claim. Composite QA snapshots and
+restores resources it temporarily changes.
+Correlation-sensitive download/new-tab workflows are exclusive when identity
+cannot otherwise be proven rather than assigning by URL/referrer guesswork.
+
+`npm run benchmark:stage3` runs the isolated 1/2/4 scheduler-by-client matrix
+with dynamic loopback ports and temporary state. The final review rerun
+measured four-client p95 total at `186.43 ms` for maximum `2`, versus the
+Stage Two baseline `371.37 ms` (49.8% improvement). One-client p95 was
+`111.45 ms` versus `93.19 ms` in that run; the matrix remains synthetic and
+the live Chrome gate is still required. Maximum `4` reached `90.81 ms` at four
+clients but remains tested rather than the initial production default.
 
 Extension command handlers receive an immutable operation-scoped context
 containing operation ID, session data, absolute deadline, and AbortSignal.
@@ -65,8 +108,10 @@ CDP, network, screenshot, or wait operations.
 
 Session lifecycle is `active` → `closing` → `closed` or `cleanup_partial`.
 Closing sessions reject new commands and receive a five-minute cleanup TTL
-pin, so cleanup can cross the original session expiry. Failed or unverified tab
-removal preserves ownership and cleanup metadata for a later retry. Expired
+pin, so cleanup can cross the original session expiry. Accepted ownership
+mutations during closing do not touch or shorten that pin. Failed or
+unverified tab removal preserves ownership and cleanup metadata for a later
+retry. Expired
 orphaned outbox reservations become durable `OutcomeUnknown` tombstones,
 recovering reserved capacity without silently erasing ambiguity. Restart
 reconciliation can invalidate stale temporary metadata without claiming an

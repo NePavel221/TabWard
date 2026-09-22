@@ -21,6 +21,7 @@
     "gate:clean-qa": "node scripts/clean-qa-gate.mjs",
     "benchmark:browsers": "node scripts/compare-browser-mcp.mjs",
     "benchmark:stage1": "npm run build -w @tabward/mcp && node scripts/benchmark-stage-one.mjs",
+    "benchmark:stage3": "npm run benchmark:stage1",
     "verify": "npm run check && npm test && npm run build && npm run pack:extension && npm run audit:release"
   },
   "engines": {

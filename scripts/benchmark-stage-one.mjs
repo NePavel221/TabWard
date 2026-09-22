@@ -9,7 +9,7 @@ const root = resolve(import.meta.dirname, "..");
 const brokerEntry = resolve(root, "packages", "mcp", "dist", "broker-server.js");
 const extensionId = "abcdefghijklmnopabcdefghijklmnop";
 const commandDelayMs = Math.max(10, Number(process.env.TABWARD_BENCH_DELAY_MS || 80));
-const samplesPerClient = Math.max(2, Number(process.env.TABWARD_BENCH_SAMPLES || 8));
+const samplesPerClient = Math.max(2, Number(process.env.TABWARD_BENCH_SAMPLES || 12));
 
 function percentile(values, fraction) {
   const sorted = [...values].sort((left, right) => left - right);
@@ -92,8 +92,8 @@ async function cleanupFixture({ socket, base, headers, child, stateDir }) {
   }
 }
 
-async function startFixture() {
-  const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-stage1-benchmark-"));
+async function startFixture(maxConcurrency) {
+  const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-stage3-benchmark-"));
   const child = spawn(process.execPath, [brokerEntry], {
     env: {
       ...process.env,
@@ -101,7 +101,8 @@ async function startFixture() {
       TABWARD_PORT: "0",
       TABWARD_BROKER_PORT: "0",
       TABWARD_BROKER_EPHEMERAL: "1",
-      TABWARD_TELEMETRY: "1"
+      TABWARD_TELEMETRY: "1",
+      TABWARD_SCHEDULER_MAX_CONCURRENCY: String(maxConcurrency)
     },
     stdio: "ignore"
   });
@@ -172,7 +173,7 @@ async function startFixture() {
   }
 }
 
-async function runScenario(fixture, clients) {
+async function runScenario(fixture, clients, maxConcurrency) {
   const samples = [];
   for (let sequence = 0; sequence < samplesPerClient; sequence += 1) {
     const burst = Array.from({ length: clients }, async (_, client) => {
@@ -185,7 +186,11 @@ async function runScenario(fixture, clients) {
         body: JSON.stringify({
           requestId,
           command: "ping",
-          payload: { client, sequence },
+          payload: {
+            client,
+            sequence,
+            sessionId: `benchmark-session-${client}`
+          },
           operationId,
           telemetry: true
         })
@@ -194,6 +199,7 @@ async function runScenario(fixture, clients) {
       assert.equal(response.status, 200);
       assert.equal(value.telemetry.operationId, operationId);
       samples.push({
+        client,
         wallMs: performance.now() - startedAt,
         ...value.telemetry
       });
@@ -205,7 +211,14 @@ async function runScenario(fixture, clients) {
   const total = samples.map((sample) => sample.brokerTotalMs);
   const resultBytes = samples.map((sample) => sample.resultBytes);
   const rss = samples.map((sample) => sample.brokerRssBytes);
+  const clientTotals = Array.from({ length: clients }, (_, client) =>
+    samples
+      .filter((sample) => sample.client === client)
+      .map((sample) => sample.brokerTotalMs)
+  );
+  const clientP95 = clientTotals.map((values) => percentile(values, 0.95));
   return {
+    maxConcurrency,
     clients,
     samples: samples.length,
     queueWaitMs: summarize(queueWait),
@@ -215,23 +228,31 @@ async function runScenario(fixture, clients) {
     resultBytes: summarize(resultBytes),
     rssBytes: summarize(rss),
     maxObservedQueueDepth: Math.max(...samples.map((sample) => sample.brokerQueueDepth)),
+    maxObservedActive: Math.max(...samples.map((sample) =>
+      sample.schedulerMaxObservedActive || sample.schedulerActiveCount || 0)),
+    fairnessP95Ratio: Number((
+      Math.max(...clientP95) / Math.max(0.001, Math.min(...clientP95))
+    ).toFixed(2)),
     holAmplificationP50: Number((percentile(total, 0.50) / percentile(execution, 0.50)).toFixed(2))
   };
 }
 
-const fixture = await startFixture();
-try {
-  const results = [];
-  for (const clients of [1, 2, 4]) {
-    results.push(await runScenario(fixture, clients));
+const results = [];
+for (const maxConcurrency of [1, 2, 4]) {
+  const fixture = await startFixture(maxConcurrency);
+  try {
+    for (const clients of [1, 2, 4]) {
+      results.push(await runScenario(fixture, clients, maxConcurrency));
+    }
+  } finally {
+    await fixture.close();
   }
-  console.log(JSON.stringify({
-    benchmark: "TabWard Stage One synthetic WebSocket global queue",
-    commandDelayMs,
-    samplesPerClient,
-    ports: "dynamic loopback only",
-    results
-  }, null, 2));
-} finally {
-  await fixture.close();
 }
+console.log(JSON.stringify({
+  benchmark: "TabWard Stage Three bounded fair scheduler",
+  commandDelayMs,
+  samplesPerClient,
+  ports: "dynamic loopback only",
+  baselineStageTwoP95Ms: { clients1: 93.19, clients2: 186.19, clients4: 371.37 },
+  results
+}, null, 2));

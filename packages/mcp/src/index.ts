@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { saveBase64Artifact, saveJsonArtifact, saveQaScreenshots } from "./artifacts.js";
+import { AcceptedWorkTracker } from "./accepted-work.js";
 import { BrokerClient } from "./broker-client.js";
 import { telemetryEnabled } from "./telemetry.js";
 import {
@@ -17,6 +18,7 @@ import {
 const VERSION = "0.3.1";
 const bridge = new BrokerClient();
 const sessions = new SessionPolicy();
+const acceptedSessionCommands = new AcceptedWorkTracker();
 const objectSchema = z.record(z.unknown());
 const locatorSchema = z.object({
   ref: z.string().optional(),
@@ -176,46 +178,66 @@ function syncSessionTabs(
   }
 }
 
+async function withAcceptedSessionCommand<T>(
+  sessionId: string,
+  run: (session: Session) => Promise<T>
+): Promise<T> {
+  const session = sessions.get(sessionId);
+  return await acceptedSessionCommands.run(sessionId, () => run(session));
+}
+
+async function waitForAcceptedSessionCommands(sessionId: string): Promise<void> {
+  await acceptedSessionCommands.wait(sessionId);
+}
+
 async function send(
   sessionId: string,
   capability: Capability,
   command: string,
   payload: Record<string, unknown> = {},
-  options: { tabId?: number; timeoutMs?: number } = {}
+  options: {
+    tabId?: number;
+    timeoutMs?: number;
+    after?: (session: Session, result: Record<string, unknown>) => void;
+  } = {}
 ): Promise<Record<string, unknown>> {
-  const session = sessions.require(sessionId, capability);
-  const tabId = options.tabId;
-  if (tabId !== undefined) {
-    if (session.mode === "managed" && !session.tabIds.has(tabId)) {
-      const known = await bridge.send(
-        "tabs",
-        context(session),
-        8_000
-      ) as Record<string, unknown>;
-      syncSessionTabs(session, known);
-      if (!session.tabIds.has(tabId)) {
-        throw new Error("Managed sessions can access only tabs opened by that session");
+  return await withAcceptedSessionCommand(sessionId, async (session) => {
+    sessions.require(sessionId, capability);
+    const tabId = options.tabId;
+    if (tabId !== undefined) {
+      if (session.mode === "managed" && !session.tabIds.has(tabId)) {
+        const known = await bridge.send(
+          "tabs",
+          context(session),
+          8_000
+        ) as Record<string, unknown>;
+        syncSessionTabs(session, known);
+        if (!session.tabIds.has(tabId)) {
+          throw new Error("Managed sessions can access only tabs opened by that session");
+        }
+      }
+      const owner = sessions.owner(tabId, session.id);
+      if (owner) {
+        throw new Error(`Tab ${tabId} is already owned by session ${owner.name}`);
+      }
+      if (session.mode === "full_profile" && !session.tabIds.has(tabId)) {
+        sessions.require(sessionId, "adopt_tabs");
+        await bridge.send("adoptTab", {
+          ...context(session),
+          tabId,
+          confirm: true
+        }, 8_000);
+        sessions.assignTab(session.id, tabId, { adopted: true });
       }
     }
-    const owner = sessions.owner(tabId, session.id);
-    if (owner) {
-      throw new Error(`Tab ${tabId} is already owned by session ${owner.name}`);
-    }
-    if (session.mode === "full_profile" && !session.tabIds.has(tabId)) {
-      sessions.require(sessionId, "adopt_tabs");
-      await bridge.send("adoptTab", {
-        ...context(session),
-        tabId,
-        confirm: true
-      }, 8_000);
-      sessions.assignTab(session.id, tabId, { adopted: true });
-    }
-  }
-  return await bridge.send(command, {
-    ...payload,
-    ...context(session),
-    ...(tabId === undefined ? {} : { tabId })
-  }, options.timeoutMs) as Record<string, unknown>;
+    const result = await bridge.send(command, {
+      ...payload,
+      ...context(session),
+      ...(tabId === undefined ? {} : { tabId })
+    }, options.timeoutMs) as Record<string, unknown>;
+    options.after?.(session, result);
+    return result;
+  });
 }
 
 server.registerTool("tabward_health", {
@@ -289,6 +311,7 @@ server.registerTool("tabward_session_close", {
 }, async ({ session_id, close_created_tabs }) => {
   const session = sessions.beginClose(session_id);
   try {
+    await waitForAcceptedSessionCommands(session_id);
     const cleanup = await bridge.send("releaseWorkspace", {
       ...context(session),
       closeCreatedTabs: close_created_tabs
@@ -338,48 +361,53 @@ server.registerTool("tabward_tabs", {
     label: z.string().max(80).optional()
   }
 }, async ({ session_id, operation, tab_id, url, active, wait, summary, label }) => {
-  const session = sessions.get(session_id);
   if (operation === "list") {
-    const result = await bridge.send("tabs", context(session)) as Record<string, unknown>;
-    syncSessionTabs(session, result);
-    if (session.mode === "managed" && Array.isArray(result.knownTabs)) {
-      result.knownTabs = result.knownTabs.filter((tab) =>
-        typeof tab === "object" && tab !== null
-        && session.tabIds.has(Number((tab as { id?: unknown }).id))
-      );
-      const activeId = typeof result.activeTab === "object" && result.activeTab !== null
-        ? Number((result.activeTab as { id?: unknown }).id)
-        : NaN;
-      if (!session.tabIds.has(activeId)) {
-        result.activeTab = null;
+    return await withAcceptedSessionCommand(session_id, async (session) => {
+      const result = await bridge.send("tabs", context(session)) as Record<string, unknown>;
+      syncSessionTabs(session, result);
+      if (session.mode === "managed" && Array.isArray(result.knownTabs)) {
+        result.knownTabs = result.knownTabs.filter((tab) =>
+          typeof tab === "object" && tab !== null
+          && session.tabIds.has(Number((tab as { id?: unknown }).id))
+        );
+        const activeId = typeof result.activeTab === "object" && result.activeTab !== null
+          ? Number((result.activeTab as { id?: unknown }).id)
+          : NaN;
+        if (!session.tabIds.has(activeId)) {
+          result.activeTab = null;
+        }
       }
-    }
-    return output(result);
+      return output(result);
+    });
   }
   if (operation === "open") {
-    const result = await bridge.send("openTab", {
-      ...context(session), url, active, wait
-    }) as Record<string, unknown>;
-    const openedId = tabIdFrom((result.tab as { id?: unknown } | undefined)?.id);
-    if (openedId !== null) {
-      sessions.assignTab(session.id, openedId, { created: true });
-    }
-    const windowId = tabIdFrom(result.workspaceWindowId);
-    if (windowId !== null) {
-      session.workspaceWindowId = windowId;
-    }
-    return output(result);
+    return await withAcceptedSessionCommand(session_id, async (session) => {
+      const result = await bridge.send("openTab", {
+        ...context(session), url, active, wait
+      }) as Record<string, unknown>;
+      const openedId = tabIdFrom((result.tab as { id?: unknown } | undefined)?.id);
+      if (openedId !== null) {
+        sessions.assignTab(session.id, openedId, { created: true });
+      }
+      const windowId = tabIdFrom(result.workspaceWindowId);
+      if (windowId !== null) {
+        session.workspaceWindowId = windowId;
+      }
+      return output(result);
+    });
   }
   if (tab_id === undefined) {
     throw new Error(`tab_id is required for ${operation}`);
   }
   if (operation === "adopt") {
-    sessions.require(session_id, "adopt_tabs");
-    const result = await bridge.send("adoptTab", {
-      ...context(session), tabId: tab_id, confirm: true
-    }) as Record<string, unknown>;
-    sessions.assignTab(session.id, tab_id, { adopted: true });
-    return output(result);
+    return await withAcceptedSessionCommand(session_id, async (session) => {
+      sessions.require(session_id, "adopt_tabs");
+      const result = await bridge.send("adoptTab", {
+        ...context(session), tabId: tab_id, confirm: true
+      }) as Record<string, unknown>;
+      sessions.assignTab(session.id, tab_id, { adopted: true });
+      return output(result);
+    });
   }
   const commands = {
     release: "releaseTab",
@@ -395,10 +423,12 @@ server.registerTool("tabward_tabs", {
   } as const;
   const result = await send(session_id, "action", commands[operation], {
     url, active, wait, summary, label
-  }, { tabId: tab_id });
-  if (operation === "release" || operation === "close" || operation === "handoff") {
-    sessions.releaseTab(session.id, tab_id);
-  }
+  }, {
+    tabId: tab_id,
+    ...(operation === "release" || operation === "close" || operation === "handoff"
+      ? { after: () => sessions.releaseTab(session_id, tab_id) }
+      : {})
+  });
   return output(result);
 });
 

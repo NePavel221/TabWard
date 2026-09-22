@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import test from "node:test";
 import { SessionPolicy } from "../dist/session.js";
 
@@ -80,7 +82,37 @@ test("closing pins cleanup beyond the session's original expiry", () => {
   assert.equal(policy.get(session.id, false, true).state, "cleanup_partial");
 });
 
-test("four logical sessions retain isolated ownership while policy is sequential", () => {
+test("accepted tab mutations cannot shorten the closing TTL pin", () => {
+  const policy = new SessionPolicy();
+  const session = policy.start({ name: "closing-mutation", ttlSeconds: 60 });
+  policy.assignTab(session.id, 41, { created: true });
+  policy.beginClose(session.id);
+  const pinnedExpiry = session.expiresAt;
+  policy.assignTab(session.id, 42, { created: true });
+  policy.releaseTab(session.id, 41);
+  assert.equal(session.expiresAt, pinnedExpiry);
+  assert.equal(session.tabIds.has(42), true);
+  session.expiresAt = Date.now() / 1000 + 0.01;
+  policy.cleanupPartial(session.id, { retry: true });
+  assert.equal(session.expiresAt > Date.now() / 1000 + 299, true);
+  assert.equal(policy.get(session.id, false, true).state, "cleanup_partial");
+});
+
+test("session close enters closing, drains accepted work, then schedules cleanup", async () => {
+  const source = await readFile(
+    resolve(import.meta.dirname, "..", "src", "index.ts"),
+    "utf8"
+  );
+  const begin = source.indexOf("const session = sessions.beginClose(session_id)");
+  const drain = source.indexOf("await waitForAcceptedSessionCommands(session_id)", begin);
+  const cleanup = source.indexOf('bridge.send("releaseWorkspace"', drain);
+  assert.equal(begin >= 0, true);
+  assert.equal(drain > begin, true);
+  assert.equal(cleanup > drain, true);
+  assert.match(source, /withAcceptedSessionCommand\(sessionId/);
+});
+
+test("four logical sessions retain isolated ownership under controlled concurrency", () => {
   const policy = new SessionPolicy();
   const sessions = Array.from({ length: 4 }, (_, index) =>
     policy.start({ name: `session-${index}` }));

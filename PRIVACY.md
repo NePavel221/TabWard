@@ -10,9 +10,10 @@ APIs. Managed mode limits access to tabs created by the agent session.
 Anonymous local timing telemetry is disabled by default. When explicitly
 enabled with `TABWARD_TELEMETRY=1` for tests or benchmarks, TabWard records only
 correlation IDs, a closed operation-type vocabulary, numeric duration/queue/
-size/RSS metrics, and no URLs, DOM, selectors, field values, file paths,
-payload or result content, or cookies. The samples remain on the local MCP
-transport and are not sent to a TabWard cloud service.
+size/RSS metrics, scheduler active/queued/configured-maximum counts, and no
+session names, URLs, DOM, selectors, field values, file paths, payload or result
+content, or cookies. The samples remain on the local MCP transport and are not
+sent to a TabWard cloud service.
 
 Reliability state is also local and bounded. Its metadata contains operation
 IDs, content fingerprints, deadlines, typed outcomes, byte/count accounting,

@@ -132,6 +132,7 @@ const server = createServer((request, response) => {
       instanceId,
       uptimeSeconds: Math.floor(process.uptime()),
       activeRequests: clients,
+      scheduler: bridge.queueStatus(),
       extension: { host: bridge.host, port: bridge.port, ...bridge.status() }
     });
     return;
@@ -355,6 +356,8 @@ const server = createServer((request, response) => {
           const queue = bridge.queueStatus();
           // Commands already active or waiting are ahead of this operation.
           record.telemetry.brokerQueueDepth = queue.active + queue.queued;
+          record.telemetry.schedulerActiveCount = queue.active;
+          record.telemetry.schedulerConfiguredMax = queue.configuredMax;
         }
         const startedAt = performance.now();
         const current = record;
@@ -380,8 +383,10 @@ const server = createServer((request, response) => {
             const next = Math.max(current.reservedBytes, current.actualBytes);
             requestCacheBytes += next - previous;
             if (current.telemetry) {
+              const queue = bridge.queueStatus();
               current.telemetry.brokerTotalMs = performance.now() - startedAt;
               current.telemetry.brokerRssBytes = process.memoryUsage().rss;
+              current.telemetry.schedulerMaxObservedActive = queue.maxObservedActive;
             }
             evictSettled(0);
           });

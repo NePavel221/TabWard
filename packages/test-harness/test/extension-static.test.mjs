@@ -26,6 +26,16 @@ async function stageTwoHelpers() {
   return context.TabWardStageTwo;
 }
 
+async function stageThreeHelpers() {
+  const source = await readFile(
+    resolve(root, "apps", "extension", "stage-three.js"),
+    "utf8"
+  );
+  const context = vm.createContext({});
+  vm.runInContext(source, context);
+  return context.TabWardStageThree;
+}
+
 test("extension uses paired WebSocket transport without native messaging", async () => {
   const background = await readFile(
     resolve(root, "apps", "extension", "background.js"),
@@ -41,10 +51,15 @@ test("extension uses paired WebSocket transport without native messaging", async
   assert.match(background, /pairing_required/);
   assert.match(background, /result_ack/);
   assert.match(background, /resultOutbox/);
-  assert.match(background, /importScripts\("stage-one\.js", "stage-two\.js"\)/);
+  assert.match(background, /importScripts\("stage-one\.js", "stage-two\.js", "stage-three\.js"\)/);
   assert.match(background, /indexedDB\.open/);
   assert.match(background, /deadlineAt/);
   assert.match(background, /activeOperations/);
+  assert.equal(
+    background.indexOf("await outboxPut(envelope)")
+      < background.indexOf("activeOperations.delete(operation.operationId)"),
+    true
+  );
   assert.doesNotMatch(background, /activeSessionContext|activeCommandSignal/);
   assert.doesNotMatch(background, /message\.code.*pairingCode/);
   assert.doesNotMatch(background, /connectNative|nativeKeepalive|bridgeFetch|pollLoop/);
@@ -54,6 +69,212 @@ test("extension uses paired WebSocket transport without native messaging", async
   );
   assert.equal(manifest.permissions.includes("nativeMessaging"), false);
   assert.equal(Number(manifest.minimum_chrome_version) >= 116, true);
+});
+
+test("Stage Three extension gate serializes same-session and same-tab work", async () => {
+  const helpers = await stageThreeHelpers();
+  const gate = helpers.createResourceGate();
+  const active = new Set();
+  let overlap = false;
+  const run = (command, delay = 10) => {
+    const scope = helpers.classifyCommand(command);
+    return gate.run(scope, async () => {
+      for (const resource of scope.resources) {
+        if (active.has(resource)) overlap = true;
+        active.add(resource);
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
+      for (const resource of scope.resources) active.delete(resource);
+    });
+  };
+  await Promise.all([
+    run({ type: "getText", payload: { sessionId: "a", tabId: 1 } }),
+    run({ type: "navigate", payload: { sessionId: "a", tabId: 2 } }),
+    run({ type: "getText", payload: { sessionId: "b", tabId: 1 } })
+  ]);
+  assert.equal(overlap, false);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(gate.metrics())),
+    { active: 0, queued: 0, globalActive: false, resources: 0 }
+  );
+});
+
+test("Stage Three extension gate makes Clean QA and ambiguous correlations global", async () => {
+  const helpers = await stageThreeHelpers();
+  assert.equal(helpers.classifyCommand({
+    type: "nameSession",
+    payload: { sessionId: "clean", cleanQa: true }
+  }).global, true);
+  assert.equal(helpers.classifyCommand({
+    type: "downloadClick",
+    payload: { sessionId: "a", tabId: 1 }
+  }).global, true);
+  assert.equal(helpers.classifyCommand({
+    type: "cdp",
+    payload: { sessionId: "a", tabId: 1, method: "Unknown.enable" }
+  }).global, true);
+
+  const gate = helpers.createResourceGate();
+  let active = 0;
+  let maxActive = 0;
+  const clean = (sessionId) => gate.run(helpers.classifyCommand({
+    type: "nameSession",
+    payload: { sessionId, cleanQa: true }
+  }), async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    active -= 1;
+  });
+  await Promise.all([clean("clean-a"), clean("clean-b")]);
+  assert.equal(maxActive, 1);
+});
+
+test("four download correlations and shared CDP tab resources never overlap", async () => {
+  const helpers = await stageThreeHelpers();
+  const gate = helpers.createResourceGate();
+  let activeDownloads = 0;
+  let maxDownloads = 0;
+  await Promise.all(Array.from({ length: 4 }, (_, index) =>
+    gate.run(helpers.classifyCommand({
+      type: "downloadClick",
+      payload: {
+        sessionId: `session-${index}`,
+        tabId: index + 1,
+        url: "https://same.example/file"
+      }
+    }), async () => {
+      activeDownloads += 1;
+      maxDownloads = Math.max(maxDownloads, activeDownloads);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 3));
+      activeDownloads -= 1;
+    })
+  ));
+  assert.equal(maxDownloads, 1);
+
+  const cdpGate = helpers.createResourceGate();
+  let cdpActive = 0;
+  let cdpOverlap = false;
+  const cdp = (type) => cdpGate.run(helpers.classifyCommand({
+    type,
+    payload: { sessionId: "session-a", tabId: 42 }
+  }), async () => {
+    cdpActive += 1;
+    if (cdpActive > 1) cdpOverlap = true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 3));
+    cdpActive -= 1;
+  });
+  await Promise.all([cdp("eventsStart"), cdp("eventsStop")]);
+  assert.equal(cdpOverlap, false);
+});
+
+test("CDP claims are idempotent only for the exact operation", async () => {
+  const helpers = await stageThreeHelpers();
+  for (const resource of ["events", "interception", "tracing"]) {
+    const owners = new Map();
+    const first = { operationId: "operation-a", sessionId: "session-a" };
+    const second = { operationId: "operation-b", sessionId: "session-a" };
+    assert.equal(helpers.claimResource(owners, resource, first).created, true);
+    assert.equal(helpers.claimResource(owners, resource, first).created, false);
+    assert.throws(
+      () => helpers.claimResource(owners, resource, second),
+      (error) => error?.name === "CdpResourceBusy"
+    );
+    assert.throws(
+      () => helpers.releaseResource(owners, resource, second),
+      (error) => error?.name === "CdpResourceBusy"
+    );
+    assert.equal(owners.get(resource).operationId, first.operationId);
+    assert.equal(helpers.releaseResource(owners, resource, first), true);
+    assert.equal(owners.has(resource), false);
+  }
+});
+
+test("trace stopping survives timeout or cancel until late completion", async () => {
+  const helpers = await stageThreeHelpers();
+  const owners = new Map();
+  const start = { operationId: "trace-start", sessionId: "session-a" };
+  const stop = { operationId: "trace-stop", sessionId: "session-a" };
+  helpers.claimResource(owners, "tracing", start);
+  const stopping = helpers.transitionResource(
+    owners,
+    "tracing",
+    stop,
+    "stopping"
+  );
+  assert.equal(stopping.previousState, "active");
+  assert.equal(owners.get("tracing").state, "stopping");
+  assert.throws(
+    () => helpers.claimResource(
+      owners,
+      "tracing",
+      { operationId: "premature-start", sessionId: "session-a" }
+    ),
+    (error) => error?.name === "CdpResourceBusy"
+  );
+  const retry = helpers.transitionResource(
+    owners,
+    "tracing",
+    { operationId: "trace-stop-retry", sessionId: "session-a" },
+    "stopping"
+  );
+  assert.equal(retry.previousState, "stopping");
+  assert.equal(helpers.completeStoppingResource(owners, "tracing"), true);
+  assert.equal(owners.has("tracing"), false);
+  assert.equal(helpers.claimResource(
+    owners,
+    "tracing",
+    { operationId: "next-start", sessionId: "session-a" }
+  ).created, true);
+});
+
+test("session cleanup preserves foreign CDP resources", async () => {
+  const helpers = await stageThreeHelpers();
+  const resources = [
+    {
+      tabId: 1,
+      attachmentSessionId: "session-a",
+      tabSessionId: "session-a",
+      owners: [{ sessionId: "session-a", operationId: "a-events" }]
+    },
+    {
+      tabId: 2,
+      attachmentSessionId: "session-b",
+      tabSessionId: "session-b",
+      owners: [{ sessionId: "session-b", operationId: "b-trace" }]
+    },
+    {
+      tabId: 3,
+      attachmentSessionId: "session-a",
+      tabSessionId: "session-a",
+      owners: [
+        { sessionId: "session-a", operationId: "a-events" },
+        { sessionId: "session-b", operationId: "b-screencast" }
+      ]
+    }
+  ];
+  const decisions = resources.map((resource) =>
+    helpers.sessionDetachDecision(resource, "session-a"));
+  assert.deepEqual(
+    decisions.map((value) => JSON.parse(JSON.stringify(value))),
+    [
+      { belongs: true, detach: true, foreignOwners: 0 },
+      { belongs: false, detach: false, foreignOwners: 1 },
+      { belongs: true, detach: false, foreignOwners: 1 }
+    ]
+  );
+});
+
+test("legacy and unknown CDP aliases remain global exclusive", async () => {
+  const helpers = await stageThreeHelpers();
+  for (const type of ["executeCdp", "futureUnknownCommand"]) {
+    const scope = helpers.classifyCommand({
+      type,
+      payload: { sessionId: "session-a", tabId: 42 }
+    });
+    assert.equal(scope.global, true, type);
+    assert.equal(scope.sessionKey, "session-a", type);
+  }
 });
 
 test("site-created child tabs inherit their opener session", async () => {
@@ -111,6 +332,16 @@ test("managed QA is ownership-scoped and Clean QA is fail-closed", async () => {
   assert.match(background, /inventoryVerified/);
   assert.match(background, /previousStateRestored/);
   assert.match(background, /preservedExistingAttachment/);
+  assert.match(background, /resourceOwners: new Map\(\)/);
+  assert.match(background, /claimCdpResource/);
+  assert.match(background, /releaseCdpResource/);
+  assert.match(background, /assertExpertCdpResourceSafe/);
+  assert.match(background, /CdpResourceInUse/);
+  assert.match(background, /cdpDetachIfIdle/);
+  assert.match(background, /cdpDetachSession/);
+  assert.match(background, /sessionDetachDecision/);
+  assert.doesNotMatch(background, /cdpDetachAll/);
+  assert.match(background, /preservedResourceOwners/);
   assert.match(background, /cdpEventBrokers\.delete/);
   assert.match(background, /EMULATION_STATES_KEY/);
   assert.match(background, /setEmulationState/);

@@ -18,6 +18,7 @@ const OPERATIONS = new Set(`
 
 const NUMERIC_FIELDS = [
   "brokerActiveRequests", "brokerQueueDepth", "bridgeQueueWaitMs",
+  "schedulerActiveCount", "schedulerConfiguredMax", "schedulerMaxObservedActive",
   "bridgeRoundTripMs", "extensionExecutionMs", "outboxCommitMs",
   "transferResidualMs", "brokerTotalMs", "clientTotalMs", "resultBytes",
   "brokerRssBytes"
