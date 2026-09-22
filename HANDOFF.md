@@ -2,9 +2,9 @@
 
 ## Current Goal
 
-Stage Three controlled concurrency is complete in the isolated
-`perf/tabward-stage3-20260921` worktree. Preserve Stage Two reliability and do
-not begin Canvas work without explicit approval.
+Stage Three controlled concurrency is installed and live-validated from the
+isolated `perf/tabward-stage3-20260921` worktree. Preserve Stage Two reliability
+and do not begin Canvas work without explicit approval.
 
 ## Current State
 
@@ -15,17 +15,18 @@ operating-system picker. Hidden `input[type=file]` elements are supported.
 The release also retains forms, probes, composite frontend QA, iframe/scoped
 screenshot support, history navigation, loopback-only managed evaluate,
 fail-closed Clean QA, and persistent English/Russian popup selection.
+The extension now uses the user-selected Lighthouse icon from a committed SVG
+source and reproducibly generates 16/32/48/128/1024 px PNG assets.
 
 Final `npm run verify` and release audit pass. Frontend QA passes 12/12,
 including restoration of pre-existing emulation and events; Clean QA passes
 5/5; replacement endurance passes 50/50 without leaked tabs; managed live smoke
 passes with isolated workspace and existing-tab access denied. The hidden-file
 upload gate passes live. The unpacked 0.3.1 extension is rebuilt, paired, and
-connected. The global MCP and local Factory skill cache are installed at 0.3.1.
-The canonical source is synchronized into the desktop checkout and private
-GitHub `main`; it matches the locally verified marketplace implementation.
-Sanitized reports remain under `.factory/temp/` and are not committed.
-
+connected in the user's Chrome. The global MCP is installed from Stage Three,
+and the local Factory skill cache remains at 0.3.1. The Stage Three branch
+remains local and is not merged or pushed. Sanitized reports remain under
+`.factory/temp/` and are not committed.
 The Factory skill now performs a silent post-task review after real TabWard
 use. It proposes at most one evidence-backed, high-leverage TabWard improvement
 and stays silent when the task revealed no strong reusable opportunity.
@@ -69,24 +70,28 @@ repeated post-review runs confirmed maximum `2`: median p95 total was about
 `93.19/371.37 ms`. That is about a 1.7% one-client regression and a 49.7%
 four-client improvement. Maximum `4` remains benchmark/test-only. No live
 Chrome, global MCP install, standard ports, pairing/config changes, push, or
-publish was used.
+publish was used during isolated development.
+
+The installed Stage Three build now passes live managed smoke, frontend QA
+12/12, Clean QA 5/5, four-client/four-session isolation with production
+concurrency `2`, and the 50-cycle replacement gate 50/50 with no leaked tabs.
+Health reports the paired extension connected with zero active sessions.
 
 ## Last 7 Tasks
 
-1. 2026-08-24: Added evidence-gated post-task TabWard improvement proposals to the Factory skill.
-2. 2026-09-14: Added `tabward_upload`, hidden file-input support, local path validation, and passed live frontend QA 12/12.
-3. 2026-09-16: Synchronized the verified 0.3.1 source into the canonical checkout and private GitHub repository.
-4. 2026-09-21: Implemented isolated Stage One telemetry, benchmark, QA artifact, unchecked-wait, and download-ownership changes with synthetic regressions.
-5. 2026-09-21: Implemented Stage Two deadlines, cancellation/outcomes, operation ledger/outbox recovery, serialized state lifecycle, byte budgets, and frame-safe foundations.
-6. 2026-09-21: Resolved Stage Two review and revalidation findings with deterministic ownership, interleaving, budget, and completeness regressions.
-7. 2026-09-21: Implemented and review-hardened Stage Three bounded fair concurrency, resource isolation, close draining, deterministic faults/endurance, and the 1/2/4 benchmark matrix.
+1. 2026-09-14: Added `tabward_upload`, hidden file-input support, local path validation, and passed live frontend QA 12/12.
+2. 2026-09-16: Synchronized the verified 0.3.1 source into the canonical checkout and private GitHub repository.
+3. 2026-09-21: Implemented isolated Stage One telemetry, benchmark, QA artifact, unchecked-wait, and download-ownership changes with synthetic regressions.
+4. 2026-09-21: Implemented Stage Two deadlines, cancellation/outcomes, operation ledger/outbox recovery, serialized state lifecycle, byte budgets, and frame-safe foundations.
+5. 2026-09-21: Resolved Stage Two review and revalidation findings with deterministic ownership, interleaving, budget, and completeness regressions.
+6. 2026-09-21: Implemented and review-hardened Stage Three bounded fair concurrency, resource isolation, close draining, deterministic faults/endurance, and the 1/2/4 benchmark matrix.
+7. 2026-09-22: Selected and installed the Lighthouse icon, installed Stage Three in Chrome, and passed smoke, Clean QA, four-session concurrency, and 50-cycle live gates.
 
 ## Next Step
 
-With explicit approval, run the live Chrome frontend QA, Clean QA,
-upload/download, multi-session concurrency, and cleanup/endurance gates in a
-TabWard-owned test profile before any installation or rollout. Canvas remains
-deferred.
+Continue the sanitized 20-task real-use gate before disabling any rollback
+browser integration. No immediate implementation task is pending. Canvas
+remains deferred.
 
 ## Risks / Do Not Forget
 
