@@ -145,15 +145,33 @@
 
 ## Composite QA clears caller-owned browser state
 
-- Symptom: running `tabward_qa` removes emulation, event capture, or an existing
-  CDP attachment configured before the QA call.
-- Cause: cleanup unconditionally reset all QA resources.
+- Symptom: running `tabward_qa` either reports a same-session CDP resource as
+  busy or removes emulation, event capture, or an existing CDP attachment
+  configured before the QA call.
+- Cause: composite QA initially treated a resource owned by an earlier
+  operation in the same session as foreign, and cleanup unconditionally reset
+  QA resources.
 - Working method: persist emulation metadata in `chrome.storage.session`,
-  snapshot event/CDP ownership, and restore only the state acquired or replaced
-  by the composite command.
+  temporarily suspend same-session ownership, snapshot event/CDP ownership,
+  and restore only the state acquired or replaced by the composite command.
 - Validation: `npm run gate:qa` confirms that pre-existing viewport and console
   capture still work after composite QA.
 - Applies to: `tabward_qa` cleanup and MV3 service-worker restarts.
+
+## Popup approval expires before a person can act
+
+- Symptom: an upload or sensitive CDP command becomes `OutcomeUnknown` before
+  the user can approve or deny the popup request.
+- Cause: the public MCP command deadline was shorter than the human approval
+  window.
+- Working method: keep approval requests active for five minutes, give
+  `tabward_upload` and `tabward_cdp` six-minute default deadlines, show the
+  active request count on the extension icon, and synchronize decisions across
+  all open popup views.
+- Validation: live CDP deny and approve gates return deterministic outcomes;
+  the icon shows `1` while pending and all popup blocks disappear after one
+  decision.
+- Applies to: human-approved uploads and browser-global CDP.
 
 ## Chrome Reload keeps showing the old extension version
 
@@ -164,8 +182,9 @@
 - Working method: remove only the old TabWard extension card, select
   **Load unpacked**, and choose the verified `dist/extension` directory. Pair
   the new extension again if Chrome assigns a new extension ID.
-- Validation: Chrome shows version `0.3.1`, health reports extension version
-  `0.3.1`, and `npm run gate:qa` passes 12/12 including hidden file upload.
+- Historical validation for the older build: Chrome showed version `0.3.1`,
+  health reported extension version `0.3.1`, and `npm run gate:qa` passed
+  12/12 including hidden file upload.
 - Applies to: switching local unpacked TabWard builds.
 
 ## Hidden file input cannot receive an upload
@@ -181,3 +200,16 @@
 - Validation: the frontend QA fixture uses a hidden file input and confirms the
   attached filename; the full gate passes 12/12.
 - Applies to: court portals and other sites with custom attachment controls.
+
+## Security-fixed transitive versions do not enter the lockfile
+
+- Symptom: root `overrides` are present, but `npm audit --omit=dev` still
+  reports the previous `fast-uri`, `hono`, or `qs` version.
+- Cause: a normal `npm install` can leave already-resolved transitive entries
+  unchanged in the existing lockfile.
+- Working method: run
+  `npm update fast-uri hono qs --ignore-scripts`, then verify `npm ls` and
+  `npm audit --omit=dev`.
+- Validation: the lockfile resolves `fast-uri` 3.1.8, `hono` 4.13.8, and
+  `qs` 6.16.0 with zero production vulnerabilities.
+- Applies to: 0.4.0 dependency remediation.

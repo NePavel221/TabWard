@@ -10,6 +10,25 @@ const translations = {
     allowExistingHelp: "Off by default. Applies only to full-profile sessions.",
     separateWindow: "Use a separate Chrome window",
     separateWindowHelp: "When off, new tabs join a TabWard group in the current window.",
+    trustedUploadSites: "Trusted upload sites",
+    trustedUploadSitesPlaceholder: "uploads.example.com\nfiles.example.org",
+    trustedUploadSitesHelp: "One exact host per line. Wildcards are rejected. HTTPS only.",
+    saveTrustedUploadSites: "Save trusted sites",
+    approvalRequired: "Approval required",
+    approvalCategory: "Category",
+    approvalMethod: "Method",
+    approvalSession: "Session",
+    approvalOrigin: "Origin",
+    approvalFiles: "Files",
+    approvalExpires: "Expires",
+    approveOnce: "Approve once",
+    trustExactHost: "Trust this exact host",
+    deny: "Deny",
+    approvalExpired: "Expired. This notification remains visible.",
+    approvalApproved: "Approved once. This notification remains visible.",
+    approvalDenied: "Denied. This notification remains visible.",
+    approvalCancelled: "No longer active. This notification remains visible.",
+    notApplicable: "Not applicable",
     checking: "Checking...",
     connected: "Connected",
     pairingRequired: "Pairing required",
@@ -32,7 +51,8 @@ const translations = {
     refresh: "Refresh",
     invalidCode: "Enter the six-digit pairing code.",
     pairingFailed: "Pairing failed.",
-    pairingApproved: "Pairing approved. Reconnecting..."
+    pairingApproved: "Pairing approved. Reconnecting...",
+    approvalFailed: "Approval decision failed."
   },
   ru: {
     localMcp: "Локальный MCP",
@@ -44,6 +64,25 @@ const translations = {
     allowExistingHelp: "По умолчанию выключено. Только для full-profile сессий.",
     separateWindow: "Использовать отдельное окно Chrome",
     separateWindowHelp: "Если выключено, новые вкладки добавляются в группу TabWard в текущем окне.",
+    trustedUploadSites: "Доверенные сайты загрузки",
+    trustedUploadSitesPlaceholder: "uploads.example.com\nfiles.example.org",
+    trustedUploadSitesHelp: "Один точный хост на строку. Шаблоны запрещены. Только HTTPS.",
+    saveTrustedUploadSites: "Сохранить доверенные сайты",
+    approvalRequired: "Требуется подтверждение",
+    approvalCategory: "Категория",
+    approvalMethod: "Метод",
+    approvalSession: "Сессия",
+    approvalOrigin: "Источник",
+    approvalFiles: "Файлы",
+    approvalExpires: "Истекает",
+    approveOnce: "Разрешить один раз",
+    trustExactHost: "Доверять этому точному хосту",
+    deny: "Запретить",
+    approvalExpired: "Срок истёк. Уведомление осталось в popup.",
+    approvalApproved: "Разрешено один раз. Уведомление осталось в popup.",
+    approvalDenied: "Запрещено. Уведомление осталось в popup.",
+    approvalCancelled: "Запрос больше не активен. Уведомление осталось в popup.",
+    notApplicable: "Не применяется",
     checking: "Проверка...",
     connected: "Подключено",
     pairingRequired: "Требуется сопряжение",
@@ -66,7 +105,8 @@ const translations = {
     refresh: "Обновить",
     invalidCode: "Введите шестизначный код сопряжения.",
     pairingFailed: "Сопряжение не выполнено.",
-    pairingApproved: "Сопряжение разрешено. Повторное подключение..."
+    pairingApproved: "Сопряжение разрешено. Повторное подключение...",
+    approvalFailed: "Не удалось сохранить решение."
   }
 };
 
@@ -81,11 +121,25 @@ const elements = {
   language: document.getElementById("language"),
   allowExistingTabs: document.getElementById("allow-existing-tabs"),
   separateWindow: document.getElementById("separate-window"),
-  settingsNotice: document.getElementById("settings-notice")
+  trustedUploadSites: document.getElementById("trusted-upload-sites"),
+  saveTrustedUploadSites: document.getElementById("save-trusted-upload-sites"),
+  settingsNotice: document.getElementById("settings-notice"),
+  approval: document.getElementById("approval"),
+  approvalRisk: document.getElementById("approval-risk"),
+  approvalCategory: document.getElementById("approval-category"),
+  approvalMethod: document.getElementById("approval-method"),
+  approvalSession: document.getElementById("approval-session"),
+  approvalOrigin: document.getElementById("approval-origin"),
+  approvalFiles: document.getElementById("approval-files"),
+  approvalExpires: document.getElementById("approval-expires"),
+  approvalApprove: document.getElementById("approval-approve"),
+  approvalTrust: document.getElementById("approval-trust"),
+  approvalDeny: document.getElementById("approval-deny")
 };
 
 let language = "en";
 let latestStatus = null;
+let currentApproval = null;
 
 function chromeLanguage() {
   const value = String(chrome.i18n.getUILanguage?.() || navigator.language || "en");
@@ -111,6 +165,7 @@ function applyLanguage(nextLanguage) {
     element.setAttribute("aria-label", t(element.dataset.i18nAriaLabel));
   }
   render(latestStatus);
+  renderApproval(currentApproval);
 }
 
 async function initializeLanguage() {
@@ -155,6 +210,46 @@ function render(status) {
   }
 }
 
+function renderApproval(approval) {
+  currentApproval = approval || null;
+  elements.approval.hidden = !currentApproval;
+  if (!currentApproval) return;
+  const statusMessages = {
+    expired: "approvalExpired",
+    approved: "approvalApproved",
+    denied: "approvalDenied",
+    cancelled: "approvalCancelled"
+  };
+  const statusMessage = statusMessages[currentApproval.status]
+    ? t(statusMessages[currentApproval.status])
+    : "";
+  elements.approvalRisk.textContent = [
+    currentApproval.riskText || "",
+    statusMessage
+  ].filter(Boolean).join(" ");
+  elements.approvalCategory.textContent = currentApproval.riskCategory || "";
+  elements.approvalMethod.textContent =
+    currentApproval.method || t("notApplicable");
+  elements.approvalSession.textContent = currentApproval.sessionLabel || "";
+  elements.approvalOrigin.textContent = currentApproval.origin || currentApproval.host || "";
+  elements.approvalFiles.textContent = currentApproval.basenames?.length
+    ? currentApproval.basenames.join(", ")
+    : t("notApplicable");
+  elements.approvalExpires.textContent = new Date(currentApproval.expiresAt).toLocaleTimeString();
+  elements.approvalTrust.hidden =
+    currentApproval.actionable !== true
+    || currentApproval.kind !== "upload"
+    || !currentApproval.host;
+  elements.approvalApprove.disabled = currentApproval.actionable !== true;
+  elements.approvalDeny.disabled = currentApproval.actionable !== true;
+}
+
+async function refreshApprovals() {
+  const result = await chrome.runtime.sendMessage({ type: "TABWARD_APPROVALS_GET" });
+  if (result?.ok !== true) return;
+  renderApproval(result.approvals?.find((approval) => approval.actionable === true) || null);
+}
+
 function localizedError(error, fallbackKey) {
   const message = String(error?.message || "");
   if (/six-digit pairing code/i.test(message)) return t("invalidCode");
@@ -167,18 +262,25 @@ function localizedError(error, fallbackKey) {
 async function refresh() {
   elements.refresh.disabled = true;
   try {
-    const [status, settingsResult] = await Promise.all([
+    const [status, settingsResult, approvalsResult] = await Promise.all([
       chrome.runtime.sendMessage({ type: "TABWARD_STATUS" }),
-      chrome.runtime.sendMessage({ type: "TABWARD_SETTINGS_GET" })
+      chrome.runtime.sendMessage({ type: "TABWARD_SETTINGS_GET" }),
+      chrome.runtime.sendMessage({ type: "TABWARD_APPROVALS_GET" })
     ]);
     render(status);
     if (settingsResult?.ok !== true) {
       throw new Error(settingsResult?.error?.message || t("readSettingsError"));
     }
     elements.allowExistingTabs.checked =
-      settingsResult.settings?.allowExistingTabs === true;
+      settingsResult.settings?.existingTabAccess === true;
     elements.separateWindow.checked =
       settingsResult.settings?.openInSeparateWindow === true;
+    elements.trustedUploadSites.value =
+      (settingsResult.settings?.trustedUploadSites || []).join("\n");
+    renderApproval(
+      approvalsResult?.approvals?.find((approval) => approval.actionable === true)
+      || null
+    );
   } catch (error) {
     setStatus(elements.bridge, t("unavailable"), "bad");
     setStatus(elements.extension, t("loaded"), "ok");
@@ -191,6 +293,8 @@ async function refresh() {
 async function saveSettings(patch) {
   elements.allowExistingTabs.disabled = true;
   elements.separateWindow.disabled = true;
+  elements.trustedUploadSites.disabled = true;
+  elements.saveTrustedUploadSites.disabled = true;
   elements.settingsNotice.textContent = t("saving");
   try {
     const result = await chrome.runtime.sendMessage({
@@ -201,9 +305,11 @@ async function saveSettings(patch) {
       throw new Error(result?.error?.message || t("saveSettingsError"));
     }
     elements.allowExistingTabs.checked =
-      result.settings?.allowExistingTabs === true;
+      result.settings?.existingTabAccess === true;
     elements.separateWindow.checked =
       result.settings?.openInSeparateWindow === true;
+    elements.trustedUploadSites.value =
+      (result.settings?.trustedUploadSites || []).join("\n");
     const released = result.releasedAdoptedTabIds?.length || 0;
     elements.settingsNotice.textContent = released > 0
       ? t("releasedTabs", released)
@@ -214,6 +320,8 @@ async function saveSettings(patch) {
   } finally {
     elements.allowExistingTabs.disabled = false;
     elements.separateWindow.disabled = false;
+    elements.trustedUploadSites.disabled = false;
+    elements.saveTrustedUploadSites.disabled = false;
   }
 }
 
@@ -224,11 +332,64 @@ elements.language.addEventListener("change", async () => {
 });
 
 elements.allowExistingTabs.addEventListener("change", () => {
-  saveSettings({ allowExistingTabs: elements.allowExistingTabs.checked });
+  saveSettings({ existingTabAccess: elements.allowExistingTabs.checked });
 });
 
 elements.separateWindow.addEventListener("change", () => {
   saveSettings({ openInSeparateWindow: elements.separateWindow.checked });
+});
+
+elements.saveTrustedUploadSites.addEventListener("click", () => {
+  const trustedUploadSites = elements.trustedUploadSites.value
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  saveSettings({ trustedUploadSites });
+});
+
+async function decideApproval(decision) {
+  if (!currentApproval) return;
+  for (const button of [
+    elements.approvalApprove,
+    elements.approvalTrust,
+    elements.approvalDeny
+  ]) {
+    button.disabled = true;
+  }
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: "TABWARD_APPROVAL_DECIDE",
+      approvalId: currentApproval.approvalId,
+      decision
+    });
+    if (result?.ok !== true) {
+      throw new Error(result?.error?.message || t("approvalFailed"));
+    }
+    await refreshApprovals();
+  } catch (error) {
+    elements.settingsNotice.textContent = localizedError(error, "approvalFailed");
+  } finally {
+    for (const button of [
+      elements.approvalApprove,
+      elements.approvalTrust,
+      elements.approvalDeny
+    ]) {
+      button.disabled = false;
+    }
+  }
+}
+
+elements.approvalApprove.addEventListener("click", () => decideApproval("approve_once"));
+elements.approvalTrust.addEventListener("click", () => decideApproval("trust_host"));
+elements.approvalDeny.addEventListener("click", () => decideApproval("deny"));
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (
+    areaName === "session"
+    && Object.prototype.hasOwnProperty.call(changes, PENDING_APPROVALS_KEY)
+  ) {
+    refreshApprovals();
+  }
 });
 
 elements.pair.addEventListener("click", async () => {
@@ -263,3 +424,7 @@ initializeLanguage()
     applyLanguage(chromeLanguage());
     elements.details.textContent = localizedError(error, "readStatusError");
   });
+
+setInterval(() => {
+  refreshApprovals().catch(() => {});
+}, 500);

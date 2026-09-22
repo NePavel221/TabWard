@@ -4,6 +4,10 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { WebSocket } from "ws";
+import {
+  authenticateSocket,
+  pairSocket
+} from "../packages/mcp/test/handshake.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const brokerEntry = resolve(root, "packages", "mcp", "dist", "broker-server.js");
@@ -42,19 +46,6 @@ function connectExtension(port) {
       origin: `chrome-extension://${extensionId}`
     });
     socket.once("open", () => resolveSocket(socket));
-    socket.once("error", reject);
-  });
-}
-
-function nextMessage(socket) {
-  return new Promise((resolveMessage, reject) => {
-    socket.once("message", (raw) => {
-      try {
-        resolveMessage(JSON.parse(raw.toString()));
-      } catch (error) {
-        reject(error);
-      }
-    });
     socket.once("error", reject);
   });
 }
@@ -121,30 +112,14 @@ async function startFixture(maxConcurrency) {
     };
     const health = await fetch(`${base}/health`, { headers }).then((value) => value.json());
     socket = await connectExtension(health.extension.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId,
-      extensionVersion: "0.3.1"
-    }));
-    assert.equal((await nextMessage(socket)).kind, "pairing_required");
-    const pairing = await fetch(`${base}/health`, { headers }).then((value) => value.json());
-    socket.send(JSON.stringify({
-      kind: "pairing_approve",
-      protocolVersion: 2,
-      code: pairing.extension.pairingCode
-    }));
-    const approved = await nextMessage(socket);
-    socket.terminate();
+    const token = await pairSocket(socket, async () => {
+      const pairing = await fetch(`${base}/health`, { headers }).then((value) => value.json());
+      return pairing.extension.pairingCode;
+    });
+    socket.close(1000);
+    await new Promise((resolveClose) => socket.once("close", resolveClose));
     socket = await connectExtension(health.extension.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId,
-      extensionVersion: "0.3.1",
-      token: approved.token
-    }));
-    assert.equal((await nextMessage(socket)).kind, "ready");
+    await authenticateSocket(socket, token);
     socket.on("message", async (raw) => {
       const message = JSON.parse(raw.toString());
       if (message.kind !== "command") return;
@@ -153,7 +128,7 @@ async function startFixture(maxConcurrency) {
       socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         operationId: message.operationId,
         telemetry: {

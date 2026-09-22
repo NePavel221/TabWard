@@ -8,6 +8,13 @@ import test from "node:test";
 import { WebSocket } from "ws";
 import { BrokerClient, operationRequest } from "../dist/broker-client.js";
 import { webSocketSendFailure } from "../dist/operation.js";
+import {
+  EXTENSION_ORIGIN,
+  PROTOCOL_VERSION,
+  authenticateSocket,
+  nextSocketMessage,
+  pairSocket
+} from "./handshake.mjs";
 
 async function waitForRuntime(stateDir) {
   const path = resolve(stateDir, "runtime.json");
@@ -25,22 +32,9 @@ async function waitForRuntime(stateDir) {
 function connectExtension(port) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(`ws://127.0.0.1:${port}`, {
-      origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+      origin: EXTENSION_ORIGIN
     });
     socket.once("open", () => resolve(socket));
-    socket.once("error", reject);
-  });
-}
-
-function nextSocketMessage(socket) {
-  return new Promise((resolveMessage, reject) => {
-    socket.once("message", (raw) => {
-      try {
-        resolveMessage(JSON.parse(raw.toString()));
-      } catch (error) {
-        reject(error);
-      }
-    });
     socket.once("error", reject);
   });
 }
@@ -49,6 +43,27 @@ function fingerprint(command, payload) {
   return createHash("sha256")
     .update(JSON.stringify({ command, payload }))
     .digest("hex");
+}
+
+const MANAGED_CAPABILITIES = [
+  "read", "action", "artifacts", "downloads", "emulation",
+  "evaluate_local", "events", "probes", "tracing", "uploads"
+];
+
+function sessionPayload(
+  sessionId = "session-a",
+  capabilities = MANAGED_CAPABILITIES,
+  mode = "managed"
+) {
+  return {
+    sessionId,
+    sessionName: sessionId,
+    sessionMode: mode,
+    sessionCapabilities: capabilities,
+    canAdoptExistingTabs: capabilities.includes("adopt_tabs"),
+    cleanQa: false,
+    sessionExpiresAt: Date.now() / 1000 + 300
+  };
 }
 
 async function startPairedBroker(stateDir, extraEnv = {}) {
@@ -72,33 +87,16 @@ async function startPairedBroker(stateDir, extraEnv = {}) {
   };
   const health = await fetch(`${base}/health`, { headers }).then((value) => value.json());
   let socket = await connectExtension(health.extension.port);
-  socket.send(JSON.stringify({
-    kind: "hello",
-    protocolVersion: 2,
-    extensionId: "abcdefghijklmnopabcdefghijklmnop",
-    extensionVersion: "0.3.1"
-  }));
-  assert.equal((await nextSocketMessage(socket)).kind, "pairing_required");
-  const pairingHealth = await fetch(`${base}/health`, { headers }).then((value) => value.json());
-  socket.send(JSON.stringify({
-    kind: "pairing_approve",
-    protocolVersion: 2,
-    code: pairingHealth.extension.pairingCode
-  }));
-  const approved = await nextSocketMessage(socket);
-  assert.equal(approved.kind, "pairing_approved");
-  socket.terminate();
+  const token = await pairSocket(socket, async () => {
+    const pairingHealth = await fetch(`${base}/health`, { headers }).then((value) => value.json());
+    return pairingHealth.extension.pairingCode;
+  });
+  socket.close(1000);
+  await new Promise((resolveClose) => socket.once("close", resolveClose));
   socket = await connectExtension(health.extension.port);
-  socket.send(JSON.stringify({
-    kind: "hello",
-    protocolVersion: 2,
-    extensionId: "abcdefghijklmnopabcdefghijklmnop",
-    extensionVersion: "0.3.1",
-    token: approved.token
-  }));
-  assert.equal((await nextSocketMessage(socket)).kind, "ready");
+  await authenticateSocket(socket, token);
   return {
-    base, child, headers, socket, token: approved.token,
+    base, child, headers, socket, token,
     close: async () => {
       socket.terminate();
       await fetch(`${base}/shutdown`, { method: "POST", headers }).catch(() => {});
@@ -149,11 +147,131 @@ test("broker authenticates health and rejects reused request content", { timeout
         payload: {}
       })
     });
-    assert.equal(conflict.status, 409);
+    assert.equal(conflict.status, 400);
     await fetch(`${base}/shutdown`, { method: "POST", headers });
   } finally {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
     if (child.exitCode === null) child.kill();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("direct broker rejects unknown commands and forged privileged capability context", { timeout: 20_000 }, async () => {
+  const stateDir = await mkdtemp(resolve(tmpdir(), "tabward-broker-policy-"));
+  let fixture;
+  try {
+    fixture = await startPairedBroker(stateDir);
+    let dispatches = 0;
+    fixture.socket.on("message", (raw) => {
+      if (JSON.parse(raw.toString()).kind === "command") dispatches += 1;
+    });
+    const unknown = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01",
+        command: "futureDangerousCommand",
+        payload: {}
+      })
+    });
+    assert.equal(unknown.status, 400);
+    const forged = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa02",
+        command: "cdp",
+        payload: {
+          sessionId: "session-a",
+          sessionName: "A",
+          sessionMode: "managed",
+          sessionCapabilities: ["cdp"],
+          canAdoptExistingTabs: false,
+          cleanQa: false,
+          sessionExpiresAt: Date.now() / 1000 + 60,
+          tabId: 1,
+          method: "Storage.getCookies",
+          params: {}
+        }
+      })
+    });
+    assert.equal(forged.status, 400);
+    const missingCapability = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa03",
+        command: "click",
+        payload: {
+          ...sessionPayload("session-a", ["read"]),
+          tabId: 1
+        }
+      })
+    });
+    assert.equal(missingCapability.status, 400);
+    const expired = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa04",
+        command: "click",
+        payload: {
+          ...sessionPayload(),
+          sessionExpiresAt: Date.now() / 1000 - 1,
+          tabId: 1
+        }
+      })
+    });
+    assert.equal(expired.status, 400);
+    const workflowReadBypass = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa05",
+        command: "workflow",
+        payload: {
+          ...sessionPayload("session-a", ["action"]),
+          tabId: 1,
+          steps: [{ type: "observe", payload: {} }]
+        }
+      })
+    });
+    assert.equal(workflowReadBypass.status, 400);
+    const formUploadBypass = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa06",
+        command: "form",
+        payload: {
+          ...sessionPayload("session-a", ["action"]),
+          tabId: 1,
+          fields: [{
+            action: "upload",
+            locator: { css: "input[type=file]" },
+            value: "C:\\temp\\secret.txt"
+          }]
+        }
+      })
+    });
+    assert.equal(formUploadBypass.status, 400);
+    const unknownWorkflowStep = await fetch(`${fixture.base}/command`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa07",
+        command: "workflow",
+        payload: {
+          ...sessionPayload(),
+          tabId: 1,
+          steps: [{ type: "futureRead", payload: {} }]
+        }
+      })
+    });
+    assert.equal(unknownWorkflowStep.status, 400);
+    assert.equal(dispatches, 0);
+  } finally {
+    await fixture?.close();
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -181,42 +299,24 @@ test("broker returns deterministic extension errors as 422", { timeout: 20_000 }
     };
     const health = await fetch(`${base}/health`, { headers }).then((value) => value.json());
     socket = await connectExtension(health.extension.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId: "abcdefghijklmnopabcdefghijklmnop",
-      extensionVersion: "0.3.0"
-    }));
-    const pairingRequired = await nextSocketMessage(socket);
-    assert.equal(pairingRequired.kind, "pairing_required");
-    const pairingHealth = await fetch(`${base}/health`, { headers }).then((value) => value.json());
-    socket.send(JSON.stringify({
-      kind: "pairing_approve",
-      protocolVersion: 2,
-      code: pairingHealth.extension.pairingCode
-    }));
-    const pairingApproved = await nextSocketMessage(socket);
-    assert.equal(pairingApproved.kind, "pairing_approved");
-    const paired = pairingApproved.token;
-    socket.terminate();
+    const paired = await pairSocket(socket, async () => {
+      const pairingHealth = await fetch(`${base}/health`, { headers }).then((value) => value.json());
+      return pairingHealth.extension.pairingCode;
+    });
+    socket.close(1000);
+    await new Promise((resolveClose) => socket.once("close", resolveClose));
     socket = await connectExtension(health.extension.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId: "abcdefghijklmnopabcdefghijklmnop",
-      extensionVersion: "0.3.0",
-      token: paired
-    }));
-    const ready = await nextSocketMessage(socket);
-    assert.equal(ready.kind, "ready");
+    await authenticateSocket(socket, paired);
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString());
       if (message.kind !== "command") return;
       socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: false,
+        operationId: message.operationId,
+        fingerprint: message.fingerprint,
         payload: { name: "OwnershipError", message: "tab is not owned" }
       }));
     });
@@ -226,7 +326,7 @@ test("broker returns deterministic extension errors as 422", { timeout: 20_000 }
       body: JSON.stringify({
         requestId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
         command: "closeTab",
-        payload: { tabId: 42 }
+        payload: { ...sessionPayload(), tabId: 42 }
       })
     });
     assert.equal(response.status, 422);
@@ -257,8 +357,10 @@ test("telemetry is absent by default when the operation does not opt in", { time
       fixture.socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
+        operationId: message.operationId,
+        fingerprint: message.fingerprint,
         payload: { ok: true }
       }));
     });
@@ -297,7 +399,7 @@ test("telemetry correlates broker, bridge, and extension without sensitive paylo
       fixture.socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         operationId,
         telemetry: {
@@ -318,6 +420,7 @@ test("telemetry correlates broker, bridge, and extension without sensitive paylo
         requestId: "dddddddd-dddd-dddd-dddd-dddddddddddd",
         command: "fill",
         payload: {
+          ...sessionPayload(),
           url: "https://secret.example/private",
           selector: "#password",
           value: "hunter2",
@@ -369,8 +472,10 @@ test("typed download OutcomeUnknown reaches the caller once without automatic re
       fixture.socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: false,
+        operationId: message.operationId,
+        fingerprint: message.fingerprint,
         payload: {
           name: "OutcomeUnknown",
           message: "Download click was accepted but no result was confirmed",
@@ -387,7 +492,10 @@ test("typed download OutcomeUnknown reaches the caller once without automatic re
     const client = new BrokerClient();
     await client.start();
     await assert.rejects(
-      client.send("downloadClick", { sessionId: "session-a", tabId: 1 }, 1_000),
+      client.send("downloadClick", {
+        ...sessionPayload("session-a", ["downloads"]),
+        tabId: 1
+      }, 1_000),
       (error) => {
         assert.equal(error?.name, "OutcomeUnknown");
         assert.deepEqual(error?.details, {
@@ -435,7 +543,7 @@ for (const clients of [2, 4]) {
         fixture.socket.send(JSON.stringify({
           kind: "result",
           id: message.id,
-          protocolVersion: 2,
+          protocolVersion: 3,
           ok: true,
           operationId: message.operationId,
           telemetry: { extensionExecutionMs: 35, outboxCommitMs: 0 },
@@ -491,7 +599,7 @@ test("different sessions overlap at scheduler max 2 while each session stays FIF
       fixture.socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         operationId: message.operationId,
         fingerprint: message.fingerprint,
@@ -512,7 +620,7 @@ test("different sessions overlap at scheduler max 2 while each session stays FIF
         body: JSON.stringify({
           requestId: `${String(index + 40).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
           command: "ping",
-          payload: { sessionId, sequence },
+          payload: { ...sessionPayload(sessionId), sequence },
           operationId: `${String(index + 40).padStart(8, "0")}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`,
           telemetry: true
         })
@@ -548,7 +656,7 @@ test("queued expiry is not dispatched to the extension", { timeout: 20_000 }, as
         id: message.id,
         operationId: message.operationId,
         fingerprint: message.fingerprint,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         payload: { command: message.type }
       }));
@@ -574,7 +682,7 @@ test("queued expiry is not dispatched to the extension", { timeout: 20_000 }, as
         requestId: "10000000-0000-4000-8000-000000000012",
         operationId: secondOperationId,
         command: "click",
-        payload: { order: 2 },
+        payload: { ...sessionPayload(), order: 2 },
         deadlineAt: Date.now() + 30
       })
     });
@@ -607,7 +715,7 @@ test("queued cancellation is acknowledged and has zero browser effects", { timeo
         id: message.id,
         operationId: message.operationId,
         fingerprint: message.fingerprint,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         payload: { ok: true }
       }));
@@ -632,7 +740,7 @@ test("queued cancellation is acknowledged and has zero browser effects", { timeo
         requestId: "20000000-0000-4000-8000-000000000012",
         operationId: queuedOperationId,
         command: "click",
-        payload: {},
+        payload: sessionPayload(),
         deadlineAt: Date.now() + 2_000
       })
     });
@@ -671,7 +779,7 @@ test("active cancellation is acknowledged without claiming effect-free completio
       if (message.kind === "cancel") {
         fixture.socket.send(JSON.stringify({
           kind: "cancel_ack",
-          protocolVersion: 2,
+          protocolVersion: 3,
           operationId: message.operationId,
           state: "active"
         }));
@@ -680,7 +788,7 @@ test("active cancellation is acknowledged without claiming effect-free completio
           id: activeMessage.id,
           operationId: activeMessage.operationId,
           fingerprint: activeMessage.fingerprint,
-          protocolVersion: 2,
+          protocolVersion: 3,
           ok: false,
           payload: {
             name: "OutcomeUnknown",
@@ -702,7 +810,7 @@ test("active cancellation is acknowledged without claiming effect-free completio
         requestId: "21000000-0000-4000-8000-000000000012",
         operationId,
         command: "click",
-        payload: {},
+        payload: sessionPayload(),
         deadlineAt: Date.now() + 2_000
       })
     });
@@ -742,7 +850,7 @@ test("operation ledger joins duplicates and rejects fingerprint conflicts", { ti
         id: message.id,
         operationId: message.operationId,
         fingerprint: message.fingerprint,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         payload: { stable: true }
       }));
@@ -784,8 +892,8 @@ test("operation ledger joins duplicates and rejects fingerprint conflicts", { ti
         deadlineAt: Date.now() + 2_000
       })
     });
-    assert.equal(conflict.status, 409);
-    assert.equal((await conflict.json()).name, "OperationConflict");
+    assert.equal(conflict.status, 400);
+    assert.match((await conflict.json()).error, /session context/);
     assert.equal(dispatches, 1);
   } finally {
     await fixture?.close();
@@ -806,11 +914,12 @@ test("disconnect after effect is unknown and never blindly redispatched", { time
       fixture.socket.terminate();
     });
     const operationId = "40000000-0000-4000-8000-000000000001";
+    const payload = { ...sessionPayload(), tabId: 1 };
     const requestBody = (requestId) => JSON.stringify({
       requestId,
       operationId,
       command: "click",
-      payload: { tabId: 1 },
+      payload,
       deadlineAt: Date.now() + 2_000
     });
     const first = await fetch(`${fixture.base}/command`, {
@@ -853,14 +962,14 @@ test("concurrent disconnect makes both effects unknown without duplicate dispatc
         requestId: "40500000-0000-4000-8000-000000000011",
         operationId: "40500000-0000-4000-8000-000000000001",
         command: "click",
-        payload: { sessionId: "session-a", tabId: 1 },
+        payload: { ...sessionPayload("session-a"), tabId: 1 },
         deadlineAt
       },
       {
         requestId: "40500000-0000-4000-8000-000000000012",
         operationId: "40500000-0000-4000-8000-000000000002",
         command: "click",
-        payload: { sessionId: "session-b", tabId: 2 },
+        payload: { ...sessionPayload("session-b"), tabId: 2 },
         deadlineAt
       }
     ];
@@ -908,7 +1017,7 @@ test("a late confirmed result replaces a settled effect-unknown ledger entry", {
     });
     const operationId = "41000000-0000-4000-8000-000000000001";
     const command = "click";
-    const payload = { tabId: 7 };
+    const payload = { ...sessionPayload(), tabId: 7 };
     const operationFingerprint = fingerprint(command, payload);
     const body = (requestId) => JSON.stringify({
       requestId,
@@ -931,20 +1040,13 @@ test("a late confirmed result replaces a settled effect-unknown ledger entry", {
       headers: fixture.headers
     }).then((value) => value.json());
     replaySocket = await connectExtension(health.extension.port);
-    replaySocket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId: "abcdefghijklmnopabcdefghijklmnop",
-      extensionVersion: "0.3.1",
-      token: fixture.token
-    }));
-    assert.equal((await nextSocketMessage(replaySocket)).kind, "ready");
+    await authenticateSocket(replaySocket, fixture.token);
     replaySocket.send(JSON.stringify({
       kind: "result",
       id: dispatched.id,
       operationId,
       fingerprint: operationFingerprint,
-      protocolVersion: 2,
+      protocolVersion: 3,
       ok: true,
       payload: { recovered: "late" }
     }));
@@ -975,7 +1077,7 @@ test("confirmed-result cache applies byte backpressure before acknowledgement", 
       id: "42000000-0000-4000-8000-000000000001",
       operationId: "42000000-0000-4000-8000-000000000001",
       fingerprint: "a".repeat(64),
-      protocolVersion: 2,
+      protocolVersion: 3,
       ok: true,
       payload: { value: "x".repeat(5 * 1024 * 1024) }
     }));
@@ -1004,7 +1106,7 @@ test("acknowledged pending results release confirmation-cache capacity", { timeo
           id: message.id,
           operationId: message.operationId,
           fingerprint: message.fingerprint,
-          protocolVersion: 2,
+          protocolVersion: 3,
           ok: true,
           payload: { value: "x".repeat(3 * 1024 * 1024) }
         }));
@@ -1054,7 +1156,7 @@ test("concurrent completions are acknowledged without lost cache updates", { tim
           id: message.id,
           operationId: message.operationId,
           fingerprint: message.fingerprint,
-          protocolVersion: 2,
+          protocolVersion: 3,
           ok: true,
           payload: { index: message.payload.index, value: "x".repeat(512 * 1024) }
         }));
@@ -1070,7 +1172,7 @@ test("concurrent completions are acknowledged without lost cache updates", { tim
           requestId: `4260000${index}-0000-4000-8000-000000000011`,
           operationId: `4260000${index}-0000-4000-8000-000000000001`,
           command: "ping",
-          payload: { sessionId: `session-${index}`, index },
+          payload: { ...sessionPayload(`session-${index}`), index },
           deadlineAt: Date.now() + 5_000
         })
       })
@@ -1155,24 +1257,17 @@ test("broker restart recovers a replayed durable extension result", { timeout: 3
     };
     const health = await fetch(`${base}/health`, { headers }).then((value) => value.json());
     socket = await connectExtension(health.extension.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId: "abcdefghijklmnopabcdefghijklmnop",
-      extensionVersion: "0.3.1",
-      token
-    }));
-    assert.equal((await nextSocketMessage(socket)).kind, "ready");
+    await authenticateSocket(socket, token);
     const operationId = "50000000-0000-4000-8000-000000000001";
     const command = "click";
-    const payload = { tabId: 1 };
+    const payload = { ...sessionPayload(), tabId: 1 };
     const operationFingerprint = fingerprint(command, payload);
     socket.send(JSON.stringify({
       kind: "result",
       id: operationId,
       operationId,
       fingerprint: operationFingerprint,
-      protocolVersion: 2,
+      protocolVersion: 3,
       ok: true,
       payload: { recovered: "confirmed" }
     }));
@@ -1228,7 +1323,7 @@ test("broker byte budget fails before extension side effects", { timeout: 20_000
         requestId: "60000000-0000-4000-8000-000000000011",
         operationId: "60000000-0000-4000-8000-000000000001",
         command: "screenshot",
-        payload: { tabId: 1 },
+        payload: { ...sessionPayload("session-a", ["artifacts"]), tabId: 1 },
         deadlineAt: Date.now() + 2_000
       })
     });
@@ -1255,7 +1350,7 @@ test("multi-megabyte read results fit reservations when capacity is free", { tim
         id: message.id,
         operationId: message.operationId,
         fingerprint: message.fingerprint,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         payload: { command: message.type, value: "x".repeat(3 * 1024 * 1024) }
       }));
@@ -1268,7 +1363,7 @@ test("multi-megabyte read results fit reservations when capacity is free", { tim
           requestId: `6100000${index}-0000-4000-8000-000000000011`,
           operationId: `6100000${index}-0000-4000-8000-000000000001`,
           command,
-          payload: { tabId: 1 },
+          payload: { ...sessionPayload("session-a", ["events"]), tabId: 1 },
           deadlineAt: Date.now() + 5_000
         })
       });

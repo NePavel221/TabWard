@@ -45,6 +45,11 @@
       id: String(payload.sessionId),
       name: String(payload.sessionName || "TabWard MCP"),
       mode: String(payload.sessionMode || "managed"),
+      capabilities: Object.freeze(
+        Array.isArray(payload.sessionCapabilities)
+          ? payload.sessionCapabilities.map(String)
+          : []
+      ),
       cleanQa: payload.cleanQa === true,
       expiresAt: Number(payload.sessionExpiresAt || 0) || null
     }) : null;
@@ -54,6 +59,11 @@
       deadlineAt: Number(message.deadlineAt),
       session
     });
+  }
+
+  function sessionExpiresAtValid(value, nowSeconds = Date.now() / 1000) {
+    const expiresAt = Number(value);
+    return Number.isFinite(expiresAt) && expiresAt > Number(nowSeconds);
   }
 
   function boundedAppend(entries, value, limits) {
@@ -296,6 +306,7 @@
     outboxReservationBytes,
     operationSession,
     resultTransportSocket,
+    sessionExpiresAtValid,
     tabRemovalConfirmed,
     topViewportRect
   });

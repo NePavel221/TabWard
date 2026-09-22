@@ -6,6 +6,11 @@ import { resolve } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { WebSocket } from "ws";
+import {
+  EXTENSION_ORIGIN,
+  authenticateSocket,
+  pairSocket
+} from "./handshake.mjs";
 
 const expectedTools = [
   "tabward_health",
@@ -50,22 +55,9 @@ async function waitForProcessExit(pid, timeoutMs = 5_000) {
 function connectExtension(port) {
   return new Promise((resolveSocket, reject) => {
     const socket = new WebSocket(`ws://127.0.0.1:${port}`, {
-      origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+      origin: EXTENSION_ORIGIN
     });
     socket.once("open", () => resolveSocket(socket));
-    socket.once("error", reject);
-  });
-}
-
-function nextSocketMessage(socket) {
-  return new Promise((resolveMessage, reject) => {
-    socket.once("message", (raw) => {
-      try {
-        resolveMessage(JSON.parse(raw.toString()));
-      } catch (error) {
-        reject(error);
-      }
-    });
     socket.once("error", reject);
   });
 }
@@ -85,20 +77,25 @@ test("fresh stdio server lists tools and returns health", { timeout: 15_000 }, a
     },
     stderr: "pipe"
   });
-  const client = new Client({ name: "tabward-test", version: "0.3.0" });
+  const client = new Client({ name: "tabward-test", version: "0.4.0" });
   let brokerPid = null;
   try {
     await client.connect(transport);
     const listed = await client.listTools();
     const names = listed.tools.map((tool) => tool.name);
     assert.deepEqual([...names].sort(), [...expectedTools].sort());
+    for (const name of ["tabward_upload", "tabward_cdp"]) {
+      const timeoutSchema = listed.tools.find((tool) => tool.name === name)
+        ?.inputSchema?.properties?.timeout_ms;
+      assert.equal(timeoutSchema?.default, 360_000, name);
+    }
 
     const health = await client.callTool({
       name: "tabward_health",
       arguments: {}
     });
     assert.equal(health.isError, undefined);
-    assert.equal(health.structuredContent.serverVersion, "0.3.1");
+    assert.equal(health.structuredContent.serverVersion, "0.4.0");
     assert.equal(health.structuredContent.bridge.host, "127.0.0.1");
     assert.equal(Number.isInteger(health.structuredContent.bridge.port), true);
     assert.equal(health.structuredContent.bridge.port > 0, true);
@@ -129,7 +126,7 @@ test("two stdio clients share one persistent broker", { timeout: 20_000 }, async
     stderr: "pipe"
   }));
   const clients = transports.map((_, index) =>
-    new Client({ name: `tabward-multi-${index}`, version: "0.3.0" })
+    new Client({ name: `tabward-multi-${index}`, version: "0.4.0" })
   );
   let brokerPid = null;
   try {
@@ -166,7 +163,7 @@ test("health restarts a terminated broker", { timeout: 25_000 }, async () => {
     },
     stderr: "pipe"
   });
-  const client = new Client({ name: "tabward-recovery", version: "0.3.0" });
+  const client = new Client({ name: "tabward-recovery", version: "0.4.0" });
   let brokerPid = null;
   try {
     await client.connect(transport);
@@ -209,7 +206,7 @@ test("opt-in MCP telemetry is returned only as health metadata", { timeout: 20_0
     },
     stderr: "pipe"
   });
-  const client = new Client({ name: "tabward-telemetry-test", version: "0.3.1" });
+  const client = new Client({ name: "tabward-telemetry-test", version: "0.4.0" });
   let socket;
   let brokerPid = null;
   try {
@@ -217,30 +214,14 @@ test("opt-in MCP telemetry is returned only as health metadata", { timeout: 20_0
     let health = await client.callTool({ name: "tabward_health", arguments: {} });
     brokerPid = health.structuredContent.bridge.broker.pid;
     socket = await connectExtension(health.structuredContent.bridge.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId: "abcdefghijklmnopabcdefghijklmnop",
-      extensionVersion: "0.3.1"
-    }));
-    assert.equal((await nextSocketMessage(socket)).kind, "pairing_required");
-    health = await client.callTool({ name: "tabward_health", arguments: {} });
-    socket.send(JSON.stringify({
-      kind: "pairing_approve",
-      protocolVersion: 2,
-      code: health.structuredContent.bridge.pairingCode
-    }));
-    const approved = await nextSocketMessage(socket);
-    socket.terminate();
+    const token = await pairSocket(socket, async () => {
+      health = await client.callTool({ name: "tabward_health", arguments: {} });
+      return health.structuredContent.bridge.pairingCode;
+    });
+    socket.close(1000);
+    await new Promise((resolveClose) => socket.once("close", resolveClose));
     socket = await connectExtension(health.structuredContent.bridge.port);
-    socket.send(JSON.stringify({
-      kind: "hello",
-      protocolVersion: 2,
-      extensionId: "abcdefghijklmnopabcdefghijklmnop",
-      extensionVersion: "0.3.1",
-      token: approved.token
-    }));
-    assert.equal((await nextSocketMessage(socket)).kind, "ready");
+    await authenticateSocket(socket, token);
     health = await client.callTool({ name: "tabward_health", arguments: {} });
     assert.equal(health.structuredContent.bridge.state, "connected");
     socket.on("message", (raw) => {
@@ -249,7 +230,7 @@ test("opt-in MCP telemetry is returned only as health metadata", { timeout: 20_0
       socket.send(JSON.stringify({
         kind: "result",
         id: message.id,
-        protocolVersion: 2,
+        protocolVersion: 3,
         ok: true,
         operationId: message.operationId,
         telemetry: { extensionExecutionMs: 1, outboxCommitMs: 0 },

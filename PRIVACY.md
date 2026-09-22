@@ -23,8 +23,18 @@ temporarily retain the full command result, including page-derived result
 content requested by the caller. Both stores have byte/count ceilings. The
 extension deletes an outbox result only after the broker confirms bounded
 retention; the broker cache is process-memory only and is not telemetry or a
-cloud upload. Cookies and authentication data are not added unless they were
-explicitly part of the command result requested by the caller.
+cloud upload. Cookie values, authorization headers, API keys,
+access/refresh/ID tokens, and similar authentication material are structurally
+redacted before network events, HAR, response bodies, web-storage diagnostics,
+or ordinary CDP results are retained or returned. Sensitive raw
+browser-global CDP remains available only through an exact one-time popup
+approval.
 
-This document is a pre-release draft and must be reviewed before Chrome Web
-Store submission.
+Local-file uploads do not copy file contents into TabWard state. The MCP checks
+that each absolute path is a readable local file; UNC, device, and network
+paths are rejected. The extension shows only basenames in approval UI.
+Automatic upload is limited to trusted exact HTTPS hosts. Wildcard trust is
+rejected. Unknown hosts require an approve-once, trust-exact-host, or deny
+decision bound to the operation, tab, target frame, document, host, and files
+for at most five minutes. The target-frame origin/document is checked again
+immediately before browser dispatch.

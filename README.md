@@ -5,7 +5,7 @@ It combines a standard stdio MCP server with a paired Chrome extension, so an
 agent can use the websites where the user is already signed in without sending
 browser traffic through a TabWard cloud service.
 
-> **Status:** private `0.3.1` beta for Windows and Google Chrome. Expect setup
+> **Status:** private `0.4.0` beta for Windows and Google Chrome. Expect setup
 > changes before the first public release.
 
 ## Why TabWard
@@ -15,7 +15,9 @@ browser traffic through a TabWard cloud service.
 - Hides existing user tabs by default.
 - Lets the user choose a TabWard group in the current window or a separate
   Chrome window.
-- Pairs the local MCP and extension with a one-time six-digit code.
+- Pairs the local MCP and extension with a one-time six-digit code, then uses
+  mutual nonce/HMAC proof without sending the reusable token before broker
+  authentication.
 - Exposes 23 `tabward_*` tools, including forms, local file attachment, structured probes, composite
   frontend QA, screenshots, assertions, events, emulation, downloads, and CDP.
 - Offers fail-closed Clean QA in a separate incognito window when Chrome's
@@ -24,6 +26,8 @@ browser traffic through a TabWard cloud service.
 - Provides a persistent English/Russian extension interface; the initial
   language follows Chrome and manual selection is saved.
 - Keeps the MCP transport on `127.0.0.1`.
+- Redacts cookie, authorization, API-key, access-token, refresh-token, and
+  ID-token material before network, HAR, storage, or diagnostic retention.
 
 ## Components
 
@@ -67,7 +71,8 @@ Load the extension:
 3. Select **Load unpacked**.
 4. Select the repository's `dist\extension` directory.
 
-Register the MCP and install the Factory skill:
+Register the MCP and install or update the Factory skill from the private
+GitHub repository:
 
 ```powershell
 $TabWardServer = (Join-Path (npm root --global) '@tabward\mcp\dist\index.js').Replace('\', '/')
@@ -80,6 +85,9 @@ droid mcp list
 
 Call `tabward_health`. If pairing is required, enter the displayed six-digit
 code in the extension popup. Pairing is normally needed only once.
+For updates, pull the private repository, rerun `npm ci`, `npm run verify`,
+`npm run install:mcp`, rebuild `dist\extension`, reload that exact directory in
+Chrome, and reinstall/update the Factory plugin from the same repository.
 
 ## Other MCP clients
 
@@ -108,6 +116,10 @@ workflow in
   owned Clean QA window and fails closed if ownership cannot be proven.
 - **Existing tabs:** unavailable unless the user enables
   **Allow access to existing tabs** and starts a full-profile session.
+- **Sensitive CDP:** browser-global, cross-target, cookie/auth, and unknown CDP
+  commands require a fresh exact popup approval for that operation and
+  document; approvals expire after five minutes and navigation invalidates
+  them. The extension icon badge shows the number of active requests.
 - **Current window:** the default; each session receives its own TabWard group.
 - **Separate window:** enabled by the user in the extension popup and fixed for
   the lifetime of the new session.
@@ -123,7 +135,12 @@ corresponding `input[type=file]`. If the page has exactly one file input, the
 locator may be omitted. Hidden file inputs used by custom attachment buttons
 are supported. TabWard verifies that every requested path is a readable file
 before the browser receives it; choosing a directory or a missing file fails
-without interacting with the page.
+without interacting with the page. UNC, device, and network paths are rejected.
+Automatic upload occurs only on trusted exact HTTPS hosts. Wildcards are
+rejected. Unknown hosts produce a popup request for approve once, trust exact
+host, or deny; the popup displays basenames only. Approval is bound to the
+actual target frame and document, then rechecked immediately before the file
+input receives the local path.
 
 ## Documentation
 
@@ -143,7 +160,7 @@ npm run verify
 
 `npm run verify` checks TypeScript, tests the MCP and extension contracts,
 builds the MCP, packages the unpacked extension and Store ZIP, and audits the
-release tree for forbidden files and likely secrets.
+release tree and complete Git history for forbidden files and likely secrets.
 
 Run `npm run gate:replacement` after installing the package and reloading the
 extension to execute the repeated local browser gate. See
@@ -234,5 +251,9 @@ configured maximum, maximum observed active work, and queue wait.
 
 The private beta intentionally uses this local command as its required
 pre-push gate instead of GitHub Actions.
+
+Public-release readiness still requires the documented 20-task real-use gate,
+permissions/store review, and a separate repository-visibility decision.
+Version `0.4.0` is not a claim that TabWard has been publicly released.
 
 TabWard is licensed under [Apache-2.0](LICENSE).

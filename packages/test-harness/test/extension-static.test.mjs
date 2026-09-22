@@ -3,6 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { resolve } from "node:path";
 import vm from "node:vm";
+import {
+  releasePathViolations,
+  secretRuleMatches
+} from "../../../scripts/release-rules.mjs";
 
 const root = resolve(import.meta.dirname, "..", "..", "..");
 
@@ -36,6 +40,22 @@ async function stageThreeHelpers() {
   return context.TabWardStageThree;
 }
 
+async function securityHelpers() {
+  const source = await readFile(
+    resolve(root, "apps", "extension", "security.js"),
+    "utf8"
+  );
+  const context = vm.createContext({
+    atob,
+    btoa,
+    crypto,
+    TextEncoder,
+    URL
+  });
+  vm.runInContext(source, context);
+  return context.TabWardSecurity;
+}
+
 test("extension uses paired WebSocket transport without native messaging", async () => {
   const background = await readFile(
     resolve(root, "apps", "extension", "background.js"),
@@ -47,11 +67,11 @@ test("extension uses paired WebSocket transport without native messaging", async
   ));
 
   assert.match(background, /ws:\/\/127\.0\.0\.1:18766/);
-  assert.match(background, /const PROTOCOL_VERSION = 2/);
+  assert.match(background, /const PROTOCOL_VERSION = 3/);
   assert.match(background, /pairing_required/);
   assert.match(background, /result_ack/);
   assert.match(background, /resultOutbox/);
-  assert.match(background, /importScripts\("stage-one\.js", "stage-two\.js", "stage-three\.js"\)/);
+  assert.match(background, /importScripts\("security\.js", "stage-one\.js", "stage-two\.js", "stage-three\.js"\)/);
   assert.match(background, /indexedDB\.open/);
   assert.match(background, /deadlineAt/);
   assert.match(background, /activeOperations/);
@@ -63,12 +83,231 @@ test("extension uses paired WebSocket transport without native messaging", async
   assert.doesNotMatch(background, /activeSessionContext|activeCommandSignal/);
   assert.doesNotMatch(background, /message\.code.*pairingCode/);
   assert.doesNotMatch(background, /connectNative|nativeKeepalive|bridgeFetch|pollLoop/);
-  assert.match(
-    background,
-    /transportState === "connected"[\s\S]*transportSocket\?\.readyState === WebSocket\.OPEN/
-  );
+  assert.match(background, /function sendTransportPing\(socket = transportSocket\)/);
+  assert.match(background, /transportState !== "connected"/);
+  assert.match(background, /socket\?\.readyState !== WebSocket\.OPEN/);
+  assert.match(background, /const TRANSPORT_KEEPALIVE_MS = 20_000/);
+  assert.match(background, /setInterval\([\s\S]*sendTransportPing\(socket\)/);
+  assert.match(background, /clearInterval\(transportKeepaliveTimer\)/);
+  assert.match(background, /chrome\.alarms\.onAlarm[\s\S]*sendTransportPing\(\)/);
   assert.equal(manifest.permissions.includes("nativeMessaging"), false);
   assert.equal(Number(manifest.minimum_chrome_version) >= 116, true);
+});
+
+test("security helpers redact nested credentials, classify CDP, and bind approvals", async () => {
+  const helpers = await securityHelpers();
+  const redacted = helpers.redactBrowserPayload({
+    headers: [
+      { name: "AuThOrIzAtIoN", value: "x" },
+      ["Set-Cookie", "a=b"],
+      { key: "x-api-key", value: "z" },
+      { name: "safe", value: "ok" }
+    ],
+    access_token: "a",
+    nested: { refreshToken: "b", idToken: "c", token: "d" },
+    text: "Bearer short",
+    serialized: "{\"password\":\"hunter2\",\"credentials\":\"secret\",\"safe\":\"normal\"}; access_token=abc123; token=short",
+    cookieHeader: "Cookie: sid=secret; csrf=more",
+    prose: "A password manager improves normal account security."
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(redacted)), {
+    headers: [
+      { name: "AuThOrIzAtIoN", value: "[REDACTED]" },
+      ["Set-Cookie", "[REDACTED]"],
+      { key: "x-api-key", value: "[REDACTED]" },
+      { name: "safe", value: "ok" }
+    ],
+    access_token: "[REDACTED]",
+    nested: {
+      refreshToken: "[REDACTED]",
+      idToken: "[REDACTED]",
+      token: "[REDACTED]"
+    },
+    text: "Bearer [REDACTED]",
+    serialized: "{\"password\":\"[REDACTED]\",\"credentials\":\"[REDACTED]\",\"safe\":\"normal\"}; access_token=\"[REDACTED]\"; token=\"[REDACTED]\"",
+    cookieHeader: "Cookie: [REDACTED]",
+    prose: "A password manager improves normal account security."
+  });
+  assert.equal(helpers.classifyCdp("Runtime.evaluate", {}).approvalRequired, false);
+  assert.equal(helpers.classifyCdp("Storage.getCookies", {}).approvalRequired, true);
+  assert.equal(helpers.classifyCdp("Runtime.evaluate", {
+    sessionId: "foreign"
+  }).approvalRequired, true);
+  assert.equal(helpers.classifyCdp("Future.read", {}).approvalRequired, true);
+  const binding = {
+    approvalId: "approval",
+    kind: "cdp",
+    operationId: "operation",
+    fingerprint: "f".repeat(64),
+    sessionId: "session",
+    tabId: 1,
+    documentId: "document",
+    origin: "https://example.test",
+    host: null,
+    method: "Storage.getCookies",
+    paramsFingerprint: "p".repeat(64),
+    fileFingerprint: null,
+    workerInstanceId: "worker",
+    status: "approved",
+    expiresAt: Date.now() + 10_000
+  };
+  assert.equal(helpers.approvalMatches(binding, binding), true);
+  assert.equal(helpers.approvalMatches(binding, {
+    ...binding,
+    method: "Storage.clearDataForOrigin"
+  }), false);
+  assert.equal(helpers.approvalMatches(binding, {
+    ...binding,
+    operationId: "replay"
+  }), false);
+  assert.equal(helpers.approvalMatches(binding, {
+    ...binding,
+    documentId: "navigated"
+  }), false);
+  assert.doesNotThrow(() =>
+    helpers.assertEffectAuthorizationFresh(Date.now() + 10_000)
+  );
+  assert.throws(
+    () => helpers.assertEffectAuthorizationFresh(Date.now() - 1),
+    /expired before dispatch/
+  );
+});
+
+test("upload trust requires an exact HTTPS host and child tabs require opener provenance", async () => {
+  const helpers = await securityHelpers();
+  assert.equal(
+    helpers.classifyUploadUrl(
+      "https://files.example.com/upload",
+      ["files.example.com"]
+    ).trusted,
+    true
+  );
+  assert.equal(
+    helpers.classifyUploadUrl(
+      "https://other.example.com/upload",
+      ["files.example.com"]
+    ).trusted,
+    false
+  );
+  assert.throws(
+    () => helpers.classifyUploadUrl("http://files.example.com/upload", []),
+    /HTTPS/
+  );
+  assert.throws(() => helpers.normalizeTrustedPattern("*.example.com"), /not allowed/);
+  const source = { id: 1, windowId: 2, active: true, index: 4 };
+  assert.equal(helpers.correlateCreatedTab({
+    id: 3, openerTabId: 1, windowId: 9, active: false, index: 0
+  }, source, []), true);
+  assert.equal(helpers.correlateCreatedTab({
+    id: 4, windowId: 2, active: true, index: 5
+  }, source, []), false);
+  assert.equal(helpers.correlateCreatedTab({
+    id: 5, windowId: 2, active: true, index: 1
+  }, source, []), false);
+});
+
+test("upload authorization binds the target frame document and rechecks at the effect boundary", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+  assert.match(
+    background,
+    /async function frameDocumentIdentity[\s\S]*location\.href[\s\S]*location\.origin/
+  );
+  assert.match(
+    background,
+    /revalidateUploadAuthorization[\s\S]*assertEffectAuthorizationFresh\(authorization\.expiresAt\)/
+  );
+  assert.match(
+    background,
+    /commandExecuteCdp[\s\S]*throwIfCommandAborted\(payload\)[\s\S]*assertEffectAuthorizationFresh\(approval\.expiresAt\)[\s\S]*cdpSend/
+  );
+  assert.match(
+    background,
+    /commandExecuteCdp[\s\S]*result:\s*sanitizeBrowserPayload\(result\)/
+  );
+  assert.doesNotMatch(
+    background,
+    /commandExecuteCdp[\s\S]{0,1000}approvalRequired\s*\?\s*result/
+  );
+  assert.doesNotMatch(background, /sessionName: context\.session\?\.name/);
+  const popup = await readFile(
+    resolve(root, "apps", "extension", "popup.js"),
+    "utf8"
+  );
+  assert.match(popup, /currentApproval\.sessionLabel/);
+  assert.doesNotMatch(popup, /currentApproval\.sessionName/);
+  assert.match(background, /const APPROVAL_TTL_MS = 5 \* 60_000/);
+  assert.match(background, /const APPROVAL_HISTORY_LIMIT = 20/);
+  assert.match(background, /chrome\.action\.setBadgeText/);
+  assert.match(background, /approval\?\.actionable === true/);
+  assert.match(background, /status:\s*Number\(record\.expiresAt \|\| 0\) <= Date\.now\(\)[\s\S]*"expired"[\s\S]*"cancelled"/);
+  assert.match(popup, /currentApproval\.actionable !== true/);
+  assert.match(popup, /find\(\(approval\) => approval\.actionable === true\)/);
+  assert.match(popup, /chrome\.storage\.onChanged\.addListener/);
+  assert.match(
+    background,
+    /async function authorizeUpload[\s\S]*frameDocumentIdentity\([\s\S]*identity\.origin/
+  );
+  assert.match(
+    background,
+    /async function cdpSetInputFiles[\s\S]*await revalidateUploadAuthorization\(uploadAuthorization\)[\s\S]*DOM\.setFileInputFiles/
+  );
+  assert.doesNotMatch(
+    background,
+    /async function authorizeUpload[\s\S]{0,500}chrome\.tabs\.get\(payload\.tabId\)/
+  );
+});
+
+test("extension capability policy covers every handler and rejects expired sessions", async () => {
+  const background = await readFile(
+    resolve(root, "apps", "extension", "background.js"),
+    "utf8"
+  );
+  const policyBody = background.match(
+    /const COMMAND_CAPABILITY_POLICY = Object\.freeze\(\{([\s\S]*?)\n\}\);/
+  )?.[1] || "";
+  const handlersBody = background.match(
+    /const handlers = \{([\s\S]*?)\r?\n\};\r?\n\r?\nfunction commandCapabilities/
+  )?.[1] || "";
+  const keys = (body) => new Set(
+    [...body.matchAll(/^\s{2}([A-Za-z][A-Za-z0-9]*):/gm)]
+      .map((match) => match[1])
+  );
+  assert.deepEqual([...keys(policyBody)].sort(), [...keys(handlersBody)].sort());
+  assert.match(background, /commandCapabilities\(type, payload, context\.session\)/);
+  assert.match(background, /type === "locatorAction" && payload\.action === "upload"/);
+  assert.match(background, /type === "qa"[\s\S]*capabilities\.push\("emulation"\)/);
+  assert.match(
+    background,
+    /type === "workflow"[\s\S]*WORKFLOW_STEP_CAPABILITY_POLICY\[step\.type\][\s\S]*capabilities\.push\(\.\.\.required\)/
+  );
+  assert.match(
+    background,
+    /type === "form"[\s\S]*FORM_FIELD_CAPABILITY_POLICY\[field\.action\][\s\S]*capabilities\.push\(\.\.\.required\)/
+  );
+  assert.match(background, /TabWardStageTwo\.sessionExpiresAtValid\(session\.expiresAt\)/);
+
+  const helpers = await stageTwoHelpers();
+  assert.equal(helpers.sessionExpiresAtValid(101, 100), true);
+  assert.equal(helpers.sessionExpiresAtValid(100, 100), false);
+  assert.equal(helpers.sessionExpiresAtValid(Number.NaN, 100), false);
+});
+
+test("release rules scan NUL-containing content and reject forbidden historical paths", () => {
+  assert.deepEqual(
+    secretRuleMatches(Buffer.from("prefix\u0000npm_abcdefghijklmnopqrstuvwxyz1234567890suffix")),
+    ["npm-token"]
+  );
+  assert.deepEqual(
+    releasePathViolations("archive/profiles/user/state.json"),
+    ["forbidden release directory"]
+  );
+  assert.deepEqual(
+    releasePathViolations("archive/export.zip"),
+    ["forbidden release file extension"]
+  );
 });
 
 test("Stage Three extension gate serializes same-session and same-tab work", async () => {
@@ -306,8 +545,36 @@ test("extension settings enforce existing-tab access and workspace placement", a
   assert.match(background, /SESSION_POLICIES_KEY/);
   assert.match(background, /workspaceEnforcedBy: "extension_user_setting"/);
   assert.match(background, /releaseAdoptedTabs/);
+  assert.match(
+    background,
+    /hasOwnProperty\.call\(patch, "existingTabAccess"\)[\s\S]*normalizedPatch\.allowExistingTabs = patch\.existingTabAccess === true/
+  );
+  assert.match(
+    background,
+    /Full Profile requires the user to enable existing-tab access/
+  );
   assert.match(popup, /id="allow-existing-tabs"/);
   assert.match(popup, /id="separate-window"/);
+});
+
+test("MCP queries the human full-profile toggle before creating a session", async () => {
+  const mcp = await readFile(
+    resolve(root, "packages", "mcp", "src", "index.ts"),
+    "utf8"
+  );
+  assert.match(
+    mcp,
+    /mode === "full_profile"[\s\S]*bridge\.send\(\s*"getUserSettings"/
+  );
+  assert.match(
+    mcp,
+    /settings\.settings\?\.existingTabAccess !== true/
+  );
+  assert.equal(
+    mcp.indexOf('bridge.send(\n      "getUserSettings"')
+      < mcp.indexOf("const session = sessions.start"),
+    true
+  );
 });
 
 test("managed QA is ownership-scoped and Clean QA is fail-closed", async () => {
@@ -332,6 +599,18 @@ test("managed QA is ownership-scoped and Clean QA is fail-closed", async () => {
   assert.match(background, /inventoryVerified/);
   assert.match(background, /previousStateRestored/);
   assert.match(background, /preservedExistingAttachment/);
+  assert.match(
+    background,
+    /function commandQa[\s\S]*const suspendOwnedResources = \(resources\) =>[\s\S]*for \(const resource of suspended\) broker\.resourceOwners\.delete\(resource\)/
+  );
+  assert.match(
+    background,
+    /suspendOwnedResources\(\[[\s\S]*"emulation"[\s\S]*"events"[\s\S]*restoredBroker\.resourceOwners = priorBrokerState\.resourceOwners/
+  );
+  assert.match(
+    background,
+    /decidePendingApproval[\s\S]*record\.workerInstanceId !== WORKER_INSTANCE_ID/
+  );
   assert.match(background, /resourceOwners: new Map\(\)/);
   assert.match(background, /claimCdpResource/);
   assert.match(background, /releaseCdpResource/);

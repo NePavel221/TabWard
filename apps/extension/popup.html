@@ -20,6 +20,10 @@
       font-size: 16px;
       margin: 0 0 12px;
     }
+    h2 {
+      font-size: 14px;
+      margin: 0 0 8px;
+    }
     .row {
       display: flex;
       align-items: center;
@@ -79,7 +83,8 @@
     .switch:focus-visible,
     select:focus-visible,
     button:focus-visible,
-    input:focus-visible {
+    input:focus-visible,
+    textarea:focus-visible {
       outline: 2px solid #8ab4f8;
       outline-offset: 2px;
     }
@@ -103,7 +108,8 @@
       background: #3c4043;
     }
     input,
-    select {
+    select,
+    textarea {
       box-sizing: border-box;
       width: 100%;
       margin-top: 12px;
@@ -123,6 +129,48 @@
       letter-spacing: normal;
       text-align: left;
       cursor: pointer;
+    }
+    textarea {
+      min-height: 64px;
+      margin-top: 8px;
+      letter-spacing: normal;
+      text-align: left;
+      resize: vertical;
+    }
+    .wide-setting {
+      display: block;
+    }
+    .approval {
+      margin-top: 14px;
+      padding: 12px;
+      border: 1px solid #fdd663;
+      border-radius: 6px;
+      background: #292714;
+    }
+    .approval dl {
+      display: grid;
+      grid-template-columns: 82px minmax(0, 1fr);
+      gap: 4px 8px;
+      margin: 8px 0 0;
+      font-size: 11px;
+    }
+    .approval dt {
+      color: #bdc1c6;
+    }
+    .approval dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+    .approval-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .approval-actions button {
+      margin-top: 8px;
+    }
+    #approval-trust {
+      grid-column: 1 / -1;
     }
   </style>
 </head>
@@ -150,8 +198,31 @@
       <input id="separate-window" class="switch" type="checkbox">
       <span class="setting-help" data-i18n="separateWindowHelp">When off, new tabs join a TabWard group in the current window.</span>
     </label>
+    <label class="setting wide-setting">
+      <span class="setting-title" data-i18n="trustedUploadSites">Trusted upload sites</span>
+      <textarea id="trusted-upload-sites" spellcheck="false" data-i18n-placeholder="trustedUploadSitesPlaceholder"></textarea>
+      <span class="setting-help" data-i18n="trustedUploadSitesHelp">One exact host per line. Wildcards are rejected. HTTPS only.</span>
+      <button id="save-trusted-upload-sites" type="button" data-i18n="saveTrustedUploadSites">Save trusted sites</button>
+    </label>
   </section>
   <div id="settings-notice" role="status" aria-live="polite"></div>
+  <section id="approval" class="approval" hidden>
+    <h2 data-i18n="approvalRequired">Approval required</h2>
+    <div id="approval-risk"></div>
+    <dl>
+      <dt data-i18n="approvalCategory">Category</dt><dd id="approval-category"></dd>
+      <dt data-i18n="approvalMethod">Method</dt><dd id="approval-method"></dd>
+      <dt data-i18n="approvalSession">Session</dt><dd id="approval-session"></dd>
+      <dt data-i18n="approvalOrigin">Origin</dt><dd id="approval-origin"></dd>
+      <dt data-i18n="approvalFiles">Files</dt><dd id="approval-files"></dd>
+      <dt data-i18n="approvalExpires">Expires</dt><dd id="approval-expires"></dd>
+    </dl>
+    <div class="approval-actions">
+      <button id="approval-approve" type="button" data-i18n="approveOnce">Approve once</button>
+      <button id="approval-deny" type="button" data-i18n="deny">Deny</button>
+      <button id="approval-trust" type="button" data-i18n="trustExactHost">Trust this exact host</button>
+    </div>
+  </section>
   <input id="code" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" data-i18n-placeholder="pairingPlaceholder" hidden>
   <button id="pair" type="button" data-i18n="approvePairing" hidden></button>
   <button id="revoke" type="button" data-i18n="revokePairing" hidden></button>

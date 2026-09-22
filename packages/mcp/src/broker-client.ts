@@ -37,7 +37,7 @@ const READ_ONLY_COMMANDS = new Set([
   "ping", "tabs", "observe", "getText", "getHtml", "getPageState",
   "extractTables", "extractImages", "queryRich", "locatorWait",
   "locatorAssert", "eventsPoll", "networkBody", "networkHar",
-  "downloads", "getUserSettings", "getInfo", "working"
+  "downloads", "getUserSettings"
 ]);
 
 export function operationRequest(

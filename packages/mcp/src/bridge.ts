@@ -1,4 +1,11 @@
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  pbkdf2Sync,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual
+} from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createServer, type Server as HttpServer } from "node:http";
 import {
@@ -22,9 +29,16 @@ import {
   schedulerOptionsFromEnv
 } from "./scheduler.js";
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const DEFAULT_WS_PORT = 18766;
 const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+const MAX_PREAUTH_MESSAGE_BYTES = 64 * 1024;
+const MAX_PREAUTH_CONNECTIONS = 8;
+const MAX_PREAUTH_MESSAGES = 6;
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+const MAX_PAIRING_ATTEMPTS = 5;
+const PAIRING_LOCKOUT_MS = 30_000;
+const PAIRING_KDF_ITERATIONS = 150_000;
 const COMMAND_TIMEOUT_MS = 60_000;
 
 interface CommandEnvelope {
@@ -62,7 +76,8 @@ interface HelloEnvelope {
   protocolVersion: number;
   extensionId: string;
   extensionVersion: string;
-  token?: string;
+  clientNonce: string;
+  hasPairingToken?: boolean;
 }
 
 function isLocalExtensionOrigin(origin: string | undefined): boolean {
@@ -111,6 +126,86 @@ function tokensEqual(left: string, right: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((key) =>
+      `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+    .join(",")}}`;
+}
+
+function handshakeTranscript(fields: {
+  connectionId: string;
+  clientNonce: string;
+  serverNonce: string;
+  extensionNonce: string;
+  extensionId: string;
+  protocolVersion: number;
+}): string {
+  return stableStringify({
+    connectionId: fields.connectionId,
+    clientNonce: fields.clientNonce,
+    serverNonce: fields.serverNonce,
+    extensionNonce: fields.extensionNonce,
+    extensionId: fields.extensionId,
+    protocolVersion: fields.protocolVersion
+  });
+}
+
+function hmacSha256(key: string, value: string): string {
+  return createHmac("sha256", key).update(value).digest("base64url");
+}
+
+function derivePairingKey(code: string, transcript: string): string {
+  const salt = createHash("sha256")
+    .update(`tabward-pairing:${transcript}`)
+    .digest();
+  return pbkdf2Sync(
+    code,
+    salt,
+    PAIRING_KDF_ITERATIONS,
+    32,
+    "sha256"
+  ).toString("base64url");
+}
+
+function nonce(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[A-Za-z0-9_-]{32,128}$/.test(value);
+}
+
+function plainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+interface HandshakeState {
+  phase:
+    | "hello"
+    | "auth_challenge"
+    | "auth_proof"
+    | "pairing_required"
+    | "pairing_proof";
+  connectionId: string;
+  clientNonce: string;
+  serverNonce: string;
+  extensionNonce: string;
+  extensionId: string;
+  extensionVersion: string;
+  messages: number;
+}
+
+export interface ExtensionBridgeOptions {
+  pairingLockoutMs?: number;
+}
+
 export class ExtensionBridge extends EventEmitter {
   readonly host = "127.0.0.1";
   #port: number;
@@ -121,6 +216,8 @@ export class ExtensionBridge extends EventEmitter {
   #pairingCode: string | null = null;
   #pairingExpiresAt = 0;
   #pairingAttempts = 0;
+  #pairingLockedUntil = 0;
+  #preauthSockets = new Set<WebSocket>();
   #extensionId: string | null = null;
   #extensionVersion: string | null = null;
   #connectedAt: string | null = null;
@@ -141,10 +238,18 @@ export class ExtensionBridge extends EventEmitter {
   );
   readonly #maxConfirmedResults = 128;
   readonly #scheduler = new FairScheduler(schedulerOptionsFromEnv());
+  readonly #pairingLockoutMs: number;
 
-  constructor(port = Number(process.env.TABWARD_PORT || DEFAULT_WS_PORT)) {
+  constructor(
+    port = Number(process.env.TABWARD_PORT || DEFAULT_WS_PORT),
+    options: ExtensionBridgeOptions = {}
+  ) {
     super();
     this.#port = port;
+    this.#pairingLockoutMs = Math.max(
+      1_000,
+      Math.min(5 * 60_000, Number(options.pairingLockoutMs || PAIRING_LOCKOUT_MS))
+    );
   }
 
   get port(): number {
@@ -191,7 +296,10 @@ export class ExtensionBridge extends EventEmitter {
       state: this.#state,
       extensionId: this.#extensionId,
       extensionVersion: this.#extensionVersion,
-      pairingCode: this.#state === "pairing_required" ? this.#pairingCode : null,
+      pairingCode: this.#state === "pairing_required"
+        && Date.now() >= this.#pairingLockedUntil
+        ? this.#pairingCode
+        : null,
       connectedAt: this.#connectedAt
     };
   }
@@ -372,6 +480,10 @@ export class ExtensionBridge extends EventEmitter {
     this.#queuedOperations.clear();
     this.#cancelAcks.clear();
     this.#socket?.terminate();
+    for (const socket of this.#preauthSockets) {
+      socket.terminate();
+    }
+    this.#preauthSockets.clear();
     for (const client of this.#server?.clients ?? []) {
       client.terminate();
     }
@@ -386,21 +498,84 @@ export class ExtensionBridge extends EventEmitter {
     this.#state = "not_running";
   }
 
+  #rotatePairingCode(): void {
+    const previous = this.#pairingCode;
+    let next = previous;
+    while (next === previous) {
+      next = String(
+        Number.parseInt(randomBytes(4).toString("hex"), 16) % 1_000_000
+      ).padStart(6, "0");
+    }
+    this.#pairingCode = next;
+    this.#pairingExpiresAt = Date.now() + 5 * 60_000;
+  }
+
+  #lockPairing(): void {
+    this.#pairingLockedUntil = Date.now() + this.#pairingLockoutMs;
+    this.#rotatePairingCode();
+  }
+
   #accept(socket: WebSocket, origin: string | undefined): void {
     const extensionId = origin?.slice("chrome-extension://".length) ?? null;
+    if (!extensionId || this.#preauthSockets.size >= MAX_PREAUTH_CONNECTIONS) {
+      socket.close(1013, "too many unauthenticated connections");
+      return;
+    }
+    this.#preauthSockets.add(socket);
     let authenticated = false;
-    socket.on("message", async (raw) => {
-      try {
-        const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+    let handshake: HandshakeState | null = null;
+    let messageTail = Promise.resolve();
+    const handshakeTimer = setTimeout(() => {
+      if (!authenticated) socket.close(1008, "handshake timeout");
+    }, HANDSHAKE_TIMEOUT_MS);
+    socket.on("message", (raw) => {
+      messageTail = messageTail.then(async () => {
+        const rawBytes = Array.isArray(raw)
+          ? raw.reduce((total, value) => total + value.length, 0)
+          : raw.byteLength;
+        if (!authenticated && rawBytes > MAX_PREAUTH_MESSAGE_BYTES) {
+          throw new Error("unauthenticated message is too large");
+        }
+        const parsed = JSON.parse(raw.toString()) as unknown;
+        if (!plainObject(parsed)) {
+          throw new Error("protocol message must be an object");
+        }
+        const message = parsed;
         if (!authenticated) {
-          authenticated = await this.#authenticate(socket, message, extensionId);
+          const result = await this.#authenticate(
+            socket,
+            message,
+            extensionId,
+            handshake
+          );
+          handshake = result.handshake;
+          authenticated = result.authenticated;
+          if (authenticated) {
+            this.#preauthSockets.delete(socket);
+            clearTimeout(handshakeTimer);
+          }
           return;
+        }
+        if (
+          socket !== this.#socket
+          || message.protocolVersion !== PROTOCOL_VERSION
+        ) {
+          throw new Error("authenticated protocol mismatch");
         }
         if (message.kind === "ping") {
           socket.send(JSON.stringify({ kind: "pong", protocolVersion: PROTOCOL_VERSION }));
           return;
         }
         if (message.kind === "result") {
+          if (
+            typeof message.id !== "string"
+            || typeof message.operationId !== "string"
+            || typeof message.ok !== "boolean"
+            || (message.fingerprint !== undefined
+              && typeof message.fingerprint !== "string")
+          ) {
+            throw new Error("invalid result envelope");
+          }
           const received = this.#receiveResult(message as unknown as ResultEnvelope);
           socket.send(JSON.stringify(received.cached ? {
             kind: "result_ack",
@@ -421,14 +596,26 @@ export class ExtensionBridge extends EventEmitter {
           return;
         }
         if (message.kind === "cancel_ack") {
+          if (
+            typeof message.operationId !== "string"
+            || !["not_found", "queued", "active", "completed"].includes(
+              String(message.state)
+            )
+          ) {
+            throw new Error("invalid cancellation acknowledgement");
+          }
           const ack = message as unknown as CancelAckEnvelope;
           this.#cancelAcks.get(ack.operationId)?.(ack);
+          return;
         }
-      } catch {
+        throw new Error("unknown authenticated protocol message");
+      }).catch(() => {
         socket.close(1008, "invalid protocol message");
-      }
+      });
     });
     socket.on("close", () => {
+      clearTimeout(handshakeTimer);
+      this.#preauthSockets.delete(socket);
       if (this.#socket === socket) {
         for (const [id, pending] of this.#pending) {
           clearTimeout(pending.timeout);
@@ -447,60 +634,216 @@ export class ExtensionBridge extends EventEmitter {
   async #authenticate(
     socket: WebSocket,
     message: Record<string, unknown>,
-    extensionId: string | null
-  ): Promise<boolean> {
+    extensionId: string,
+    handshake: HandshakeState | null
+  ): Promise<{ authenticated: boolean; handshake: HandshakeState | null }> {
     if (message.protocolVersion !== PROTOCOL_VERSION) {
-      this.#state = "version_mismatch";
+      if (!this.#socket) {
+        this.#state = "version_mismatch";
+      }
       socket.send(JSON.stringify({
         kind: "version_mismatch",
         protocolVersion: PROTOCOL_VERSION
       }));
       socket.close(1008, "protocol version mismatch");
-      return false;
+      return { authenticated: false, handshake };
+    }
+    if (!handshake) {
+      if (message.kind !== "hello") {
+        throw new Error("hello required");
+      }
+      const hello = message as unknown as HelloEnvelope;
+      if (
+        hello.extensionId !== extensionId
+        || typeof hello.extensionVersion !== "string"
+        || hello.extensionVersion.length < 1
+        || hello.extensionVersion.length > 64
+        || !nonce(hello.clientNonce)
+      ) {
+        throw new Error("invalid extension hello");
+      }
+      const next: HandshakeState = {
+        phase: "hello",
+        connectionId: randomUUID(),
+        clientNonce: hello.clientNonce,
+        serverNonce: randomBytes(32).toString("base64url"),
+        extensionNonce: "",
+        extensionId,
+        extensionVersion: hello.extensionVersion,
+        messages: 1
+      };
+      if (hello.hasPairingToken === true && this.#pairingToken) {
+        next.phase = "auth_challenge";
+        socket.send(JSON.stringify({
+          kind: "auth_challenge",
+          protocolVersion: PROTOCOL_VERSION,
+          connectionId: next.connectionId,
+          clientNonce: next.clientNonce,
+          serverNonce: next.serverNonce
+        }));
+        return { authenticated: false, handshake: next };
+      }
+      if (Date.now() < this.#pairingLockedUntil) {
+        socket.close(1008, "pairing temporarily locked");
+        return { authenticated: false, handshake: next };
+      }
+      if (this.#pairingLockedUntil > 0) {
+        this.#pairingLockedUntil = 0;
+        this.#pairingAttempts = 0;
+      }
+      if (!this.#pairingCode || Date.now() > this.#pairingExpiresAt) {
+        this.#rotatePairingCode();
+      }
+      next.phase = "pairing_required";
+      if (!this.#socket) this.#state = "pairing_required";
+      socket.send(JSON.stringify({
+        kind: "pairing_required",
+        protocolVersion: PROTOCOL_VERSION,
+        connectionId: next.connectionId,
+        clientNonce: next.clientNonce,
+        serverNonce: next.serverNonce
+      }));
+      this.emit("pairing", this.status());
+      return { authenticated: false, handshake: next };
+    }
+    handshake.messages += 1;
+    if (handshake.messages > MAX_PREAUTH_MESSAGES) {
+      throw new Error("too many handshake messages");
     }
     if (
-      message.kind === "pairing_approve"
-      && Date.now() <= this.#pairingExpiresAt
-      && this.#pairingAttempts < 5
-      && message.code === this.#pairingCode
+      handshake.phase === "pairing_required"
+      && message.kind === "pairing_approve"
     ) {
-      this.#pairingToken = await createPairingToken();
-      this.#pairingCode = null;
-      this.#pairingExpiresAt = 0;
-      this.#pairingAttempts = 0;
+      this.#pairingAttempts += 1;
+      if (
+        Date.now() > this.#pairingExpiresAt
+        || message.code !== this.#pairingCode
+        || message.connectionId !== handshake.connectionId
+        || message.clientNonce !== handshake.clientNonce
+        || message.serverNonce !== handshake.serverNonce
+        || !nonce(message.extensionNonce)
+      ) {
+        if (this.#pairingAttempts >= MAX_PAIRING_ATTEMPTS) {
+          this.#lockPairing();
+          socket.close(1008, "pairing temporarily locked");
+        } else {
+          socket.close(1008, "pairing attempt rejected");
+        }
+        return { authenticated: false, handshake };
+      }
+      handshake.extensionNonce = message.extensionNonce;
+      const transcript = handshakeTranscript({
+        ...handshake,
+        protocolVersion: PROTOCOL_VERSION
+      });
+      const pairingCode = this.#pairingCode;
+      if (!pairingCode) {
+        throw new Error("pairing code expired");
+      }
+      const pairingKey = derivePairingKey(pairingCode, transcript);
+      handshake.phase = "pairing_proof";
       socket.send(JSON.stringify({
         kind: "pairing_approved",
         protocolVersion: PROTOCOL_VERSION,
-        token: this.#pairingToken
+        connectionId: handshake.connectionId,
+        clientNonce: handshake.clientNonce,
+        serverNonce: handshake.serverNonce,
+        extensionNonce: handshake.extensionNonce,
+        brokerProof: hmacSha256(
+          pairingKey,
+          `broker-pairing:${transcript}`
+        )
       }));
-      return false;
+      return { authenticated: false, handshake };
     }
-    if (message.kind === "pairing_approve") {
-      this.#pairingAttempts += 1;
-      if (this.#pairingAttempts >= 5) {
-        this.#pairingCode = null;
-        this.#pairingExpiresAt = 0;
-        socket.close(1008, "too many pairing attempts");
-      }
-      return false;
-    }
-    if (message.kind !== "hello") {
-      throw new Error("hello required");
-    }
-    const hello = message as unknown as HelloEnvelope;
-    if (hello.extensionId !== extensionId) {
-      socket.close(1008, "extension identity mismatch");
-      return false;
-    }
-    this.#extensionId = extensionId;
-    this.#extensionVersion = hello.extensionVersion;
     if (
-      this.#pairingToken
-      && typeof hello.token === "string"
-      && tokensEqual(hello.token, this.#pairingToken)
+      handshake.phase === "pairing_proof"
+      && message.kind === "pairing_confirm"
+      && message.connectionId === handshake.connectionId
     ) {
+      const transcript = handshakeTranscript({
+        ...handshake,
+        protocolVersion: PROTOCOL_VERSION
+      });
+      const pairingKey = derivePairingKey(String(this.#pairingCode), transcript);
+      const expected = hmacSha256(
+        pairingKey,
+        `extension-pairing:${transcript}`
+      );
+      if (
+        typeof message.extensionProof !== "string"
+        || !tokensEqual(message.extensionProof, expected)
+      ) {
+        throw new Error("extension pairing proof failed");
+      }
+      const token = await createPairingToken();
+      this.#pairingToken = token;
+      this.#pairingCode = null;
+      this.#pairingExpiresAt = 0;
+      this.#pairingAttempts = 0;
+      this.#pairingLockedUntil = 0;
+      if (!this.#socket) this.#state = "not_running";
+      socket.send(JSON.stringify({
+        kind: "pairing_complete",
+        protocolVersion: PROTOCOL_VERSION,
+        connectionId: handshake.connectionId,
+        token
+      }));
+      return { authenticated: false, handshake };
+    }
+    if (
+      handshake.phase === "auth_challenge"
+      && message.kind === "auth_response"
+      && message.connectionId === handshake.connectionId
+      && message.clientNonce === handshake.clientNonce
+      && message.serverNonce === handshake.serverNonce
+      && nonce(message.extensionNonce)
+      && typeof message.extensionProof === "string"
+      && this.#pairingToken
+    ) {
+      handshake.extensionNonce = message.extensionNonce;
+      const transcript = handshakeTranscript({
+        ...handshake,
+        protocolVersion: PROTOCOL_VERSION
+      });
+      const expected = hmacSha256(
+        this.#pairingToken,
+        `extension:${transcript}`
+      );
+      if (!tokensEqual(message.extensionProof, expected)) {
+        throw new Error("extension authentication failed");
+      }
+      handshake.phase = "auth_proof";
+      socket.send(JSON.stringify({
+        kind: "broker_proof",
+        protocolVersion: PROTOCOL_VERSION,
+        connectionId: handshake.connectionId,
+        proof: hmacSha256(this.#pairingToken, `broker:${transcript}`)
+      }));
+      return { authenticated: false, handshake };
+    }
+    if (
+      handshake.phase === "auth_proof"
+      && message.kind === "auth_confirm"
+      && message.connectionId === handshake.connectionId
+      && typeof message.proof === "string"
+      && this.#pairingToken
+    ) {
+      const transcript = handshakeTranscript({
+        ...handshake,
+        protocolVersion: PROTOCOL_VERSION
+      });
+      const expected = hmacSha256(
+        this.#pairingToken,
+        `confirm:${transcript}`
+      );
+      if (!tokensEqual(message.proof, expected)) {
+        throw new Error("extension authentication confirmation failed");
+      }
       this.#socket?.close(1000, "replaced by new extension connection");
       this.#socket = socket;
+      this.#extensionId = handshake.extensionId;
+      this.#extensionVersion = handshake.extensionVersion;
       this.#connectedAt = new Date().toISOString();
       this.#state = "connected";
       socket.send(JSON.stringify({
@@ -508,22 +851,9 @@ export class ExtensionBridge extends EventEmitter {
         protocolVersion: PROTOCOL_VERSION
       }));
       this.emit("connected", this.status());
-      return true;
+      return { authenticated: true, handshake };
     }
-    if (!this.#pairingCode || Date.now() > this.#pairingExpiresAt) {
-      this.#pairingCode = String(
-        Number.parseInt(randomBytes(4).toString("hex"), 16) % 1_000_000
-      ).padStart(6, "0");
-      this.#pairingExpiresAt = Date.now() + 5 * 60_000;
-      this.#pairingAttempts = 0;
-    }
-    this.#state = "pairing_required";
-    socket.send(JSON.stringify({
-      kind: "pairing_required",
-      protocolVersion: PROTOCOL_VERSION
-    }));
-    this.emit("pairing", this.status());
-    return false;
+    throw new Error("unexpected handshake message");
   }
 
   #cacheConfirmed(result: ResultEnvelope): boolean {

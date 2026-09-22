@@ -15,7 +15,7 @@ import {
   type Session
 } from "./session.js";
 
-const VERSION = "0.3.1";
+const VERSION = "0.4.0";
 const bridge = new BrokerClient();
 const sessions = new SessionPolicy();
 const acceptedSessionCommands = new AcceptedWorkTracker();
@@ -89,7 +89,11 @@ async function validateUploadPaths(filePaths: string[]): Promise<string[]> {
     throw new Error("file_paths must not contain empty paths");
   }
   for (const filePath of normalized) {
-    if (!isAbsolute(filePath)) {
+    const networkOrDevicePath = /^(?:\\\\|\/\/|\\\\[?.]\\|\\\?\?\\)/.test(filePath);
+    const localAbsolute = process.platform === "win32"
+      ? /^[a-zA-Z]:[\\/](?![\\/])/.test(filePath)
+      : isAbsolute(filePath) && !filePath.startsWith("//") && !filePath.startsWith("/dev/");
+    if (!localAbsolute || networkOrDevicePath) {
       throw new Error(`Upload path must be absolute: ${basename(filePath) || "[unnamed file]"}`);
     }
     let metadata;
@@ -132,6 +136,7 @@ function context(session: Session): Record<string, unknown> {
     sessionId: session.id,
     sessionName: session.name,
     sessionMode: session.mode,
+    sessionCapabilities: [...session.capabilities].sort(),
     canAdoptExistingTabs: session.capabilities.has("adopt_tabs"),
     workspace: session.workspace,
     cleanQa: session.cleanQa,
@@ -192,7 +197,7 @@ async function waitForAcceptedSessionCommands(sessionId: string): Promise<void> 
 
 async function send(
   sessionId: string,
-  capability: Capability,
+  capability: Capability | readonly Capability[],
   command: string,
   payload: Record<string, unknown> = {},
   options: {
@@ -202,7 +207,9 @@ async function send(
   } = {}
 ): Promise<Record<string, unknown>> {
   return await withAcceptedSessionCommand(sessionId, async (session) => {
-    sessions.require(sessionId, capability);
+    for (const required of Array.isArray(capability) ? capability : [capability]) {
+      sessions.require(sessionId, required);
+    }
     const tabId = options.tabId;
     if (tabId !== undefined) {
       if (session.mode === "managed" && !session.tabIds.has(tabId)) {
@@ -269,6 +276,20 @@ server.registerTool("tabward_session_start", {
   }
   if (bridge.status().state !== "connected") {
     throw new Error("TabWard extension is not connected or paired");
+  }
+  if (mode === "full_profile") {
+    const settings = await bridge.send(
+      "getUserSettings",
+      {},
+      5_000
+    ) as { settings?: { existingTabAccess?: unknown } };
+    if (settings.settings?.existingTabAccess !== true) {
+      const error = new Error(
+        "Full Profile requires the user to enable existing-tab access in the TabWard popup"
+      );
+      error.name = "ExistingTabAccessDisabled";
+      throw error;
+    }
   }
   const session = sessions.start({
     mode,
@@ -363,6 +384,7 @@ server.registerTool("tabward_tabs", {
 }, async ({ session_id, operation, tab_id, url, active, wait, summary, label }) => {
   if (operation === "list") {
     return await withAcceptedSessionCommand(session_id, async (session) => {
+      sessions.require(session_id, "read");
       const result = await bridge.send("tabs", context(session)) as Record<string, unknown>;
       syncSessionTabs(session, result);
       if (session.mode === "managed" && Array.isArray(result.knownTabs)) {
@@ -382,6 +404,7 @@ server.registerTool("tabward_tabs", {
   }
   if (operation === "open") {
     return await withAcceptedSessionCommand(session_id, async (session) => {
+      sessions.require(session_id, "action");
       const result = await bridge.send("openTab", {
         ...context(session), url, active, wait
       }) as Record<string, unknown>;
@@ -535,7 +558,7 @@ server.registerTool("tabward_upload", {
     file_paths: z.array(z.string().min(1)).min(1).max(50),
     locator: locatorSchema.optional(),
     frame_id: z.number().int().min(0).optional(),
-    timeout_ms: z.number().int().min(100).max(600_000).default(30_000)
+    timeout_ms: z.number().int().min(100).max(600_000).default(360_000)
   }
 }, async ({ session_id, tab_id, file_paths, locator, frame_id, timeout_ms }) => {
   const uploadLocator = locator ?? {
@@ -856,7 +879,11 @@ server.registerTool("tabward_qa", {
       throw new Error(`screenshots[${index}] requires locator`);
     }
   }
-  const result = await send(session_id, "probes", "qa", {
+  const qaCapabilities = new Set<Capability>(["probes"]);
+  if (preset || viewport) qaCapabilities.add("emulation");
+  if (capture_console || capture_network) qaCapabilities.add("events");
+  if (screenshots.length > 0) qaCapabilities.add("artifacts");
+  const result = await send(session_id, [...qaCapabilities], "qa", {
     preset, viewport, probes, assertions, screenshots,
     captureConsole: capture_console,
     captureNetwork: capture_network,
@@ -875,12 +902,13 @@ server.registerTool("tabward_cdp", {
     session_id: z.string(),
     tab_id: z.number().int().positive(),
     method: z.string().min(1),
-    params: objectSchema.optional()
+    params: objectSchema.optional(),
+    timeout_ms: z.number().int().min(100).max(600_000).default(360_000)
   }
-}, async ({ session_id, tab_id, method, params }) =>
+}, async ({ session_id, tab_id, method, params, timeout_ms }) =>
   output(await send(session_id, "cdp", "cdp", {
     method, params: params ?? {}
-  }, { tabId: tab_id }))
+  }, { tabId: tab_id, timeoutMs: timeout_ms }))
 );
 
 server.registerTool("tabward_downloads", {

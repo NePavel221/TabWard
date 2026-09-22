@@ -1,6 +1,11 @@
 {
   "name": "tabward-workspace",
-  "version": "0.3.1",
+  "version": "0.4.0",
+  "overrides": {
+    "fast-uri": "3.1.8",
+    "hono": "4.13.8",
+    "qs": "6.16.0"
+  },
   "private": true,
   "description": "Local browser control for AI agents",
   "license": "Apache-2.0",

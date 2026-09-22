@@ -13,7 +13,13 @@ on-demand broker owns the extension WebSocket and is shared by concurrent MCP
 clients. Runtime discovery uses an atomic local file and a separate bearer
 credential; the pairing credential is never returned to MCP clients.
 
-Protocol v2 assigns every operation one correlation ID, content fingerprint,
+Protocol v3 starts with a nonce/HMAC mutual-authentication handshake. The
+extension sends only a nonce-bearing hello; it does not send the reusable
+pairing credential before the broker proves possession. Initial six-digit
+pairing derives a temporary proof key and releases the new reusable token only
+after both sides prove the code.
+
+Protocol v3 assigns every operation one correlation ID, content fingerprint,
 and absolute deadline. The same ID crosses MCP, authenticated broker HTTP,
 the fair bridge scheduler, WebSocket dispatch, the extension operation context,
 IndexedDB outbox, result, and acknowledgement. Queue wait consumes the same

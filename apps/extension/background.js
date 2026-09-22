@@ -1,12 +1,15 @@
-importScripts("stage-one.js", "stage-two.js", "stage-three.js");
+importScripts("security.js", "stage-one.js", "stage-two.js", "stage-three.js");
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const WS_URL = "ws://127.0.0.1:18766";
 const PAIRING_TOKEN_KEY = "pairingToken";
 const USER_SETTINGS_KEY = "userSettings";
+const PENDING_APPROVALS_KEY = "pendingApprovals";
 const DEFAULT_USER_SETTINGS = Object.freeze({
   allowExistingTabs: false,
-  openInSeparateWindow: false
+  existingTabAccess: false,
+  openInSeparateWindow: false,
+  trustedUploadSites: []
 });
 const DEFAULT_GROUP_TITLE = "TabWard";
 const DEFAULT_GROUP_COLOR = "grey";
@@ -39,30 +42,140 @@ const EVENT_MAX_BYTES = 8 * 1024 * 1024;
 const TRACE_MAX_BYTES = 16 * 1024 * 1024;
 const SCREENCAST_MAX_BYTES = 16 * 1024 * 1024;
 const NETWORK_BODY_RESULT_MAX_BYTES = 7 * 1024 * 1024;
+const APPROVAL_TTL_MS = 5 * 60_000;
+const APPROVAL_HISTORY_LIMIT = 20;
+const TRANSPORT_KEEPALIVE_MS = 20_000;
 const OPERATION_CONTEXT = Symbol("TabWardOperationContext");
 const WORKER_INSTANCE_ID = crypto.randomUUID();
-const SAFE_CDP_METHODS = new Set([
-  "Accessibility.getFullAXTree",
-  "DOM.describeNode",
-  "DOM.getBoxModel",
-  "DOM.getDocument",
-  "DOM.getOuterHTML",
-  "DOM.querySelector",
-  "DOM.querySelectorAll",
-  "Page.getLayoutMetrics",
-  "Runtime.getProperties"
+const MANAGED_SESSION_CAPABILITIES = new Set([
+  "read", "action", "artifacts", "downloads", "emulation",
+  "evaluate_local", "events", "probes", "tracing", "uploads"
 ]);
+const FULL_PROFILE_SESSION_CAPABILITIES = new Set([
+  ...MANAGED_SESSION_CAPABILITIES,
+  "adopt_tabs", "cdp", "evaluate", "network_interception", "storage"
+]);
+const COMMAND_CAPABILITY_POLICY = Object.freeze({
+  ping: null,
+  getUserSettings: null,
+  reloadExtension: null,
+  nameSession: [],
+  cleanup: [],
+  releaseWorkspace: [],
+  turnEnded: [],
+  openTab: ["action"],
+  tabs: ["read"],
+  navigate: ["action"],
+  navigateAdvanced: ["action"],
+  goBack: ["action"],
+  goForward: ["action"],
+  getText: ["read"],
+  getHtml: ["read"],
+  getPageState: ["read"],
+  extractTables: ["read"],
+  observe: ["read"],
+  snapshot: ["read"],
+  query: ["read"],
+  queryRich: ["read"],
+  extractImages: ["read"],
+  resolveTarget: ["read"],
+  click: ["action"],
+  fill: ["action"],
+  smartClick: ["action"],
+  smartFill: ["action"],
+  locatorAction: ["action"],
+  form: ["action"],
+  locatorWait: ["read"],
+  locatorAssert: ["read"],
+  workflow: ["action"],
+  downloadClick: ["downloads"],
+  downloadImage: ["downloads"],
+  downloads: ["downloads"],
+  deleteDownload: ["downloads"],
+  closeTab: ["action"],
+  activateTab: ["action"],
+  cursor: ["action"],
+  finish: ["action"],
+  reload: ["action"],
+  waitForText: ["read"],
+  waitForSelector: ["read"],
+  attach: ["cdp"],
+  detach: ["cdp"],
+  cdp: ["cdp"],
+  eventsStart: ["events"],
+  eventsPoll: ["events"],
+  eventsClear: ["events"],
+  eventsStop: ["events"],
+  dialogHandle: ["events"],
+  networkBody: ["events"],
+  networkHar: ["events"],
+  interceptionStart: ["network_interception"],
+  interceptionContinue: ["network_interception"],
+  interceptionFail: ["network_interception"],
+  interceptionFulfill: ["network_interception"],
+  interceptionStop: ["network_interception"],
+  emulation: ["emulation"],
+  storage: ["storage"],
+  traceStart: ["tracing"],
+  traceStop: ["tracing"],
+  screencastStart: ["tracing"],
+  screencastFrame: ["tracing"],
+  screencastStop: ["tracing"],
+  screenshot: ["artifacts"],
+  evaluate: [],
+  probe: ["probes"],
+  qa: ["probes"],
+  inputMouse: ["action"],
+  inputKey: ["action"],
+  inputScroll: ["action"],
+  handoff: ["action"],
+  deliverable: ["action"],
+  adoptTab: ["adopt_tabs"],
+  releaseTab: ["action"]
+});
+const WORKFLOW_STEP_CAPABILITY_POLICY = Object.freeze({
+  observe: ["read"],
+  smartClick: ["action"],
+  smartFill: ["action"],
+  navigate: ["action"],
+  pageState: ["read"],
+  queryRich: ["read"],
+  extractImages: ["read"],
+  waitForText: ["read"],
+  waitForSelector: ["read"],
+  reload: ["action"],
+  inputKey: ["action"],
+  inputScroll: ["action"]
+});
+const FORM_FIELD_CAPABILITY_POLICY = Object.freeze({
+  click: ["action"],
+  doubleClick: ["action"],
+  hover: ["action"],
+  fill: ["action"],
+  type: ["action"],
+  press: ["action"],
+  check: ["action"],
+  uncheck: ["action"],
+  select: ["action"],
+  focus: ["action"],
+  blur: ["action"],
+  drag: ["action"],
+  upload: ["uploads"]
+});
 
 let reloadScheduled = false;
 let transportSocket = null;
 let transportState = "not_running";
 let transportReconnectTimer = null;
 let transportReconnectAttempt = 0;
+let transportKeepaliveTimer = null;
 let pairingCode = null;
 let transportLastError = null;
 let connectedAt = null;
+let transportHandshake = null;
 let outboxFlushPromise = null;
 let outboxMutationTail = Promise.resolve();
+let pendingApprovalMutationTail = Promise.resolve();
 const activeOperations = new Map();
 const extensionResourceGate = TabWardStageThree.createResourceGate();
 
@@ -325,15 +438,61 @@ function scheduleTransportReconnect() {
   }, delay);
 }
 
+function stopTransportKeepalive() {
+  if (transportKeepaliveTimer) {
+    clearInterval(transportKeepaliveTimer);
+    transportKeepaliveTimer = null;
+  }
+}
+
+function sendTransportPing(socket = transportSocket) {
+  if (
+    transportState !== "connected"
+    || socket !== transportSocket
+    || socket?.readyState !== WebSocket.OPEN
+  ) {
+    return false;
+  }
+  socket.send(JSON.stringify({
+    kind: "ping",
+    protocolVersion: PROTOCOL_VERSION
+  }));
+  return true;
+}
+
+function startTransportKeepalive(socket) {
+  stopTransportKeepalive();
+  transportKeepaliveTimer = setInterval(() => {
+    if (!sendTransportPing(socket)) {
+      stopTransportKeepalive();
+    }
+  }, TRANSPORT_KEEPALIVE_MS);
+}
+
 async function pairingToken() {
   const state = await chrome.storage.local.get({ [PAIRING_TOKEN_KEY]: null });
   return typeof state[PAIRING_TOKEN_KEY] === "string" ? state[PAIRING_TOKEN_KEY] : null;
 }
 
 function normalizeUserSettings(value) {
+  const trustedUploadSites = Array.from(new Set(
+    (Array.isArray(value?.trustedUploadSites) ? value.trustedUploadSites : [])
+      .map((pattern) => {
+        try {
+          return TabWardSecurity.normalizeTrustedPattern(pattern);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+  )).slice(0, 100);
   return {
-    allowExistingTabs: value?.allowExistingTabs === true,
-    openInSeparateWindow: value?.openInSeparateWindow === true
+    allowExistingTabs:
+      value?.existingTabAccess === true || value?.allowExistingTabs === true,
+    existingTabAccess:
+      value?.existingTabAccess === true || value?.allowExistingTabs === true,
+    openInSeparateWindow: value?.openInSeparateWindow === true,
+    trustedUploadSites
   };
 }
 
@@ -358,13 +517,220 @@ async function releaseAdoptedTabs() {
 
 async function updateUserSettings(patch) {
   const current = await getUserSettings();
-  const next = normalizeUserSettings({ ...current, ...patch });
+  const normalizedPatch = { ...patch };
+  if (Object.prototype.hasOwnProperty.call(patch, "existingTabAccess")) {
+    normalizedPatch.existingTabAccess = patch.existingTabAccess === true;
+    normalizedPatch.allowExistingTabs = patch.existingTabAccess === true;
+  } else if (Object.prototype.hasOwnProperty.call(patch, "allowExistingTabs")) {
+    normalizedPatch.allowExistingTabs = patch.allowExistingTabs === true;
+    normalizedPatch.existingTabAccess = patch.allowExistingTabs === true;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "trustedUploadSites")) {
+    const requested = Array.isArray(patch.trustedUploadSites)
+      ? patch.trustedUploadSites
+      : [];
+    for (const pattern of requested) {
+      TabWardSecurity.normalizeTrustedPattern(pattern);
+    }
+  }
+  const next = normalizeUserSettings({ ...current, ...normalizedPatch });
   await chrome.storage.local.set({ [USER_SETTINGS_KEY]: next });
   const releasedAdoptedTabIds =
     current.allowExistingTabs && !next.allowExistingTabs
       ? await releaseAdoptedTabs()
       : [];
   return { settings: next, releasedAdoptedTabIds };
+}
+
+async function readPendingApprovals() {
+  const state = await chrome.storage.session.get({ [PENDING_APPROVALS_KEY]: {} });
+  return state[PENDING_APPROVALS_KEY] || {};
+}
+
+async function mutatePendingApprovals(mutator) {
+  const run = async () => {
+    const records = await readPendingApprovals();
+    const next = mutator(structuredClone(records)) || records;
+    await chrome.storage.session.set({ [PENDING_APPROVALS_KEY]: next });
+    await syncApprovalBadge(next);
+    return next;
+  };
+  const current = pendingApprovalMutationTail.then(run, run);
+  pendingApprovalMutationTail = current.then(() => undefined, () => undefined);
+  return current;
+}
+
+async function syncApprovalBadge(records = null) {
+  const source = records || await readPendingApprovals();
+  const count = Object.values(source)
+    .map(publicApproval)
+    .filter((approval) => approval?.actionable === true)
+    .length;
+  await chrome.action.setBadgeBackgroundColor({ color: "#D97706" });
+  await chrome.action.setBadgeText({
+    text: count > 0 ? String(Math.min(count, 99)) : ""
+  });
+}
+
+function publicApproval(record) {
+  if (!record) return null;
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId : "";
+  const expired = Number(record.expiresAt || 0) <= Date.now();
+  const currentWorker = record.workerInstanceId === WORKER_INSTANCE_ID;
+  const actionable = record.status === "pending" && !expired && currentWorker;
+  return {
+    approvalId: record.approvalId,
+    kind: record.kind,
+    method: record.method || null,
+    riskCategory: record.riskCategory,
+    riskText: record.riskText,
+    sessionLabel: sessionId
+      ? `TabWard session …${sessionId.slice(-8)}`
+      : "TabWard session",
+    origin: record.origin,
+    host: record.host || null,
+    basenames: record.basenames || [],
+    expiresAt: record.expiresAt,
+    status: record.status === "pending" && expired
+      ? "expired"
+      : record.status === "pending" && !currentWorker
+        ? "cancelled"
+        : record.status,
+    actionable
+  };
+}
+
+async function listPendingApprovals() {
+  const records = await readPendingApprovals();
+  return Object.values(records)
+    .sort((left, right) => {
+      const leftPublic = publicApproval(left);
+      const rightPublic = publicApproval(right);
+      if (leftPublic.actionable !== rightPublic.actionable) {
+        return leftPublic.actionable ? -1 : 1;
+      }
+      return Number(right.createdAt || 0) - Number(left.createdAt || 0);
+    })
+    .map(publicApproval);
+}
+
+async function createPendingApproval(binding, display) {
+  const record = {
+    ...binding,
+    ...display,
+    status: "pending",
+    decision: null,
+    createdAt: Date.now(),
+    expiresAt: Math.min(
+      Date.now() + APPROVAL_TTL_MS,
+      Number(binding.deadlineAt || Date.now() + APPROVAL_TTL_MS)
+    )
+  };
+  if (record.expiresAt <= Date.now()) {
+    const error = new Error("Approval deadline expired before user review");
+    error.name = "NotStarted";
+    throw error;
+  }
+  await mutatePendingApprovals((records) => {
+    records[record.approvalId] = record;
+    const retained = Object.values(records)
+      .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+      .slice(0, APPROVAL_HISTORY_LIMIT);
+    for (const approvalId of Object.keys(records)) delete records[approvalId];
+    for (const retainedRecord of retained) {
+      records[retainedRecord.approvalId] = retainedRecord;
+    }
+    return records;
+  });
+  return record;
+}
+
+async function decidePendingApproval(approvalId, decision) {
+  const allowed = new Set(["approve_once", "trust_host", "deny"]);
+  if (!allowed.has(decision)) throw new Error("Invalid approval decision");
+  let decided = null;
+  await mutatePendingApprovals((records) => {
+    const record = records[approvalId];
+    if (
+      !record
+      || record.status !== "pending"
+      || record.expiresAt <= Date.now()
+      || record.workerInstanceId !== WORKER_INSTANCE_ID
+    ) {
+      throw new Error("Approval request is missing or expired");
+    }
+    if (decision === "trust_host" && record.kind !== "upload") {
+      throw new Error("Only upload hosts can be trusted persistently");
+    }
+    records[approvalId] = {
+      ...record,
+      status: decision === "deny" ? "denied" : "approved",
+      decision,
+      decidedAt: Date.now()
+    };
+    decided = records[approvalId];
+    return records;
+  });
+  if (decision === "trust_host") {
+    const settings = await getUserSettings();
+    await updateUserSettings({
+      trustedUploadSites: [...settings.trustedUploadSites, decided.host]
+    });
+  }
+  return publicApproval(decided);
+}
+
+async function consumeApproval(binding, context) {
+  try {
+    while (Date.now() < Math.min(binding.deadlineAt, binding.expiresAt)) {
+      throwIfCommandAborted(context);
+      const records = await readPendingApprovals();
+      const record = records[binding.approvalId];
+      if (record?.status === "denied") {
+        const error = new Error("The user denied this browser operation");
+        error.name = "ApprovalDenied";
+        throw error;
+      }
+      if (TabWardSecurity.approvalMatches(record, binding)) {
+        return record;
+      }
+      await sleep(150, commandSignal(context));
+    }
+    const error = new Error("User approval expired before browser dispatch");
+    error.name = "ApprovalTimeout";
+    throw error;
+  } finally {
+    await mutatePendingApprovals((records) => {
+      const record = records[binding.approvalId];
+      if (record?.status === "pending") {
+        records[binding.approvalId] = {
+          ...record,
+          status: Number(record.expiresAt || 0) <= Date.now()
+            ? "expired"
+            : "cancelled",
+          decidedAt: Date.now()
+        };
+      }
+      return records;
+    });
+  }
+}
+
+async function tabDocumentIdentity(tabId) {
+  const [tab, execution] = await Promise.all([
+    chrome.tabs.get(tabId),
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({ href: location.href, origin: location.origin })
+    })
+  ]);
+  const result = execution?.[0];
+  return {
+    tabId,
+    documentId: result?.documentId || null,
+    url: String(result?.result?.href || tab.url || ""),
+    origin: String(result?.result?.origin || "")
+  };
 }
 
 async function connectTransport() {
@@ -377,12 +743,21 @@ async function connectTransport() {
   socket.addEventListener("open", async () => {
     transportReconnectAttempt = 0;
     transportLastError = null;
+    transportHandshake = {
+      phase: "hello_sent",
+      clientNonce: TabWardSecurity.randomNonce(),
+      connectionId: null,
+      serverNonce: null,
+      extensionNonce: null,
+      token: await pairingToken()
+    };
     socket.send(JSON.stringify({
       kind: "hello",
       protocolVersion: PROTOCOL_VERSION,
       extensionId: chrome.runtime.id,
       extensionVersion: chrome.runtime.getManifest().version,
-      token: await pairingToken() || undefined
+      clientNonce: transportHandshake.clientNonce,
+      hasPairingToken: Boolean(transportHandshake.token)
     }));
   });
   socket.addEventListener("message", (event) => {
@@ -393,8 +768,10 @@ async function connectTransport() {
   });
   socket.addEventListener("close", () => {
     if (transportSocket === socket) {
+      stopTransportKeepalive();
       transportSocket = null;
       connectedAt = null;
+      transportHandshake = null;
       if (transportState === "connected") {
         transportState = "not_running";
       }
@@ -419,25 +796,155 @@ async function handleTransportMessage(socket, raw) {
     throw new Error("TabWard protocol version mismatch");
   }
   if (message.kind === "pairing_required") {
+    if (
+      typeof message.connectionId !== "string"
+      || typeof message.serverNonce !== "string"
+      || message.clientNonce !== transportHandshake?.clientNonce
+    ) {
+      throw new Error("Invalid TabWard pairing challenge");
+    }
+    transportHandshake.connectionId = message.connectionId;
+    transportHandshake.serverNonce = message.serverNonce;
+    transportHandshake.phase = "pairing_required";
     transportState = "pairing_required";
     return;
   }
   if (message.kind === "pairing_approved") {
-    if (typeof message.token !== "string" || message.token.length < 43) {
-      throw new Error("Invalid TabWard pairing token");
+    if (
+      !transportHandshake
+      || transportHandshake.phase !== "pairing_request_sent"
+      || message.connectionId !== transportHandshake.connectionId
+      || message.clientNonce !== transportHandshake.clientNonce
+      || message.serverNonce !== transportHandshake.serverNonce
+      || typeof message.brokerProof !== "string"
+    ) {
+      throw new Error("Invalid TabWard pairing proof");
+    }
+    transportHandshake.extensionNonce = message.extensionNonce;
+    const transcript = TabWardSecurity.handshakeTranscript({
+      ...transportHandshake,
+      extensionId: chrome.runtime.id,
+      protocolVersion: PROTOCOL_VERSION
+    });
+    const pairingKey = await TabWardSecurity.derivePairingKey(
+      transportHandshake.pairingCode,
+      transcript
+    );
+    const expected = await TabWardSecurity.hmacSha256(
+      pairingKey,
+      `broker-pairing:${transcript}`
+    );
+    if (message.brokerProof !== expected) {
+      throw new Error("TabWard pairing broker proof failed");
+    }
+    socket.send(JSON.stringify({
+      kind: "pairing_confirm",
+      protocolVersion: PROTOCOL_VERSION,
+      connectionId: transportHandshake.connectionId,
+      extensionProof: await TabWardSecurity.hmacSha256(
+        pairingKey,
+        `extension-pairing:${transcript}`
+      )
+    }));
+    transportHandshake.phase = "pairing_confirm_sent";
+    return;
+  }
+  if (message.kind === "pairing_complete") {
+    if (
+      !transportHandshake
+      || transportHandshake.phase !== "pairing_confirm_sent"
+      || message.connectionId !== transportHandshake.connectionId
+      || typeof message.token !== "string"
+      || message.token.length < 43
+    ) {
+      throw new Error("Invalid TabWard pairing completion");
     }
     await chrome.storage.local.set({ [PAIRING_TOKEN_KEY]: message.token });
     pairingCode = null;
+    transportHandshake.pairingCode = null;
     socket.close(1000, "pairing saved");
     return;
   }
+  if (message.kind === "auth_challenge") {
+    if (
+      !transportHandshake?.token
+      || transportHandshake.phase !== "hello_sent"
+      || typeof message.connectionId !== "string"
+      || typeof message.serverNonce !== "string"
+      || message.clientNonce !== transportHandshake.clientNonce
+    ) {
+      throw new Error("Invalid TabWard authentication challenge");
+    }
+    transportHandshake.connectionId = message.connectionId;
+    transportHandshake.serverNonce = message.serverNonce;
+    transportHandshake.extensionNonce = TabWardSecurity.randomNonce();
+    const transcript = TabWardSecurity.handshakeTranscript({
+      ...transportHandshake,
+      extensionId: chrome.runtime.id,
+      protocolVersion: PROTOCOL_VERSION
+    });
+    socket.send(JSON.stringify({
+      kind: "auth_response",
+      protocolVersion: PROTOCOL_VERSION,
+      connectionId: transportHandshake.connectionId,
+      clientNonce: transportHandshake.clientNonce,
+      serverNonce: transportHandshake.serverNonce,
+      extensionNonce: transportHandshake.extensionNonce,
+      extensionProof: await TabWardSecurity.hmacSha256(
+        transportHandshake.token,
+        `extension:${transcript}`
+      )
+    }));
+    transportHandshake.phase = "auth_response_sent";
+    return;
+  }
+  if (message.kind === "broker_proof") {
+    if (
+      !transportHandshake?.token
+      || transportHandshake.phase !== "auth_response_sent"
+      || message.connectionId !== transportHandshake.connectionId
+    ) {
+      throw new Error("Unexpected TabWard broker proof");
+    }
+    const transcript = TabWardSecurity.handshakeTranscript({
+      ...transportHandshake,
+      extensionId: chrome.runtime.id,
+      protocolVersion: PROTOCOL_VERSION
+    });
+    const expected = await TabWardSecurity.hmacSha256(
+      transportHandshake.token,
+      `broker:${transcript}`
+    );
+    if (message.proof !== expected) {
+      throw new Error("TabWard broker authentication failed");
+    }
+    socket.send(JSON.stringify({
+      kind: "auth_confirm",
+      protocolVersion: PROTOCOL_VERSION,
+      connectionId: transportHandshake.connectionId,
+      proof: await TabWardSecurity.hmacSha256(
+        transportHandshake.token,
+        `confirm:${transcript}`
+      )
+    }));
+    transportHandshake.phase = "auth_confirm_sent";
+    return;
+  }
   if (message.kind === "ready") {
+    if (transportHandshake?.phase !== "auth_confirm_sent") {
+      throw new Error("TabWard ready arrived before mutual authentication");
+    }
+    transportHandshake.phase = "authenticated";
     pairingCode = null;
     transportState = "connected";
     connectedAt = new Date().toISOString();
+    startTransportKeepalive(socket);
     await reconcileStaleMetadata();
     await flushOutbox(socket);
     return;
+  }
+  if (transportState !== "connected" || transportHandshake?.phase !== "authenticated") {
+    throw new Error("Mutual authentication is required before protocol messages");
   }
   if (message.kind === "result_ack") {
     if (typeof message.id === "string") {
@@ -672,10 +1179,20 @@ function approvePairing(code) {
   ) {
     throw new Error("Enter the six-digit pairing code shown by the TabWard MCP");
   }
+  if (!transportHandshake?.connectionId || !transportHandshake.serverNonce) {
+    throw new Error("Pairing challenge is not ready");
+  }
+  transportHandshake.extensionNonce = TabWardSecurity.randomNonce();
+  transportHandshake.pairingCode = String(code);
+  transportHandshake.phase = "pairing_request_sent";
   transportSocket.send(JSON.stringify({
     kind: "pairing_approve",
     protocolVersion: PROTOCOL_VERSION,
-    code: String(code)
+    code: String(code),
+    connectionId: transportHandshake.connectionId,
+    clientNonce: transportHandshake.clientNonce,
+    serverNonce: transportHandshake.serverNonce,
+    extensionNonce: transportHandshake.extensionNonce
   }));
 }
 
@@ -849,14 +1366,16 @@ function sanitizeUrl(value) {
     parsed.hash = "";
     return parsed.toString();
   } catch (_error) {
-    return String(value).replace(/([?&#](?:token|key|code|auth|session|password)=[^&#\s]+)/gi, "<redacted>");
+    return TabWardSecurity.redactSensitiveText(value);
   }
 }
 
 function toSafeError(error) {
   const safe = {
     name: error && error.name ? error.name : "Error",
-    message: sanitizeUrl(error && error.message ? error.message : String(error))
+    message: TabWardSecurity.redactSensitiveText(
+      sanitizeUrl(error && error.message ? error.message : String(error))
+    )
   };
   const count = Number.isInteger(error?.candidateCount)
     ? error.candidateCount
@@ -927,42 +1446,24 @@ function looksSensitiveField(record) {
 }
 
 function redactSensitiveText(value) {
-  return String(value || "")
-    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1<redacted>")
-    .replace(/\b((?:password|passwd|secret|token|api[-_ ]?key|authorization|session)\s*[:=]\s*)[^\s,;]+/gi, "$1<redacted>");
+  return TabWardSecurity.redactSensitiveText(value);
 }
 
 function sanitizeBrowserPayload(value, key = "") {
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeBrowserPayload(item, key));
-  }
-  if (value && typeof value === "object") {
-    const sensitive = looksSensitiveField(value);
-    const result = {};
-    for (const [childKey, childValue] of Object.entries(value)) {
-      if (childKey === "value" && sensitive) {
-        result.value = "[REDACTED]";
-        result.valueLength = String(childValue || "").length;
-      } else if (childKey === "dataset" && childValue && typeof childValue === "object") {
-        result.dataset = Object.fromEntries(
-          Object.entries(childValue).map(([dataKey, dataValue]) => [
-            dataKey,
-            /(?:password|secret|token|key|auth|session)/i.test(dataKey) ? "[REDACTED]" : redactSensitiveText(dataValue)
-          ])
-        );
-      } else {
-        result[childKey] = sanitizeBrowserPayload(childValue, childKey);
-      }
+  if (value && typeof value === "object" && !Array.isArray(value) && looksSensitiveField(value)) {
+    const copy = { ...value };
+    if (Object.prototype.hasOwnProperty.call(copy, "value")) {
+      copy.valueLength = String(copy.value || "").length;
+      copy.value = "[REDACTED]";
     }
-    return result;
+    return TabWardSecurity.redactBrowserPayload(copy, key);
   }
-  if (typeof value === "string") {
-    if (/^(?:url|href|parentHref|src|srcset|backgroundImage|favIconUrl|referrer)$/i.test(key)) {
-      return sanitizeUrl(value);
-    }
-    return redactSensitiveText(value);
+  const redacted = TabWardSecurity.redactBrowserPayload(value, key);
+  if (typeof redacted === "string"
+    && /^(?:url|href|parentHref|src|srcset|backgroundImage|favIconUrl|referrer)$/i.test(key)) {
+    return sanitizeUrl(redacted);
   }
-  return value;
+  return redacted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,8 +1983,21 @@ async function getSessionWorkspace(session) {
     if (!["isolated", "current"].includes(state[SESSION_POLICIES_KEY][session.id]?.workspace)) {
       state[SESSION_POLICIES_KEY][session.id] = {
         workspace,
+        mode: session.mode,
+        capabilities: Array.isArray(session.capabilities)
+          ? [...session.capabilities].sort()
+          : [],
         cleanQa: session.cleanQa === true,
         createdAt: new Date().toISOString()
+      };
+    } else {
+      state[SESSION_POLICIES_KEY][session.id] = {
+        ...state[SESSION_POLICIES_KEY][session.id],
+        mode: session.mode,
+        capabilities: Array.isArray(session.capabilities)
+          ? [...session.capabilities].sort()
+          : [],
+        cleanQa: session.cleanQa === true
       };
     }
     return state;
@@ -4895,7 +5409,7 @@ async function reconcileCreatedDownload(startedAt, options = {}) {
   return candidates[0];
 }
 
-function waitForNewTab(sourceTabId, startedAt, timeoutMs) {
+function waitForNewTab(sourceTab, beforeTabIds, timeoutMs) {
   let cancel = null;
   const promise = new Promise((resolve) => {
     let finished = false;
@@ -4906,16 +5420,11 @@ function waitForNewTab(sourceTabId, startedAt, timeoutMs) {
       }
     }, timeoutMs);
     const listener = (tab) => {
-      if (
-        finished
-        || tab.id === sourceTabId
-        || (tab.openerTabId !== undefined && tab.openerTabId !== sourceTabId)
-        || !tab.id
-      ) {
+      if (finished || !TabWardSecurity.correlateCreatedTab(tab, sourceTab, beforeTabIds)) {
         return;
       }
       cleanup();
-      resolve({ tab: slimTab(tab), timedOut: false });
+      resolve({ tab, timedOut: false });
     };
     function cleanup() {
       finished = true;
@@ -4932,6 +5441,33 @@ function waitForNewTab(sourceTabId, startedAt, timeoutMs) {
   });
   promise.cancel = () => cancel?.();
   return promise;
+}
+
+async function rememberCorrelatedChildTab(tab, sourceTab, session) {
+  if (!tab?.id || !TabWardSecurity.correlateCreatedTab(tab, sourceTab, [])) {
+    const error = new Error("New tab correlation changed before ownership could be recorded");
+    error.name = "OwnershipError";
+    throw error;
+  }
+  const current = (await getOwnership())[tab.id];
+  if (current && current.kind !== "released") {
+    if (current.sessionId !== session.id) {
+      const error = new Error("Correlated new tab is already owned by another session");
+      error.name = "OwnershipError";
+      throw error;
+    }
+    return tab;
+  }
+  const workspaceWindow = await getLiveSessionWindow(session);
+  let ownedTab = tab;
+  if (workspaceWindow?.id !== undefined && tab.windowId !== workspaceWindow.id) {
+    ownedTab = await chrome.tabs.move(tab.id, {
+      windowId: workspaceWindow.id,
+      index: -1
+    });
+  }
+  await rememberTab(ownedTab, "created-child", session);
+  return ownedTab;
 }
 
 function extensionForImage(candidate) {
@@ -5806,7 +6342,8 @@ async function cdpSetInputFiles(
   files,
   context = null,
   frameId = undefined,
-  expectedDocumentId = undefined
+  expectedDocumentId = undefined,
+  uploadAuthorization = null
 ) {
   throwIfCommandAborted(context);
   const marker = `tabward-upload-${crypto.randomUUID()}`;
@@ -5852,6 +6389,7 @@ async function cdpSetInputFiles(
     if (!node?.backendNodeId) {
       throw new Error("Could not map the requested frame file input to CDP");
     }
+    await revalidateUploadAuthorization(uploadAuthorization);
     throwIfCommandAborted(context);
     effectAttempted = true;
     await cdpSend(tabId, "DOM.setFileInputFiles", {
@@ -5891,6 +6429,120 @@ async function cdpSetInputFiles(
       { frameId }
     ), 2000, "remove upload target marker");
   }
+}
+
+async function frameDocumentIdentity(tabId, frameId, documentId) {
+  const identity = await executeInTab(
+    tabId,
+    () => ({ href: location.href, origin: location.origin }),
+    [],
+    { frameId, documentId }
+  );
+  if (
+    !identity
+    || typeof identity.executionDocumentId !== "string"
+    || !identity.executionDocumentId
+    || typeof identity.origin !== "string"
+    || !identity.origin
+  ) {
+    const error = new Error("Target frame identity is unavailable");
+    error.name = "ApprovalMismatch";
+    throw error;
+  }
+  return {
+    tabId,
+    frameId: Number(identity.frameId ?? frameId ?? 0),
+    documentId: identity.executionDocumentId,
+    url: String(identity.href || ""),
+    origin: identity.origin
+  };
+}
+
+async function revalidateUploadAuthorization(authorization) {
+  if (!authorization) {
+    const error = new Error("Upload authorization is required at the effect boundary");
+    error.name = "ApprovalMismatch";
+    throw error;
+  }
+  const currentIdentity = await frameDocumentIdentity(
+    authorization.tabId,
+    authorization.frameId,
+    authorization.documentId
+  );
+  const currentSite = TabWardSecurity.classifyUploadUrl(
+    currentIdentity.url,
+    (await getUserSettings()).trustedUploadSites
+  );
+  if (
+    currentIdentity.documentId !== authorization.documentId
+    || currentIdentity.origin !== authorization.origin
+    || currentSite.host !== authorization.host
+    || (authorization.trustedPattern && !currentSite.trusted)
+  ) {
+    const error = new Error("Upload authorization was invalidated by target-frame navigation or settings");
+    error.name = "ApprovalMismatch";
+    throw error;
+  }
+  TabWardSecurity.assertEffectAuthorizationFresh(authorization.expiresAt);
+  return currentIdentity;
+}
+
+async function authorizeUpload(payload, files, frameId, documentId) {
+  const identity = await frameDocumentIdentity(
+    payload.tabId,
+    frameId,
+    documentId
+  );
+  const settings = await getUserSettings();
+  const site = TabWardSecurity.classifyUploadUrl(
+    identity.url,
+    settings.trustedUploadSites
+  );
+  const context = commandContext(payload);
+  const authorization = {
+    approved: true,
+    tabId: payload.tabId,
+    frameId: identity.frameId,
+    documentId: identity.documentId,
+    origin: identity.origin,
+    host: site.host,
+    trustedPattern: site.trustedPattern,
+    expiresAt: context.deadlineAt
+  };
+  if (site.trusted) return authorization;
+  const fileFingerprint = await TabWardSecurity.sha256(
+    files.map((file) => String(file))
+  );
+  const binding = {
+    approvalId: crypto.randomUUID(),
+    kind: "upload",
+    operationId: context.operationId,
+    fingerprint: context.fingerprint,
+    deadlineAt: context.deadlineAt,
+    sessionId: context.session?.id || null,
+    tabId: payload.tabId,
+    documentId: identity.documentId,
+    origin: identity.origin,
+    host: site.host,
+    method: null,
+    paramsFingerprint: null,
+    fileFingerprint,
+    workerInstanceId: WORKER_INSTANCE_ID,
+    expiresAt: Math.min(Date.now() + APPROVAL_TTL_MS, context.deadlineAt)
+  };
+  const created = await createPendingApproval(binding, {
+    riskCategory: "local-file-upload",
+    riskText: "This site is not trusted for automatic local file uploads.",
+    origin: site.origin,
+    basenames: files.map((file) => String(file).split(/[\\/]/).pop()).filter(Boolean)
+  });
+  await consumeApproval({ ...binding, expiresAt: created.expiresAt }, payload);
+  return {
+    ...authorization,
+    trustedPattern: null,
+    decision: "approve_once",
+    expiresAt: created.expiresAt
+  };
 }
 
 async function commandLocatorAction(payload) {
@@ -6126,16 +6778,34 @@ async function commandLocatorAction(payload) {
       return { ok: true, action, source: target, destination };
     } else if (action === "upload") {
       const files = Array.isArray(payload.value) ? payload.value.map(String) : [String(payload.value || "")];
-      if (!files.every((file) => /^[a-zA-Z]:\\|^\\\\/.test(file))) {
-        throw new Error("Upload paths must be absolute Windows paths");
+      const networkOrDevice = (file) =>
+        /^(?:\\\\|\/\/|\\\\[?.]\\|\\\?\?\\)/.test(file)
+        || /^\/dev\//.test(file);
+      const localAbsolute = (file) =>
+        /^[a-zA-Z]:[\\/](?![\\/])/.test(file)
+        || /^\/(?!\/)/.test(file);
+      if (
+        !files.every(localAbsolute)
+        || files.some(networkOrDevice)
+      ) {
+        throw new Error(
+          "Upload paths must be absolute local files, not UNC, device, or network paths"
+        );
       }
+      const uploadAuthorization = await authorizeUpload(
+        payload,
+        files,
+        frameId ?? target.frameId,
+        target.executionDocumentId
+      );
       const upload = await cdpSetInputFiles(
         payload.tabId,
         target.ref,
         files,
         payload,
         frameId ?? target.frameId,
-        target.executionDocumentId
+        target.executionDocumentId,
+        uploadAuthorization
       );
       fallbackUsed = upload.retried;
     } else {
@@ -6315,9 +6985,10 @@ async function commandDownloadClick(payload) {
   return withWorkingTab(payload.tabId, payload, "Download", async () => {
     const startedAt = Date.now();
     const timeoutMs = Math.max(100, Math.min(Number(payload.timeoutMs || 30000), 600000));
-    const [beforeDownloads, sourceTab] = await Promise.all([
+    const [beforeDownloads, sourceTab, beforeTabs] = await Promise.all([
       chrome.downloads.search({}),
-      chrome.tabs.get(payload.tabId)
+      chrome.tabs.get(payload.tabId),
+      chrome.tabs.query({})
     ]);
     const target = await executeInTab(payload.tabId, pageResolveActionTarget, [payload], { frameId: payload.frameId });
     if (!target || target.ok !== true) {
@@ -6332,7 +7003,11 @@ async function commandDownloadClick(payload) {
         expectedUrl: target.href,
         sourceUrl: sourceTab.url
       });
-      newTabPromise = waitForNewTab(payload.tabId, startedAt, timeoutMs);
+      newTabPromise = waitForNewTab(
+        sourceTab,
+        beforeTabs.map((tab) => tab.id).filter(Number.isInteger),
+        timeoutMs
+      );
     } catch (error) {
       await rollbackDownloadOwnership(reservationId, session.id);
       throw error;
@@ -6406,12 +7081,17 @@ async function commandDownloadClick(payload) {
     if (signal?.tab) {
       downloadPromise.cancel?.();
       await rollbackDownloadOwnership(reservationId, session.id);
+      const ownedTab = await rememberCorrelatedChildTab(
+        signal.tab,
+        sourceTab,
+        session
+      );
       return {
         ok: false,
         kind: "new_tab",
         actionAccepted: true,
         verified: false,
-        newTab: signal.tab,
+        newTab: slimTab(ownedTab),
         click: action,
         trace: [
           { step: "found", count: target.candidateCount },
@@ -6462,12 +7142,17 @@ async function commandDownloadClick(payload) {
       const newTab = await newTabPromise;
       if (newTab?.tab) {
         await rollbackDownloadOwnership(reservationId, session.id);
+        const ownedTab = await rememberCorrelatedChildTab(
+          newTab.tab,
+          sourceTab,
+          session
+        );
         return {
           ok: false,
           kind: "new_tab",
           actionAccepted: true,
           verified: false,
-          newTab: newTab.tab,
+          newTab: slimTab(ownedTab),
           click: action
         };
       }
@@ -6596,19 +7281,6 @@ async function commandCursor(payload) {
   });
 }
 
-async function commandWorking() {
-  const knownTabsResult = await bestEffort(getKnownTabs(), 3000, "get known tabs");
-  const workTabsResult = await bestEffort(getWorkTabs(), 3000, "get work tabs");
-  return {
-    knownTabs: Array.isArray(knownTabsResult) ? knownTabsResult : [],
-    workTabs: workTabsResult && workTabsResult.ok === false ? [] : Object.values(workTabsResult || {}),
-    warnings: [
-      ...(knownTabsResult && knownTabsResult.ok === false ? [knownTabsResult.error] : []),
-      ...(workTabsResult && workTabsResult.ok === false ? [workTabsResult.error] : [])
-    ]
-  };
-}
-
 async function commandFinish(payload) {
   const tabId = payload.tabId;
   if (tabId === undefined || tabId === null) {
@@ -6702,14 +7374,64 @@ async function commandDetach(payload) {
   return { ok: true, tabId: payload.tabId, attached: false };
 }
 
-async function commandExecuteCdp(payload) {
-  if (!SAFE_CDP_METHODS.has(payload.method) && payload.privileged !== true) {
-    const error = new Error(`CDP method ${payload.method} requires privileged mode`);
-    error.name = "PrivilegedModeError";
+async function requireCdpApproval(payload, classification) {
+  const context = commandContext(payload);
+  const identity = await tabDocumentIdentity(payload.tabId);
+  const paramsFingerprint = await TabWardSecurity.sha256(payload.params || {});
+  const binding = {
+    approvalId: crypto.randomUUID(),
+    kind: "cdp",
+    operationId: context.operationId,
+    fingerprint: context.fingerprint,
+    deadlineAt: context.deadlineAt,
+    sessionId: context.session?.id || null,
+    tabId: payload.tabId,
+    documentId: identity.documentId,
+    origin: identity.origin,
+    host: null,
+    method: String(payload.method),
+    paramsFingerprint,
+    fileFingerprint: null,
+    workerInstanceId: WORKER_INSTANCE_ID,
+    expiresAt: Math.min(Date.now() + APPROVAL_TTL_MS, context.deadlineAt)
+  };
+  const created = await createPendingApproval(binding, {
+    riskCategory: classification.category,
+    riskText: classification.riskText,
+    origin: identity.origin || sanitizeUrl(identity.url),
+    basenames: []
+  });
+  await consumeApproval({ ...binding, expiresAt: created.expiresAt }, payload);
+  const current = await tabDocumentIdentity(payload.tabId);
+  if (current.documentId !== identity.documentId || current.origin !== identity.origin) {
+    const error = new Error("CDP approval was invalidated by navigation");
+    error.name = "ApprovalMismatch";
     throw error;
   }
+  return {
+    expiresAt: created.expiresAt
+  };
+}
+
+async function commandExecuteCdp(payload) {
+  const classification = TabWardSecurity.classifyCdp(
+    payload.method,
+    payload.params || {}
+  );
+  const approval = classification.approvalRequired
+    ? await requireCdpApproval(payload, classification)
+    : null;
+  throwIfCommandAborted(payload);
+  if (approval) {
+    TabWardSecurity.assertEffectAuthorizationFresh(approval.expiresAt);
+  }
   const result = await cdpSend(payload.tabId, payload.method, payload.params || {});
-  return { ok: true, method: payload.method, result };
+  return {
+    ok: true,
+    method: payload.method,
+    policy: classification.category,
+    result: sanitizeBrowserPayload(result)
+  };
 }
 
 async function commandCdp(payload) {
@@ -6796,12 +7518,16 @@ async function commandNetworkBody(payload) {
   const result = await cdpSend(payload.tabId, "Network.getResponseBody", {
     requestId: payload.requestId
   });
-  return TabWardStageTwo.boundedNetworkBody(
+  const bounded = TabWardStageTwo.boundedNetworkBody(
     payload.requestId,
-    result.body,
-    result.base64Encoded === true,
+    TabWardSecurity.redactNetworkBody(result.body, result.base64Encoded === true),
+    false,
     NETWORK_BODY_RESULT_MAX_BYTES
   );
+  return {
+    ...bounded,
+    redacted: bounded.body !== String(result.body || "")
+  };
 }
 
 async function commandNetworkHar(payload) {
@@ -6848,13 +7574,13 @@ async function commandNetworkHar(payload) {
   }
   const entries = Array.from(records.values()).map((record) => {
     delete record._startedAt;
-    return record;
+    return sanitizeBrowserPayload(record);
   });
   return {
     ok: true,
     log: {
       version: "1.2",
-      creator: { name: "TabWard", version: "0.3.1" },
+      creator: { name: "TabWard", version: "0.4.0" },
       pages: [],
       entries
     }
@@ -7116,9 +7842,11 @@ async function commandStorage(payload) {
     const cookies = await cdpSend(payload.tabId, "Network.getCookies", { urls: [tab.url] });
     const snapshotId = crypto.randomUUID();
     storageSnapshots.set(snapshotId, {
-      localStorage: webStorage.localStorage || {},
-      sessionStorage: webStorage.sessionStorage || {},
-      cookies: cookies.cookies || []
+      localStorage: sanitizeBrowserPayload(webStorage.localStorage || {}),
+      sessionStorage: sanitizeBrowserPayload(webStorage.sessionStorage || {}),
+      cookies: [],
+      cookieValuesRetained: false,
+      cookieCount: (cookies.cookies || []).length
     });
     while (storageSnapshots.size > 20) {
       storageSnapshots.delete(storageSnapshots.keys().next().value);
@@ -7161,7 +7889,7 @@ async function commandStorage(payload) {
     return { ok: true, ...webStorage, cookiesCleared: (current.cookies || []).length };
   }
   if (["set", "restore"].includes(operation) && Array.isArray(data.cookies)) {
-    if (operation === "restore") {
+    if (operation === "restore" && data.cookieValuesRetained !== false) {
       const current = await cdpSend(payload.tabId, "Network.getCookies", { urls: [tab.url] });
       for (const cookie of current.cookies || []) {
         await cdpSend(payload.tabId, "Network.deleteCookies", {
@@ -7171,12 +7899,17 @@ async function commandStorage(payload) {
         });
       }
     }
-    if (data.cookies.length) {
+    if (data.cookies.length && data.cookieValuesRetained !== false) {
       await cdpSend(payload.tabId, "Network.setCookies", { cookies: data.cookies });
     }
-    return { ok: true, ...webStorage, cookiesSet: data.cookies.length };
+    return sanitizeBrowserPayload({
+      ok: true,
+      ...webStorage,
+      cookiesSet: data.cookieValuesRetained === false ? 0 : data.cookies.length,
+      cookiesRestored: data.cookieValuesRetained !== false
+    });
   }
-  return { ok: true, ...webStorage };
+  return sanitizeBrowserPayload({ ok: true, ...webStorage });
 }
 
 async function commandTraceStart(payload) {
@@ -7479,6 +8212,31 @@ async function commandQa(payload) {
   const priorEmulation = priorEmulationState
     ? structuredClone(priorEmulationState)
     : null;
+  const qaOwner = cdpResourceOwner(payload);
+  const suspendOwnedResources = (resources) => {
+    const broker = cdpBroker(payload.tabId);
+    const suspended = new Set();
+    for (const resource of resources) {
+      const owner = broker.resourceOwners.get(resource);
+      if (!owner) continue;
+      if (owner.sessionId !== qaOwner.sessionId || owner.state !== "active") {
+        const error = new Error(
+          `CDP resource ${resource} is already owned by operation ${owner.operationId}`
+        );
+        error.name = "CdpResourceBusy";
+        throw error;
+      }
+      suspended.add(resource);
+    }
+    for (const resource of suspended) broker.resourceOwners.delete(resource);
+    return suspended;
+  };
+  const suspendedResources = suspendOwnedResources([
+    ...((payload.preset || payload.viewport) ? ["emulation"] : []),
+    ...(categories.length ? ["events"] : [])
+  ]);
+  const suspendedEmulation = suspendedResources.has("emulation");
+  const suspendedEvents = suspendedResources.has("events");
   let eventCursor = 0;
   let emulationApplied = false;
   let eventsStarted = false;
@@ -7606,6 +8364,12 @@ async function commandQa(payload) {
       restoredBroker.resourceOwners = priorBrokerState.resourceOwners;
     } else if (restoredBroker) {
       restoredBroker.resourceOwners.clear();
+    }
+    if (suspendedEmulation && !priorBrokerState?.resourceOwners.has("emulation")) {
+      throw new Error("Pre-QA emulation ownership was not preserved");
+    }
+    if (suspendedEvents && !priorBrokerState?.resourceOwners.has("events")) {
+      throw new Error("Pre-QA event ownership was not preserved");
     }
     if (!hadCdpAttachment && cdpTabs.has(payload.tabId)) {
       operations.push([
@@ -7803,6 +8567,16 @@ async function commandWorkflow(payload) {
 
 async function commandNameSession(payload) {
   const session = await resolveSessionContext(payload);
+  if (
+    session.mode === "full_profile"
+    && (await getUserSettings()).existingTabAccess !== true
+  ) {
+    const error = new Error(
+      "Full Profile requires the user to enable existing-tab access in the TabWard popup"
+    );
+    error.name = "ExistingTabAccessDisabled";
+    throw error;
+  }
   session.name = payload.name || session.name || "TabWard session";
   let cleanQa = null;
   if (session.cleanQa === true) {
@@ -8097,52 +8871,6 @@ async function commandDeliverable(payload) {
   return deliverableTab(payload.tabId, payload, payload.summary || "");
 }
 
-async function commandGetInfo(payload) {
-  const session = await bestEffort(getSession(), 2000, "get session for info");
-  const knownTabsResult = await bestEffort(getKnownTabs(), 3000, "get known tabs for info");
-  const workTabsResult = await bestEffort(getWorkTabs(), 3000, "get work tabs for info");
-  return {
-    ok: true,
-    extensionId: chrome.runtime.id,
-    version: "0.3.1",
-    cdpAttachedTabs: Array.from(cdpTabs),
-    transport: transportStatus(),
-    session: session && session.ok === false ? null : session,
-    knownTabs: Array.isArray(knownTabsResult) ? knownTabsResult : [],
-    workTabs: workTabsResult && workTabsResult.ok === false ? {} : workTabsResult,
-    capabilities: [
-      "pairedWebSocket",
-      "cancellation",
-      "cdp",
-      "cdpEvents",
-      "cursor",
-      "emulation",
-      "faviconBadges",
-      "frames",
-      "fullProfileSessions",
-      "har",
-      "interception",
-      "locatorActions",
-      "locatorAssertions",
-      "nativeInput",
-      "observe",
-      "ownedDownloads",
-      "redaction",
-      "screencast",
-      "sessions",
-      "shadowDom",
-      "smartActions",
-      "storageSnapshots",
-      "tabGroups",
-      "tabOwnership",
-      "tracing",
-      "uploads",
-      "waitSelector",
-      "workflows"
-    ]
-  };
-}
-
 const handlers = {
   ping: commandPing,
   openTab: commandOpenTab,
@@ -8177,7 +8905,6 @@ const handlers = {
   closeTab: commandCloseTab,
   activateTab: commandActivateTab,
   cursor: commandCursor,
-  working: commandWorking,
   finish: commandFinish,
   cleanup: commandCleanup,
   reloadExtension: commandReloadExtension,
@@ -8186,7 +8913,6 @@ const handlers = {
   waitForSelector: commandWaitForSelector,
   attach: commandAttach,
   detach: commandDetach,
-  executeCdp: commandExecuteCdp,
   cdp: commandCdp,
   eventsStart: commandEventsStart,
   eventsPoll: commandEventsPoll,
@@ -8224,16 +8950,140 @@ const handlers = {
   getUserSettings: async () => ({
     ok: true,
     settings: await getUserSettings()
-  }),
-  getInfo: commandGetInfo
+  })
 };
+
+function commandCapabilities(type, payload, session) {
+  const capabilities = [...(COMMAND_CAPABILITY_POLICY[type] || [])];
+  if (type === "locatorAction" && payload.action === "upload") {
+    return ["uploads"];
+  }
+  if (type === "evaluate") {
+    return [session?.mode === "managed" ? "evaluate_local" : "evaluate"];
+  }
+  if (type === "qa") {
+    if (payload.preset || payload.viewport) capabilities.push("emulation");
+    if (payload.captureConsole === true || payload.captureNetwork === true) {
+      capabilities.push("events");
+    }
+    if (Array.isArray(payload.screenshots) && payload.screenshots.length > 0) {
+      capabilities.push("artifacts");
+    }
+  }
+  if (type === "workflow") {
+    if (!Array.isArray(payload.steps)) {
+      throw new Error("workflow steps must be an array");
+    }
+    for (const [index, step] of payload.steps.entries()) {
+      if (!step || typeof step !== "object" || Array.isArray(step) || typeof step.type !== "string") {
+        throw new Error(`workflow step ${index} is invalid`);
+      }
+      const required = WORKFLOW_STEP_CAPABILITY_POLICY[step.type];
+      if (!required) {
+        throw new Error(`workflow step type is not allowed: ${step.type || "<empty>"}`);
+      }
+      capabilities.push(...required);
+    }
+  }
+  if (type === "form") {
+    if (!Array.isArray(payload.fields)) {
+      throw new Error("form fields must be an array");
+    }
+    for (const [index, field] of payload.fields.entries()) {
+      if (!field || typeof field !== "object" || Array.isArray(field) || typeof field.action !== "string") {
+        throw new Error(`form field ${index} is invalid`);
+      }
+      const required = FORM_FIELD_CAPABILITY_POLICY[field.action];
+      if (!required) {
+        throw new Error(`form field action is not allowed: ${field.action || "<empty>"}`);
+      }
+      capabilities.push(...required);
+    }
+  }
+  return [...new Set(capabilities)];
+}
+
+function validateOperationSession(session) {
+  if (!session?.id || !["managed", "full_profile"].includes(session.mode)) {
+    throw new Error("Authenticated session context is required");
+  }
+  if (!TabWardStageTwo.sessionExpiresAtValid(session.expiresAt)) {
+    const error = new Error("Authenticated session context is expired");
+    error.name = "SessionPolicyError";
+    throw error;
+  }
+  const capabilities = Array.isArray(session.capabilities)
+    ? session.capabilities.map(String)
+    : [];
+  const unique = new Set(capabilities);
+  const allowed = session.mode === "managed"
+    ? MANAGED_SESSION_CAPABILITIES
+    : FULL_PROFILE_SESSION_CAPABILITIES;
+  if (
+    unique.size !== capabilities.length
+    || capabilities.some((capability) => !allowed.has(capability))
+  ) {
+    const error = new Error("Authenticated session capabilities are invalid");
+    error.name = "SessionPolicyError";
+    throw error;
+  }
+  return unique;
+}
 
 async function dispatch(command, context) {
   const type = command.type;
   if (!handlers[type]) {
     throw new Error(`Unknown command: ${type}`);
   }
+  if (!Object.prototype.hasOwnProperty.call(COMMAND_CAPABILITY_POLICY, type)) {
+    const error = new Error(`No capability policy exists for command: ${type}`);
+    error.name = "SessionPolicyError";
+    throw error;
+  }
   const payload = { ...(command.payload || {}) };
+  const capabilityPolicy = COMMAND_CAPABILITY_POLICY[type];
+  if (capabilityPolicy !== null) {
+    let capabilities;
+    try {
+      capabilities = validateOperationSession(context.session);
+    } catch (error) {
+      error.name = "SessionPolicyError";
+      throw error;
+    }
+    for (const capability of commandCapabilities(type, payload, context.session)) {
+      if (!capabilities.has(capability)) {
+        const error = new Error(`${type} requires the ${capability} capability`);
+        error.name = "SessionPolicyError";
+        throw error;
+      }
+    }
+    if (type !== "nameSession") {
+    const policy = (await getSessionPolicies())[context.session.id];
+    const policyCapabilities = Array.isArray(context.session.capabilities)
+      ? [...context.session.capabilities].sort()
+      : [];
+    if (
+      !policy
+      || policy.mode !== context.session.mode
+      || JSON.stringify(policy.capabilities || []) !== JSON.stringify(policyCapabilities)
+    ) {
+      const error = new Error("Session policy does not match the authenticated session");
+      error.name = "SessionPolicyError";
+      throw error;
+    }
+    }
+    if (
+      context.session.mode === "full_profile"
+      && (await getUserSettings()).existingTabAccess !== true
+      && !["releaseWorkspace", "releaseTab", "turnEnded"].includes(type)
+    ) {
+      const error = new Error(
+        "Full Profile is disabled by the TabWard existing-tab access setting"
+      );
+      error.name = "ExistingTabAccessDisabled";
+      throw error;
+    }
+  }
   Object.defineProperty(payload, OPERATION_CONTEXT, {
     value: context,
     enumerable: true,
@@ -8293,6 +9143,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: toSafeError(error) }));
     return true;
   }
+  if (message?.type === "TABWARD_APPROVALS_GET") {
+    listPendingApprovals()
+      .then((approvals) => sendResponse({ ok: true, approvals }))
+      .catch((error) => sendResponse({ ok: false, error: toSafeError(error) }));
+    return true;
+  }
+  if (message?.type === "TABWARD_APPROVAL_DECIDE") {
+    decidePendingApproval(String(message.approvalId || ""), String(message.decision || ""))
+      .then((approval) => sendResponse({ ok: true, approval }))
+      .catch((error) => sendResponse({ ok: false, error: toSafeError(error) }));
+    return true;
+  }
   return false;
 });
 
@@ -8308,15 +9170,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     return;
   }
   connectTransport();
-  if (
-    transportState === "connected"
-    && transportSocket?.readyState === WebSocket.OPEN
-  ) {
-    transportSocket.send(JSON.stringify({
-      kind: "ping",
-      protocolVersion: PROTOCOL_VERSION
-    }));
-  }
+  sendTransportPing();
+  syncApprovalBadge().catch(() => {});
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
@@ -8411,3 +9266,4 @@ chrome.windows.onRemoved.addListener((windowId) => {
 });
 
 connectTransport();
+syncApprovalBadge().catch(() => {});

@@ -54,6 +54,18 @@ code in the TabWard popup. Never share the resulting pairing token.
 The popup initially follows Chrome's language when it is Russian or English.
 Changing the popup language applies immediately and persists in the extension.
 
+Before starting `full_profile`, enable **Allow access to existing tabs** in the
+popup. This is the master human toggle; the MCP checks it before creating the
+session and the extension rechecks it before every privileged operation.
+
+For local uploads, add only exact trusted HTTPS hosts such as
+`uploads.example.com`. Wildcards are rejected. Unknown hosts require a popup
+approval bound to the actual target frame/document and rechecked at dispatch.
+For sensitive raw CDP, approve the exact method and parameters shown in the
+popup; approvals expire after five minutes and do not grant a session-wide
+exception. The extension icon badge shows the number of active requests, and
+all open popup views hide a request after another popup decides it.
+
 ## Direct stdio MCP
 
 For another MCP client, use `node` as the stdio command and this path as its
@@ -94,6 +106,14 @@ npm run install:mcp
 droid plugin marketplace update TabWard
 droid plugin update tabward@TabWard --scope user
 ```
+
+Reload Chrome from the newly verified `dist\extension` directory after every
+extension update. Chrome's Reload button does not change which source
+directory was originally selected.
+
+The repository and update source remain private during the beta. Do not treat
+installation of `0.4.0` as a public-release signal; complete the 20-task
+real-use gate and release review first.
 
 ## Uninstall
 

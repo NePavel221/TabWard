@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { basename, isAbsolute } from "node:path";
 import { ExtensionBridge, ExtensionCommandError } from "./bridge.js";
 import {
   commandFingerprint,
@@ -16,6 +18,129 @@ const HOST = "127.0.0.1";
 const IPC_PORT = Number(process.env.TABWARD_BROKER_PORT || 18767);
 const EXTENSION_PORT = Number(process.env.TABWARD_PORT || 18766);
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_PAYLOAD_DEPTH = 24;
+const MAX_PAYLOAD_KEYS = 20_000;
+const MAX_PAYLOAD_STRING = 16 * 1024 * 1024;
+const MANAGED_SESSION_CAPABILITIES = new Set([
+  "read", "action", "artifacts", "downloads", "emulation",
+  "evaluate_local", "events", "probes", "tracing", "uploads"
+]);
+const FULL_PROFILE_SESSION_CAPABILITIES = new Set([
+  ...MANAGED_SESSION_CAPABILITIES,
+  "adopt_tabs", "cdp", "evaluate", "network_interception", "storage"
+]);
+const COMMAND_CAPABILITY_POLICY: Readonly<
+  Record<string, readonly string[] | null>
+> = Object.freeze({
+  ping: null,
+  getUserSettings: null,
+  reloadExtension: null,
+  nameSession: [],
+  cleanup: [],
+  releaseWorkspace: [],
+  turnEnded: [],
+  openTab: ["action"],
+  tabs: ["read"],
+  navigate: ["action"],
+  navigateAdvanced: ["action"],
+  goBack: ["action"],
+  goForward: ["action"],
+  getText: ["read"],
+  getHtml: ["read"],
+  getPageState: ["read"],
+  extractTables: ["read"],
+  observe: ["read"],
+  snapshot: ["read"],
+  query: ["read"],
+  queryRich: ["read"],
+  extractImages: ["read"],
+  resolveTarget: ["read"],
+  click: ["action"],
+  fill: ["action"],
+  smartClick: ["action"],
+  smartFill: ["action"],
+  locatorAction: ["action"],
+  form: ["action"],
+  locatorWait: ["read"],
+  locatorAssert: ["read"],
+  workflow: ["action"],
+  downloadClick: ["downloads"],
+  downloadImage: ["downloads"],
+  downloads: ["downloads"],
+  deleteDownload: ["downloads"],
+  closeTab: ["action"],
+  activateTab: ["action"],
+  cursor: ["action"],
+  finish: ["action"],
+  reload: ["action"],
+  waitForText: ["read"],
+  waitForSelector: ["read"],
+  attach: ["cdp"],
+  detach: ["cdp"],
+  cdp: ["cdp"],
+  eventsStart: ["events"],
+  eventsPoll: ["events"],
+  eventsClear: ["events"],
+  eventsStop: ["events"],
+  dialogHandle: ["events"],
+  networkBody: ["events"],
+  networkHar: ["events"],
+  interceptionStart: ["network_interception"],
+  interceptionContinue: ["network_interception"],
+  interceptionFail: ["network_interception"],
+  interceptionFulfill: ["network_interception"],
+  interceptionStop: ["network_interception"],
+  emulation: ["emulation"],
+  storage: ["storage"],
+  traceStart: ["tracing"],
+  traceStop: ["tracing"],
+  screencastStart: ["tracing"],
+  screencastFrame: ["tracing"],
+  screencastStop: ["tracing"],
+  screenshot: ["artifacts"],
+  evaluate: [],
+  probe: ["probes"],
+  qa: ["probes"],
+  inputMouse: ["action"],
+  inputKey: ["action"],
+  inputScroll: ["action"],
+  handoff: ["action"],
+  deliverable: ["action"],
+  adoptTab: ["adopt_tabs"],
+  releaseTab: ["action"]
+});
+const COMMAND_ALLOWLIST = new Set(Object.keys(COMMAND_CAPABILITY_POLICY));
+const WORKFLOW_STEP_CAPABILITY_POLICY: Readonly<Record<string, readonly string[]>> =
+  Object.freeze({
+    observe: ["read"],
+    smartClick: ["action"],
+    smartFill: ["action"],
+    navigate: ["action"],
+    pageState: ["read"],
+    queryRich: ["read"],
+    extractImages: ["read"],
+    waitForText: ["read"],
+    waitForSelector: ["read"],
+    reload: ["action"],
+    inputKey: ["action"],
+    inputScroll: ["action"]
+  });
+const FORM_FIELD_CAPABILITY_POLICY: Readonly<Record<string, readonly string[]>> =
+  Object.freeze({
+    click: ["action"],
+    doubleClick: ["action"],
+    hover: ["action"],
+    fill: ["action"],
+    type: ["action"],
+    press: ["action"],
+    check: ["action"],
+    uncheck: ["action"],
+    select: ["action"],
+    focus: ["action"],
+    blur: ["action"],
+    drag: ["action"],
+    upload: ["uploads"]
+  });
 const instanceId = randomUUID();
 const bridge = new ExtensionBridge(EXTENSION_PORT);
 let token = "";
@@ -38,6 +163,217 @@ const MAX_REQUEST_CACHE_BYTES = Math.max(
   Number(process.env.TABWARD_REQUEST_CACHE_BYTES || 32 * 1024 * 1024)
 );
 let requestCacheBytes = 0;
+
+function plainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function validatePayloadShape(
+  value: unknown,
+  depth = 0,
+  budget = { keys: 0 }
+): void {
+  if (depth > MAX_PAYLOAD_DEPTH) {
+    throw new Error("command payload nesting is too deep");
+  }
+  if (typeof value === "string" && value.length > MAX_PAYLOAD_STRING) {
+    throw new Error("command payload string is too large");
+  }
+  if (Array.isArray(value)) {
+    budget.keys += value.length;
+    if (budget.keys > MAX_PAYLOAD_KEYS) {
+      throw new Error("command payload has too many entries");
+    }
+    for (const item of value) validatePayloadShape(item, depth + 1, budget);
+    return;
+  }
+  if (value && typeof value === "object") {
+    if (!plainObject(value)) {
+      throw new Error("command payload contains an unsupported object");
+    }
+    const entries = Object.entries(value);
+    budget.keys += entries.length;
+    if (budget.keys > MAX_PAYLOAD_KEYS) {
+      throw new Error("command payload has too many entries");
+    }
+    for (const [, item] of entries) {
+      validatePayloadShape(item, depth + 1, budget);
+    }
+  }
+}
+
+function validSessionPayload(payload: Record<string, unknown>): boolean {
+  const capabilities = Array.isArray(payload.sessionCapabilities)
+    ? payload.sessionCapabilities
+    : [];
+  const uniqueCapabilities = new Set(capabilities);
+  const mode = String(payload.sessionMode);
+  const allowedCapabilities = mode === "managed"
+    ? MANAGED_SESSION_CAPABILITIES
+    : FULL_PROFILE_SESSION_CAPABILITIES;
+  return typeof payload.sessionId === "string"
+    && payload.sessionId.length >= 1
+    && payload.sessionId.length <= 80
+    && /^[A-Za-z0-9_-]+$/.test(payload.sessionId)
+    && typeof payload.sessionName === "string"
+    && payload.sessionName.length >= 1
+    && payload.sessionName.length <= 80
+    && ["managed", "full_profile"].includes(mode)
+    && Array.isArray(payload.sessionCapabilities)
+    && uniqueCapabilities.size === capabilities.length
+    && capabilities.every((capability) =>
+      typeof capability === "string"
+      && capability.length <= 64
+      && allowedCapabilities.has(capability))
+    && typeof payload.canAdoptExistingTabs === "boolean"
+    && payload.canAdoptExistingTabs === capabilities.includes("adopt_tabs")
+    && typeof payload.cleanQa === "boolean"
+    && Number.isFinite(payload.sessionExpiresAt)
+    && Number(payload.sessionExpiresAt) > Date.now() / 1000;
+}
+
+function commandCapabilities(
+  command: string,
+  payload: Record<string, unknown>
+): string[] {
+  const capabilities = [...(COMMAND_CAPABILITY_POLICY[command] || [])];
+  if (command === "locatorAction" && payload.action === "upload") {
+    return ["uploads"];
+  }
+  if (command === "evaluate") {
+    return [payload.sessionMode === "managed" ? "evaluate_local" : "evaluate"];
+  }
+  if (command === "qa") {
+    if (payload.preset || payload.viewport) capabilities.push("emulation");
+    if (payload.captureConsole === true || payload.captureNetwork === true) {
+      capabilities.push("events");
+    }
+    if (Array.isArray(payload.screenshots) && payload.screenshots.length > 0) {
+      capabilities.push("artifacts");
+    }
+  }
+  if (command === "workflow") {
+    if (!Array.isArray(payload.steps)) {
+      throw new Error("workflow steps must be an array");
+    }
+    for (const [index, step] of payload.steps.entries()) {
+      if (!plainObject(step) || typeof step.type !== "string") {
+        throw new Error(`workflow step ${index} is invalid`);
+      }
+      const required = WORKFLOW_STEP_CAPABILITY_POLICY[step.type];
+      if (!required) {
+        throw new Error(`workflow step type is not allowed: ${step.type || "<empty>"}`);
+      }
+      capabilities.push(...required);
+    }
+  }
+  if (command === "form") {
+    if (!Array.isArray(payload.fields)) {
+      throw new Error("form fields must be an array");
+    }
+    for (const [index, field] of payload.fields.entries()) {
+      if (!plainObject(field) || typeof field.action !== "string") {
+        throw new Error(`form field ${index} is invalid`);
+      }
+      const required = FORM_FIELD_CAPABILITY_POLICY[field.action];
+      if (!required) {
+        throw new Error(`form field action is not allowed: ${field.action || "<empty>"}`);
+      }
+      capabilities.push(...required);
+    }
+  }
+  return [...new Set(capabilities)];
+}
+
+function localAbsolutePath(value: string): boolean {
+  if (/^(?:\\\\|\/\/|\\\\[?.]\\|\\\?\?\\)/.test(value)) return false;
+  if (process.platform === "win32") {
+    return /^[a-zA-Z]:[\\/](?![\\/])/.test(value);
+  }
+  return isAbsolute(value)
+    && !value.startsWith("//")
+    && !value.startsWith("/dev/");
+}
+
+async function validateUploadPayload(payload: Record<string, unknown>): Promise<void> {
+  if (payload.action !== "upload") return;
+  const paths = Array.isArray(payload.value)
+    ? payload.value
+    : [payload.value];
+  if (
+    paths.length < 1
+    || paths.length > 100
+    || paths.some((value) => typeof value !== "string" || !localAbsolutePath(value))
+  ) {
+    throw new Error("upload requires readable absolute local file paths");
+  }
+  for (const value of paths as string[]) {
+    const metadata = await stat(value).catch(() => null);
+    if (!metadata?.isFile()) {
+      throw new Error(
+        `upload file is missing or unreadable: ${basename(value) || "[unnamed file]"}`
+      );
+    }
+  }
+}
+
+async function validateCommandRequest(
+  command: unknown,
+  payload: unknown
+): Promise<Record<string, unknown>> {
+  if (typeof command !== "string" || !COMMAND_ALLOWLIST.has(command)) {
+    throw new Error("command is not allowed");
+  }
+  if (!plainObject(payload)) {
+    throw new Error("command payload must be a plain object");
+  }
+  validatePayloadShape(payload);
+  const capabilityPolicy = COMMAND_CAPABILITY_POLICY[command];
+  const sessionFields = [
+    "sessionId", "sessionName", "sessionMode", "sessionCapabilities",
+    "canAdoptExistingTabs", "cleanQa", "sessionExpiresAt"
+  ];
+  const hasSessionContext = sessionFields.some((field) =>
+    Object.prototype.hasOwnProperty.call(payload, field));
+  if (
+    (capabilityPolicy !== null || hasSessionContext)
+    && !validSessionPayload(payload)
+  ) {
+    throw new Error("command session context is invalid or expired");
+  }
+  if (capabilityPolicy !== null) {
+    const capabilities = payload.sessionCapabilities as unknown[];
+    for (const requiredCapability of commandCapabilities(command, payload)) {
+      if (!capabilities.includes(requiredCapability)) {
+        throw new Error(`${command} requires the ${requiredCapability} capability`);
+      }
+    }
+  }
+  if (command === "evaluate") {
+    const capabilities = Array.isArray(payload.sessionCapabilities)
+      ? payload.sessionCapabilities
+      : [];
+    const managed = payload.sessionMode === "managed";
+    if (
+      !validSessionPayload(payload)
+      || (managed && (
+        payload.localOnly !== true
+        || payload.privileged === true
+        || !capabilities.includes("evaluate_local")
+      ))
+      || (!managed && (
+        payload.privileged !== true
+        || !capabilities.includes("evaluate")
+      ))
+    ) {
+      throw new Error("evaluate capability context is invalid");
+    }
+  }
+  await validateUploadPayload(payload);
+  return payload;
+}
 
 function authorized(value: string | undefined): boolean {
   if (!value || !token) return false;
@@ -127,7 +463,7 @@ const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     json(response, 200, {
       ok: true,
-      brokerVersion: "0.3.1",
+      brokerVersion: "0.4.0",
       pid: process.pid,
       instanceId,
       uptimeSeconds: Math.floor(process.uptime()),
@@ -186,12 +522,23 @@ const server = createServer((request, response) => {
         json(response, 200, { ok: true, acknowledgement });
         return;
       }
-      if (!body.command || typeof body.command !== "string") {
-        json(response, 400, { ok: false, error: "command is required" });
-        return;
-      }
       if (!body.requestId || !/^[a-f0-9-]{16,80}$/i.test(body.requestId)) {
         json(response, 400, { ok: false, error: "valid requestId is required" });
+        return;
+      }
+      let validatedPayload: Record<string, unknown>;
+      try {
+        validatedPayload = await validateCommandRequest(
+          body.command,
+          body.payload ?? {}
+        );
+      } catch (error) {
+        json(response, 400, {
+          ok: false,
+          error: error instanceof Error
+            ? error.message
+            : "command validation failed"
+        });
         return;
       }
       // The authenticated MCP client opts in per operation. The persistent
@@ -203,7 +550,7 @@ const server = createServer((request, response) => {
       const now = Date.now();
       pruneRequests(now);
       let record = requests.get(operationId);
-      const requestFingerprint = commandFingerprint(body.command, body.payload ?? {});
+      const requestFingerprint = commandFingerprint(body.command!, validatedPayload);
       if (body.fingerprint && body.fingerprint !== requestFingerprint) {
         json(response, 400, { ok: false, error: "operation fingerprint is invalid" });
         return;
@@ -305,6 +652,16 @@ const server = createServer((request, response) => {
         }
       }
       if (!record) {
+        if (
+          body.deadlineAt !== undefined
+          && (
+            !Number.isFinite(body.deadlineAt)
+            || Number(body.deadlineAt) > now + 600_000
+          )
+        ) {
+          json(response, 400, { ok: false, error: "operation deadline is invalid" });
+          return;
+        }
         const deadlineAt = Number.isFinite(body.deadlineAt)
           ? Number(body.deadlineAt)
           : now + Math.min(Math.max(Number(body.timeoutMs || 60_000), 100), 600_000);
@@ -321,7 +678,7 @@ const server = createServer((request, response) => {
           });
           return;
         }
-        const reservedBytes = reserveBytes(body.command, body.payload ?? {});
+        const reservedBytes = reserveBytes(body.command!, validatedPayload);
         evictSettled(reservedBytes);
         if (
           requests.size >= MAX_CACHED_REQUESTS
@@ -351,7 +708,7 @@ const server = createServer((request, response) => {
         };
         requestCacheBytes += reservedBytes;
         if (measure) {
-          record.telemetry = newTelemetry(body.command, operationId);
+          record.telemetry = newTelemetry(body.command!, operationId);
           record.telemetry.brokerActiveRequests = clients;
           const queue = bridge.queueStatus();
           // Commands already active or waiting are ahead of this operation.
@@ -367,8 +724,8 @@ const server = createServer((request, response) => {
           deadlineAt
         };
         record.promise = bridge.send(
-            body.command,
-            body.payload ?? {},
+            body.command!,
+            validatedPayload,
             operation,
             record.telemetry
           ).then((result) => {
