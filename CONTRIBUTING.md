@@ -1,6 +1,6 @@
 # Contributing to TabWard
 
-TabWard is currently a private Windows and Chrome beta. Repository access does
+TabWard is currently a public-source Windows and Chrome beta. Repository access does
 not grant access to another user's browser, pairing state, or local artifacts.
 
 ## Development setup
@@ -23,7 +23,7 @@ user tabs.
 3. Do not commit pairing state, browser profiles, cookies, authenticated page
    content, downloads, artifacts, traces, logs, `.env` files, or credentials.
 4. Keep extension, MCP, and plugin versions synchronized.
-5. Run `npm run verify` locally before every push. The private beta does not
+5. Run `npm run verify` locally before every push. This beta does not
    use GitHub Actions.
 6. Describe security or permission changes explicitly in the pull request.
 
@@ -33,5 +33,4 @@ script.
 ## Reporting security issues
 
 Do not place secrets, cookies, pairing tokens, or authenticated browser content
-in an issue. Contact the repository owner privately until a dedicated
-vulnerability-reporting channel is published.
+in an issue. Use the private reporting link in `SECURITY.md`.

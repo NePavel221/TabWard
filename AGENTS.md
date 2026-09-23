@@ -32,7 +32,7 @@ in authenticated, agent-owned Chrome tabs.
 
 ## Validation
 
-GitHub Actions is intentionally not used during the private beta. Run
+GitHub Actions is intentionally not used during the source beta. Run
 `npm run verify` locally after code changes and before every push. Run
 `npm run audit:release` before a release candidate. Run the live Chrome smoke
 only in a TabWard-owned test session and close only test-created tabs.

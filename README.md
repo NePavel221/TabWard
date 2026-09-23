@@ -5,8 +5,9 @@ It combines a standard stdio MCP server with a paired Chrome extension, so an
 agent can use the websites where the user is already signed in without sending
 browser traffic through a TabWard cloud service.
 
-> **Status:** private `0.4.0` beta for Windows and Google Chrome. Expect setup
-> changes before the first public release.
+> **Status:** public-source `0.4.0` beta for Windows and Google Chrome.
+> The MCP package and Chrome Web Store extension have not been published.
+> Expect setup changes before their first release.
 
 ## Why TabWard
 
@@ -48,7 +49,7 @@ MCP clients -> tabward-mcp -> authenticated localhost broker
 - Windows 10 or 11.
 - Google Chrome 116 or newer.
 - Node.js 20 or newer.
-- Git access to this private repository.
+- Git access to the TabWard repository.
 - Factory Droid for the documented plugin flow, or another stdio MCP client.
 
 ## Quick start
@@ -71,8 +72,7 @@ Load the extension:
 3. Select **Load unpacked**.
 4. Select the repository's `dist\extension` directory.
 
-Register the MCP and install or update the Factory skill from the private
-GitHub repository:
+Register the MCP and install or update the Factory skill from GitHub:
 
 ```powershell
 $TabWardServer = (Join-Path (npm root --global) '@tabward\mcp\dist\index.js').Replace('\', '/')
@@ -85,7 +85,7 @@ droid mcp list
 
 Call `tabward_health`. If pairing is required, enter the displayed six-digit
 code in the extension popup. Pairing is normally needed only once.
-For updates, pull the private repository, rerun `npm ci`, `npm run verify`,
+For updates, pull the repository, rerun `npm ci`, `npm run verify`,
 `npm run install:mcp`, rebuild `dist\extension`, reload that exact directory in
 Chrome, and reinstall/update the Factory plugin from the same repository.
 
@@ -249,11 +249,11 @@ on `tabward_health`, so ordinary tool content and structured responses remain
 unchanged. Scheduler telemetry is numeric only: active count, queue depth,
 configured maximum, maximum observed active work, and queue wait.
 
-The private beta intentionally uses this local command as its required
-pre-push gate instead of GitHub Actions.
+This beta intentionally uses this local command as its required pre-push gate
+instead of GitHub Actions.
 
-Public-release readiness still requires the documented 20-task real-use gate,
-permissions/store review, and a separate repository-visibility decision.
-Version `0.4.0` is not a claim that TabWard has been publicly released.
+The 20-task real-use gate is optional for this beta. Public source availability
+does not imply npm or Chrome Web Store publication, migration from another
+browser integration, or completion of permissions and Store review.
 
 TabWard is licensed under [Apache-2.0](LICENSE).

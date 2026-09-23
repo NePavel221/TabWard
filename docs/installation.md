@@ -6,7 +6,7 @@
 - Google Chrome 116 or newer.
 - Node.js 20 or newer.
 - Factory Droid.
-- Git access to the private TabWard repository.
+- Git access to the TabWard repository.
 
 ## Clone and build
 
@@ -111,9 +111,9 @@ Reload Chrome from the newly verified `dist\extension` directory after every
 extension update. Chrome's Reload button does not change which source
 directory was originally selected.
 
-The repository and update source remain private during the beta. Do not treat
-installation of `0.4.0` as a public-release signal; complete the 20-task
-real-use gate and release review first.
+The repository is public, but the npm package and Chrome Web Store extension
+are not published. Installing `0.4.0` from source is still a beta workflow;
+review permissions and the Store listing separately before distribution.
 
 ## Uninstall
 

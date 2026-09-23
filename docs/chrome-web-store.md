@@ -17,6 +17,8 @@
   `security.js` and the 16/32/48/128 px icons.
 - Document the trusted HTTPS upload-site list, unknown-host approval UI,
   exact sensitive-CDP approval, and the existing-tab master toggle.
-- Complete the 20-task real-use beta gate before submission.
-- Do not claim public availability until repository visibility, Store review,
-  and deferred publication have been separately approved.
+- The 20-task real-use beta gate is optional; it was not performed before the
+  repository became public.
+- Public repository access is not Chrome Web Store availability. Do not claim
+  Store availability until review and deferred publication have been separately
+  approved.

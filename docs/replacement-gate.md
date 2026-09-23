@@ -50,9 +50,10 @@ The runner alternates execution order and requires TabWard pass rate, p50, and
 p95 to be no worse than the legacy integration beyond the documented 10%
 tolerance.
 
-## Real-task gate
+## Optional real-task gate
 
-Complete 20 distinct local tasks without falling back to the legacy integration:
+For additional confidence before replacing a legacy integration, complete 20
+distinct local tasks without falling back to it:
 
 - at least five authenticated read scenarios;
 - at least five multi-step scenarios;
@@ -64,7 +65,8 @@ cookies, storage, downloads, or user-generated data.
 
 ## Migration
 
-After all automated gates and the real-task gate pass, verify TabWard from the
-private GitHub snapshot, then disable rollback integrations in Factory.
-Preserve their local files until several further TabWard-only tasks have
-succeeded.
+Do not treat public source access as approval to disable a working browser
+integration. After the automated gates and sufficient local real-task
+validation, verify TabWard from the GitHub source snapshot, then decide
+whether to disable rollback integrations in Factory. Preserve their local
+files until several further TabWard-only tasks have succeeded.

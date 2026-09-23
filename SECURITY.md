@@ -1,6 +1,6 @@
 # Security
 
-TabWard is private beta software. Do not file public issues containing cookies,
+TabWard is public-source beta software. Do not file public issues containing cookies,
 tokens, authenticated page content, pairing state, traces, downloads, or local
 filesystem paths.
 
@@ -17,7 +17,7 @@ data whenever possible.
 
 | Version | Security support |
 | --- | --- |
-| 0.4.0 | Supported private beta version |
+| 0.4.0 | Supported source beta version |
 | 0.3.x and earlier | Unsupported |
 
 TabWard binds local transports to `127.0.0.1`, but its local state and broker
