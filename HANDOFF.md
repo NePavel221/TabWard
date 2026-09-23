@@ -2,8 +2,8 @@
 
 ## Current Goal
 
-Make the verified TabWard `0.4.0` source repository public without publishing
-the npm package or Chrome Web Store extension.
+The verified TabWard `0.4.0` source repository is public. No further source
+opening task is pending.
 
 ## Current State
 
@@ -16,9 +16,9 @@ passes `npm run verify` (122 tests, TypeScript, packaging, release and
 all-history scans) and `npm audit --omit=dev` (zero vulnerabilities).
 
 The user waived the 20-task real-use gate and authorized opening the source
-repository. Source documentation now describes a public-source beta, not a
-published package or Store extension. The remaining release action is a
-normal push of `main` to GitHub followed by a visibility change and readback.
+repository. The verified changes were pushed to `main`, and GitHub reports
+`NePavel221/TabWard` as `PUBLIC`. Source documentation describes a
+public-source beta, not a published package or Store extension.
 
 ## Last 7 Tasks
 
@@ -28,13 +28,12 @@ normal push of `main` to GitHub followed by a visibility change and readback.
 4. 2026-09-22: Implemented the 0.4.0 security/public-readiness hardening set.
 5. 2026-09-22: Closed the independent security review findings with deterministic regressions.
 6. 2026-09-22: Installed 0.4.0 and passed the approved Chrome live gates.
-7. 2026-09-23: Updated public-source instructions and reran pre-push verification.
+7. 2026-09-23: Published verified source on GitHub and confirmed public visibility.
 
 ## Next Step
 
-Push `main`, change GitHub repository visibility to public, and verify the
-remote branch and public access. Package/Store publishing and migration away
-from other browser integrations remain separate decisions.
+No mandatory next step. Publishing the npm package or Store extension and
+migrating away from other browser integrations require separate decisions.
 
 ## Risks / Do Not Forget
 
